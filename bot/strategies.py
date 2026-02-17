@@ -83,11 +83,13 @@ def check_ma_crossover(state, closes_qqq, closes_tlt):
         elif t_above:
             target = config.MA_TRADE_SAFE
     else:
-        # No position yet
+        # No position yet — always enter; MA strategy should never be all-cash
         if q_above:
             target = config.MA_TRADE_GROWTH
         elif t_above:
             target = config.MA_TRADE_SAFE
+        else:
+            target = config.MA_TRADE_ALT
 
     if target != current:
         logger.info(

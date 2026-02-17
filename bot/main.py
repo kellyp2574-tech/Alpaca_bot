@@ -263,6 +263,100 @@ def _handle_dip_exit(state, spy_closes, upro_price, spy_live=None,
 
 
 # ═══════════════════════════════════════════════════
+# MODE: rebalance  (Monday 10:30 AM)
+#   - Adjust MA position to target allocation (50% of equity)
+#   - Does NOT touch dip positions
+# ═══════════════════════════════════════════════════
+
+def run_rebalance(dry_run=False):
+    """Rebalance MA bucket to target allocation.
+    Compares current MA position market value to target (MA_ALLOC_PCT * equity).
+    Buys or trims to close the gap. Threshold of 2% avoids micro-trades."""
+    state = load_state()
+    logger.info("=" * 60)
+    logger.info("REBALANCE RUN" + (" [DRY RUN]" if dry_run else ""))
+
+    if not _check_market_open(dry_run):
+        return
+
+    try:
+        equity = broker.get_equity()
+        cash = broker.get_cash()
+        logger.info(f"Account: equity=${equity:,.2f} cash=${cash:,.2f}")
+    except Exception as e:
+        logger.error(f"Could not fetch account data: {e}")
+        return
+
+    ma_ticker = state.get("ma_holding")
+    if not ma_ticker:
+        logger.info("REBALANCE: no MA position held — skipping (will enter at next close run)")
+        logger.info("=" * 60)
+        return
+
+    # Current MA position value
+    current_value = broker.get_position_market_value(ma_ticker)
+    target_value = equity * config.MA_ALLOC_PCT
+    diff = target_value - current_value
+    drift_pct = abs(diff) / equity if equity > 0 else 0
+
+    logger.info(f"REBALANCE: {ma_ticker} current=${current_value:,.2f} "
+                f"target=${target_value:,.2f} diff=${diff:+,.2f} "
+                f"(drift={drift_pct:.1%})")
+
+    # Only rebalance if drift exceeds 2% of equity
+    REBALANCE_THRESHOLD = 0.02
+    if drift_pct < REBALANCE_THRESHOLD:
+        logger.info(f"REBALANCE: drift {drift_pct:.1%} < {REBALANCE_THRESHOLD:.0%} threshold — no action")
+        logger.info("=" * 60)
+        return
+
+    if diff > 0:
+        # Under-allocated: buy more
+        buy_amount = min(diff, cash)
+        if buy_amount < 1.0:
+            logger.info(f"REBALANCE: need ${diff:,.2f} more but only ${cash:,.2f} cash — skipping")
+        else:
+            logger.info(f"REBALANCE BUY: {ma_ticker} +${buy_amount:,.2f}")
+            if not dry_run:
+                broker.buy_notional(ma_ticker, buy_amount)
+                log_trade(state, "BUY", ma_ticker, f"${buy_amount:.0f}", 0,
+                          f"rebalance +${buy_amount:.0f}")
+            else:
+                logger.info(f"  [DRY RUN] Would buy ${buy_amount:,.2f} of {ma_ticker}")
+    else:
+        # Over-allocated: trim position
+        trim_amount = abs(diff)
+        pos = broker.get_position(ma_ticker)
+        if pos and float(pos.market_value) > 0:
+            trim_pct = trim_amount / float(pos.market_value)
+            trim_qty = float(pos.qty) * trim_pct
+            if trim_qty < 0.001:
+                logger.info(f"REBALANCE: trim too small ({trim_qty:.4f} shares) — skipping")
+            else:
+                logger.info(f"REBALANCE TRIM: {ma_ticker} -{trim_qty:.4f} shares (~${trim_amount:,.2f})")
+                if not dry_run:
+                    from alpaca.trading.requests import MarketOrderRequest
+                    from alpaca.trading.enums import OrderSide, TimeInForce
+                    client = broker.get_trading_client()
+                    order = client.submit_order(MarketOrderRequest(
+                        symbol=ma_ticker,
+                        qty=round(trim_qty, 4),
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY,
+                    ))
+                    logger.info(f"TRIM order_id={order.id}")
+                    log_trade(state, "SELL", ma_ticker, f"{trim_qty:.4f}", 0,
+                              f"rebalance -${trim_amount:.0f}")
+                else:
+                    logger.info(f"  [DRY RUN] Would trim {trim_qty:.4f} shares of {ma_ticker}")
+
+    state["last_rebalance"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_state(state)
+    logger.info("REBALANCE COMPLETE")
+    logger.info("=" * 60)
+
+
+# ═══════════════════════════════════════════════════
 # MODE: tuesday_recovery  (Monday 3:30 PM only)
 #   - Check dip trade exit (in case one is active)
 #   - Monday dip signal -> buy UPRO for Tuesday bounce

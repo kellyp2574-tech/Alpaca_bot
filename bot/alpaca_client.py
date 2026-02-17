@@ -25,11 +25,11 @@ def get_equity():
 
 
 def get_cash():
-    """Get available cash. Margin is controlled at Alpaca's account level —
-    if margin is off, cash == buying_power. If margin is enabled later,
-    buying_power will increase automatically without code changes."""
+    """Get available cash WITHOUT margin. Uses non_marginable_buying_power
+    so this bot never borrows, even if margin is enabled on the account
+    for other strategies/bots."""
     account = get_account()
-    return float(account.cash)
+    return float(account.non_marginable_buying_power)
 
 
 def get_all_positions():

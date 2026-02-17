@@ -3,23 +3,26 @@ Bot Scheduler — Dispatches to the correct strategy mode based on --mode argume
 Cron handles all timing; the scheduler just runs the requested mode and exits.
 
 Modes:
+  auto           Auto-detect mode from current time (default if no --mode given)
   intraday       Live-price stop loss / take profit checks (no new entries)
   monday_close   Monday dip buy + MA crossover + BB reversion + dip exits (Mon only)
   daily_close    MA crossover + BB reversion + dip exits (Tue-Fri)
+  rebalance      Adjust MA position to target allocation (Mon 10:30 AM)
 
-Cron setup (all times ET, triggers at :30 to avoid open/close bells):
-  # Intraday exits — Mon-Fri, 10:30 AM to 2:30 PM
-  30 10-14 * * 1-5 cd /path/to/Alpaca_bot && python -m bot.scheduler --mode intraday
+Auto-detect schedule (all times ET):
+  Mon 10:xx  →  rebalance
+  Mon 15:xx  →  monday_close
+  Tue-Fri 15:xx  →  daily_close
+  Mon-Fri 11:xx–14:xx  →  intraday
+  (any other time → skip)
 
-  # Monday close — Monday 3:30 PM (tuesday recovery + MA + BB)
-  30 15 * * 1 cd /path/to/Alpaca_bot && python -m bot.scheduler --mode monday_close
-
-  # Daily close — Tue-Fri 3:30 PM (MA rotation + BB entries + dip exits)
-  30 15 * * 2-5 cd /path/to/Alpaca_bot && python -m bot.scheduler --mode daily_close
+Windows Task Scheduler: run every hour at :30 with just:
+  python -m bot.scheduler
 
 Manual:
   python -m bot.scheduler --force              # Run all strategies (combined)
   python -m bot.scheduler --force --dry-run    # Dry run, no trades
+  python -m bot.scheduler --mode intraday      # Force a specific mode
   python -m bot.scheduler --status             # Show current state
 """
 import sys
@@ -29,7 +32,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from bot import config
-from bot.main import run_bot, run_daily_close, run_monday_close, show_status
+from bot.main import run_bot, run_daily_close, run_monday_close, run_rebalance, show_status
 from bot.state_manager import load_state, save_state
 from bot import alpaca_client as broker
 from bot import data
@@ -134,9 +137,43 @@ def _market_is_open():
         return False
 
 
+def _auto_detect_mode():
+    """Determine which mode to run based on current ET time.
+    Returns mode string or None if nothing should run now."""
+    now = datetime.now(ET)
+    hour = now.hour
+    minute = now.minute
+    dow = now.weekday()  # 0=Monday, 4=Friday
+    is_monday = dow == 0
+    is_weekday = dow <= 4
+
+    # Only act during market hours, :30-:59 window
+    if not is_weekday or minute < 30:
+        return None
+
+    if hour == 10 and is_monday:
+        return "rebalance"
+    elif hour == 15 and is_monday:
+        return "monday_close"
+    elif hour == 15 and is_weekday:
+        return "daily_close"
+    elif 11 <= hour <= 14 and is_weekday:
+        return "intraday"
+    else:
+        return None
+
+
 def dispatch(mode, dry_run=False):
     """Dispatch to the correct mode. Guards against closed-market execution."""
     now = datetime.now(ET)
+
+    # Auto-detect mode from time if requested
+    if mode == "auto":
+        mode = _auto_detect_mode()
+        if mode is None:
+            logger.info(f"AUTO: nothing to do at {now.strftime('%Y-%m-%d %H:%M ET')} ({now.strftime('%A')})")
+            return
+
     logger.info(f"SCHEDULER: mode={mode} at {now.strftime('%Y-%m-%d %H:%M ET')} ({now.strftime('%A')})"
                 + (" [DRY RUN]" if dry_run else ""))
     logger.info(f"  python={sys.executable}  cwd={os.getcwd()}")
@@ -146,7 +183,10 @@ def dispatch(mode, dry_run=False):
         logger.info(f"Skipping mode={mode} -- market not open (use --force to override)")
         return
 
-    if mode == "intraday":
+    if mode == "rebalance":
+        run_rebalance(dry_run=dry_run)
+
+    elif mode == "intraday":
         run_intraday_exits(dry_run=dry_run)
 
     elif mode == "monday_close":
@@ -160,7 +200,7 @@ def dispatch(mode, dry_run=False):
 
     else:
         logger.error(f"Unknown mode: {mode}")
-        print(f"Usage: python -m bot.scheduler --mode [intraday|monday_close|daily_close]")
+        print(f"Usage: python -m bot.scheduler --mode [rebalance|intraday|monday_close|daily_close]")
         print(f"       python -m bot.scheduler --force")
         sys.exit(1)
 
@@ -182,7 +222,5 @@ if __name__ == "__main__":
             print("Error: --mode requires an argument")
             sys.exit(1)
     else:
-        print("Usage: python -m bot.scheduler --mode [intraday|monday_close|daily_close]")
-        print("       python -m bot.scheduler --force [--dry-run]")
-        print("       python -m bot.scheduler --status")
-        sys.exit(1)
+        # Default: auto-detect mode from current time
+        dispatch("auto", dry_run=dry_run)
