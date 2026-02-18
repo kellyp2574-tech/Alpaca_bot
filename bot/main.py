@@ -183,6 +183,43 @@ def _fetch_common_data():
         return None
 
 
+def _sync_ma_holding_from_broker(state):
+    """Ensure state['ma_holding'] matches actual Alpaca positions."""
+    ma_tickers = {
+        config.MA_TRADE_GROWTH,
+        config.MA_TRADE_SAFE,
+        config.MA_TRADE_ALT,
+    }
+
+    try:
+        positions = broker.get_all_positions()
+    except Exception as e:
+        logger.error(f"Could not fetch positions to sync MA holding: {e}")
+        return state.get("ma_holding"), 0.0
+
+    active = []
+    for pos in positions:
+        symbol = getattr(pos, "symbol", None)
+        if symbol in ma_tickers:
+            qty = float(getattr(pos, "qty", 0) or 0)
+            if abs(qty) > 0:
+                market_value = float(getattr(pos, "market_value", 0) or 0)
+                active.append((symbol, market_value))
+
+    active.sort(key=lambda item: abs(item[1]), reverse=True)
+    actual_symbol = active[0][0] if active else None
+    actual_value = active[0][1] if active else 0.0
+
+    if state.get("ma_holding") != actual_symbol:
+        logger.warning(
+            f"MA HOLDING SYNC: state={state.get('ma_holding')} -> broker={actual_symbol}"
+        )
+        state["ma_holding"] = actual_symbol
+
+    state["ma_position_value"] = actual_value
+    return actual_symbol, actual_value
+
+
 def _check_market_open(dry_run=False):
     """Return True if market is open (or dry_run)."""
     try:
@@ -276,8 +313,14 @@ def run_rebalance(dry_run=False):
     logger.info("=" * 60)
     logger.info("REBALANCE RUN" + (" [DRY RUN]" if dry_run else ""))
 
+    def finish(message):
+        state["last_rebalance"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_state(state)
+        logger.info(message)
+        logger.info("=" * 60)
+
     if not _check_market_open(dry_run):
-        return
+        return finish("REBALANCE SKIPPED (market closed)")
 
     try:
         equity = broker.get_equity()
@@ -285,75 +328,78 @@ def run_rebalance(dry_run=False):
         logger.info(f"Account: equity=${equity:,.2f} cash=${cash:,.2f}")
     except Exception as e:
         logger.error(f"Could not fetch account data: {e}")
-        return
+        return finish("REBALANCE SKIPPED (account fetch failed)")
 
-    ma_ticker = state.get("ma_holding")
+    ma_ticker, current_value = _sync_ma_holding_from_broker(state)
     if not ma_ticker:
-        logger.info("REBALANCE: no MA position held — skipping (will enter at next close run)")
-        logger.info("=" * 60)
-        return
+        logger.info("REBALANCE: no MA position held — state synced, nothing to do")
+        return finish("REBALANCE COMPLETE (no MA position)")
 
-    # Current MA position value
-    current_value = broker.get_position_market_value(ma_ticker)
-    target_value = equity * config.MA_ALLOC_PCT
+    base_capital = max(current_value, 0) + cash
+    state["ma_capital_base"] = base_capital
+    if base_capital <= 0:
+        logger.info("REBALANCE: no cash or MA capital available — skipping")
+        return finish("REBALANCE SKIPPED (no capital)")
+
+    target_value = base_capital * config.MA_ALLOC_PCT
     diff = target_value - current_value
-    drift_pct = abs(diff) / equity if equity > 0 else 0
+    drift_pct = abs(diff) / base_capital if base_capital > 0 else 0
 
     logger.info(f"REBALANCE: {ma_ticker} current=${current_value:,.2f} "
                 f"target=${target_value:,.2f} diff=${diff:+,.2f} "
-                f"(drift={drift_pct:.1%})")
+                f"(drift={drift_pct:.1%}, base=${base_capital:,.2f})")
 
-    # Only rebalance if drift exceeds 2% of equity
     REBALANCE_THRESHOLD = 0.02
     if drift_pct < REBALANCE_THRESHOLD:
         logger.info(f"REBALANCE: drift {drift_pct:.1%} < {REBALANCE_THRESHOLD:.0%} threshold — no action")
-        logger.info("=" * 60)
-        return
+        return finish("REBALANCE COMPLETE (within threshold)")
 
     if diff > 0:
-        # Under-allocated: buy more
         buy_amount = min(diff, cash)
         if buy_amount < 1.0:
             logger.info(f"REBALANCE: need ${diff:,.2f} more but only ${cash:,.2f} cash — skipping")
-        else:
-            logger.info(f"REBALANCE BUY: {ma_ticker} +${buy_amount:,.2f}")
-            if not dry_run:
-                broker.buy_notional(ma_ticker, buy_amount)
-                log_trade(state, "BUY", ma_ticker, f"${buy_amount:.0f}", 0,
-                          f"rebalance +${buy_amount:.0f}")
-            else:
-                logger.info(f"  [DRY RUN] Would buy ${buy_amount:,.2f} of {ma_ticker}")
-    else:
-        # Over-allocated: trim position
-        trim_amount = abs(diff)
-        pos = broker.get_position(ma_ticker)
-        if pos and float(pos.market_value) > 0:
-            trim_pct = trim_amount / float(pos.market_value)
-            trim_qty = float(pos.qty) * trim_pct
-            if trim_qty < 0.001:
-                logger.info(f"REBALANCE: trim too small ({trim_qty:.4f} shares) — skipping")
-            else:
-                logger.info(f"REBALANCE TRIM: {ma_ticker} -{trim_qty:.4f} shares (~${trim_amount:,.2f})")
-                if not dry_run:
-                    from alpaca.trading.requests import MarketOrderRequest
-                    from alpaca.trading.enums import OrderSide, TimeInForce
-                    client = broker.get_trading_client()
-                    order = client.submit_order(MarketOrderRequest(
-                        symbol=ma_ticker,
-                        qty=round(trim_qty, 4),
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                    ))
-                    logger.info(f"TRIM order_id={order.id}")
-                    log_trade(state, "SELL", ma_ticker, f"{trim_qty:.4f}", 0,
-                              f"rebalance -${trim_amount:.0f}")
-                else:
-                    logger.info(f"  [DRY RUN] Would trim {trim_qty:.4f} shares of {ma_ticker}")
+            return finish("REBALANCE SKIPPED (insufficient cash)")
 
-    state["last_rebalance"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    save_state(state)
-    logger.info("REBALANCE COMPLETE")
-    logger.info("=" * 60)
+        logger.info(f"REBALANCE BUY: {ma_ticker} +${buy_amount:,.2f}")
+        if not dry_run:
+            broker.buy_notional(ma_ticker, buy_amount)
+            log_trade(state, "BUY", ma_ticker, f"${buy_amount:.0f}", 0,
+                      f"rebalance +${buy_amount:.0f}")
+        else:
+            logger.info(f"  [DRY RUN] Would buy ${buy_amount:,.2f} of {ma_ticker}")
+        return finish("REBALANCE COMPLETE (buy)")
+
+    # diff <= 0 → trim
+    trim_amount = abs(diff)
+    pos = broker.get_position(ma_ticker)
+    if not pos or float(getattr(pos, "market_value", 0) or 0) <= 0:
+        logger.info("REBALANCE: no live position to trim — skipping")
+        return finish("REBALANCE SKIPPED (no position)")
+
+    trim_pct = trim_amount / float(pos.market_value)
+    trim_qty = float(pos.qty) * trim_pct
+    if trim_qty < 0.001:
+        logger.info(f"REBALANCE: trim too small ({trim_qty:.4f} shares) — skipping")
+        return finish("REBALANCE SKIPPED (trim too small)")
+
+    logger.info(f"REBALANCE TRIM: {ma_ticker} -{trim_qty:.4f} shares (~${trim_amount:,.2f})")
+    if not dry_run:
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        client = broker.get_trading_client()
+        order = client.submit_order(MarketOrderRequest(
+            symbol=ma_ticker,
+            qty=round(trim_qty, 4),
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        ))
+        logger.info(f"TRIM order_id={order.id}")
+        log_trade(state, "SELL", ma_ticker, f"{trim_qty:.4f}", 0,
+                  f"rebalance -${trim_amount:.0f}")
+    else:
+        logger.info(f"  [DRY RUN] Would trim {trim_qty:.4f} shares of {ma_ticker}")
+
+    return finish("REBALANCE COMPLETE (trim)")
 
 
 # ═══════════════════════════════════════════════════
