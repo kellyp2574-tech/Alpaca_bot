@@ -28,29 +28,6 @@ MA_CONFIRM_EXIT = 5            # days to confirm exit (asymmetric)
 MA_ALLOC_PCT = 0.50            # 50% of equity for MA positions
 
 # ═══════════════════════════════════════════════════
-# Strategy B: Monday Dip
-# ═══════════════════════════════════════════════════
-DIP_SIGNAL_TICKER = "SPY"      # signal ticker for dip detection
-DIP_TRADE_TICKER = "UPRO"     # 3x leveraged SPY
-DIP_MIN_PCT = 0.005            # minimum 0.5% dip to trigger
-DIP_ALLOC_CAP = 0.30           # max 30% of equity
-DIP_HOLD_DAYS = 2              # hold for 2 trading days
-DIP_TAKE_PROFIT = 0.025        # 2.5% take profit
-# No stop loss for Monday Dip
-
-# ═══════════════════════════════════════════════════
-# Strategy C: BB Reversion
-# ═══════════════════════════════════════════════════
-BB_SIGNAL_TICKER = "SPY"       # signal ticker for BB calculation
-BB_TRADE_TICKER = "UPRO"      # 3x leveraged SPY
-BB_PERIOD = 20                 # Bollinger Band SMA period
-BB_SIGMA = 2.0                 # standard deviations for lower band
-BB_ALLOC_CAP = 0.20            # max 20% of equity
-BB_STOP_LOSS = 0.10            # 10% stop loss
-BB_TAKE_PROFIT = 0.05          # 5% take profit
-# Exit: when SPY returns to 20-day SMA
-
-# ═══════════════════════════════════════════════════
 # State & Logging
 # ═══════════════════════════════════════════════════
 STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state")
@@ -65,6 +42,4 @@ TRADE_LOG_FILE = os.path.join(LOG_DIR, "trades.log")
 ALL_TICKERS = list(set([
     MA_SIGNAL_GROWTH, MA_SIGNAL_SAFE,
     MA_TRADE_GROWTH, MA_TRADE_SAFE, MA_TRADE_ALT,
-    DIP_SIGNAL_TICKER, DIP_TRADE_TICKER,
-    BB_SIGNAL_TICKER, BB_TRADE_TICKER,
 ]))

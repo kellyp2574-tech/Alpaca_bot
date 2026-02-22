@@ -1,0 +1,52 @@
+"""Core configuration for the morning momentum bot - Gap Strategy."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Config:
+    """Strategy parameters and guardrails - Gap Momentum Strategy."""
+
+    # Strategy window
+    scan_start: str = "09:00"      # Start scanning at 9am
+    scan_end: str = "09:29"        # End scanning at 9:29 (same as final_scan)
+    scan_interval_minutes: int = 5  # Scan every 5 min
+    final_scan: str = "09:29"       # Final candidate build
+    entry_start: str = "09:35"      # Entry time
+    entry_cutoff: str = "10:30"     # Last entry allowed
+    hard_exit: str = "10:30"        # Exit all positions
+    market_open: str = "09:30"
+
+    # Universe filters (gap strategy)
+    min_price: float = 2.0
+    max_price: float = 100.0
+    min_dollar_volume: float = 10_000_000  # $10M daily
+    min_5min_volume: float = 1_000_000  # $1M in first 5 min
+    min_gap_pct: float = 0.07  # 7% min gap
+    max_gap_pct: float = 0.15  # 15% max gap
+    opening_strength: bool = True  # First 5-min candle must be green
+
+    # Position sizing
+    daily_deploy_pct: float = 0.50  # 50% of cash per day
+    max_daily_deploy: float = 50_000  # $50k hard cap
+
+    # Risk guardrails
+    risk_per_trade: float = 0.02  # 2% risk per trade
+    max_concurrent: int = 12  # Max open positions
+    max_trades_per_day: int = 12  # Max trades per day
+    daily_kill_r: float = -3.0  # Stop trading if R <= -3R
+
+    # Exit rules
+    take_profit_pct: float = 0.012  # 1.2% activation for trailing
+    trail_pct: float = 0.01  # 1% trailing stop
+    stop_loss_pct: float = 0.05  # 5% hard stop
+    stop_atr_mult: float = 2.0  # ATR multiplier for initial stop
+    stop_min_pct: float = 0.02  # 2% minimum stop
+    stop_max_pct: float = 0.05  # 5% maximum stop
+    breakeven_at_pct: float = 0.006  # Move stop to breakeven at 1.2% profit
+
+    # Execution
+    slippage_pct: float = 0.005  # 0.5% base slippage
+    exec_slippage_buy_pct: float = 0.002
+    exec_slippage_sell_pct: float = 0.005
+    exit_ack_timeout_seconds: float = 5.0  # Seconds to wait before exit reconciliation
