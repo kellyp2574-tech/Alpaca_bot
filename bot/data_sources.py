@@ -14,6 +14,12 @@ class DataStack:
 
     alpaca: AlpacaDataAdapter
 
+    def unsubscribe_all(self) -> None:
+        try:
+            self.alpaca.close_stream()
+        except Exception:
+            pass
+
 
 def init_data_stack(
     alpaca_api_key: Optional[str] = None,
