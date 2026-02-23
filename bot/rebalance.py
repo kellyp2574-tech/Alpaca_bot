@@ -9,17 +9,11 @@ import argparse
 from datetime import datetime
 
 from bot import config
-from bot.state_manager import load_state, save_state, log_trade
+from bot.state_manager import load_state, save_state, log_trade, StateStore as MMStateStore
 from bot import alpaca_client as broker
 from bot import data
 from bot import strategies
 from bot.trade_reporter import log_trade_with_reporting
-
-# Import Morning Momentum state store for safety check
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent / "Alpaca_Morning_Momentum"))
-from bot.state_manager import StateStore as MMStateStore
 
 # ═══════════════════════════════════════════════════
 # Logging setup

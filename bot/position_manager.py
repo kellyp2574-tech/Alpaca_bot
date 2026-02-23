@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:
-    from .main import SessionStats
+    from .morning_main import SessionStats
 
 from .clock import market_now
 from .morning_config import Config
