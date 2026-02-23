@@ -660,7 +660,7 @@ def fetch_candidates(
     
     # Build candidates
     today = market_now().date()
-    candidates = build_candidates(cfg, data.alpaca, data.fmp, data.float_cache, symbols, today)
+    candidates = build_candidates(cfg, data.alpaca, symbols, today)
     
     stats = {
         "total_symbols": len(symbols),

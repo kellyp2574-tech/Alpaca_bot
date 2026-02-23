@@ -13,8 +13,6 @@ from .storage import Candidate
 def build_candidates(
     cfg: Config,
     alpaca,
-    fmp,
-    float_cache,
     symbols: Iterable[str],
     date: datetime,
 ) -> List[Candidate]:
@@ -23,8 +21,6 @@ def build_candidates(
     Args:
         cfg: Strategy configuration.
         alpaca: Adapter exposing Alpaca data helpers.
-        fmp: Float data provider with get_float().
-        float_cache: FloatCache-like instance.
         symbols: Iterable of symbols from most-actives list.
         date: Trading date.
     """
