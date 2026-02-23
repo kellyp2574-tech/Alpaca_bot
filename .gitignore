@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+venv/
 
 # Bot state & caches (all generated at runtime)
 state/
