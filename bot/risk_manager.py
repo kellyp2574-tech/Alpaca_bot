@@ -6,6 +6,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from .morning_config import Config
+from .clock import market_now
 
 
 class RiskManager:
@@ -34,7 +35,9 @@ class RiskManager:
             "day": self.day.isoformat() if self.day else None,
         }
 
-    def maybe_reset(self, today: date) -> None:
+    def maybe_reset(self, today: Optional[date] = None) -> None:
+        if today is None:
+            today = market_now().date()
         if self.day is None or today != self.day:
             self.day = today
             self.trades_taken = 0
@@ -54,9 +57,11 @@ class RiskManager:
 
     def can_deploy_amount(self, requested_amount: float) -> Tuple[bool, float]:
         """Check if we can deploy the requested amount under daily cap."""
-        if self.cfg.max_daily_deploy <= 0:
-            return True, requested_amount  # No daily cap
-        
+        if self.cfg.max_daily_deploy < 0:
+            return True, requested_amount  # Negative values disable the cap
+        if self.cfg.max_daily_deploy == 0:
+            return False, 0.0
+
         remaining = self.cfg.max_daily_deploy - self.daily_deploy_used
         allowed_amount = min(requested_amount, remaining)
         can_deploy = allowed_amount > 0

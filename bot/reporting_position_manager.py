@@ -29,16 +29,19 @@ class ReportingPositionManager:
         )
         
         # Log trade to reporting system
-        log_trade_with_reporting(
-            symbol=symbol,
-            action="BUY",
-            quantity=qty,
-            price=price,
-            strategy=self.strategy_name,
-            order_id=entry_order_id,
-            client_order_id=entry_client_order_id,
-            notes=f"Entry with stop: {stop_pct*100:.1f}%"
-        )
+        try:
+            log_trade_with_reporting(
+                symbol=symbol,
+                action="BUY",
+                quantity=qty,
+                price=price,
+                strategy=self.strategy_name,
+                order_id=entry_order_id,
+                client_order_id=entry_client_order_id,
+                notes=f"Entry with stop: {stop_pct*100:.1f}%"
+            )
+        except Exception:
+            logger.exception("Reporting failed for %s BUY; continuing without reporting", symbol)
         
         return result
     
@@ -58,14 +61,17 @@ class ReportingPositionManager:
         
         # Log trade to reporting system
         if exit_qty > 0:
-            log_trade_with_reporting(
-                symbol=symbol,
-                action="SELL",
-                quantity=exit_qty,
-                price=price,
-                strategy=self.strategy_name,
-                notes=f"Exit: {reason}"
-            )
+            try:
+                log_trade_with_reporting(
+                    symbol=symbol,
+                    action="SELL",
+                    quantity=exit_qty,
+                    price=price,
+                    strategy=self.strategy_name,
+                    notes=f"Exit: {reason}"
+                )
+            except Exception:
+                logger.exception("Reporting failed for %s SELL; continuing without reporting", symbol)
         
         return result
     
@@ -74,14 +80,17 @@ class ReportingPositionManager:
         # Log all exits before calling original
         for symbol, position in self.original_pm.positions.items():
             if not position.exit_pending and symbol in prices:
-                log_trade_with_reporting(
-                    symbol=symbol,
-                    action="SELL",
-                    quantity=position.qty,
-                    price=prices[symbol],
-                    strategy=self.strategy_name,
-                    notes=f"Force exit: {reason}"
-                )
+                try:
+                    log_trade_with_reporting(
+                        symbol=symbol,
+                        action="SELL",
+                        quantity=position.qty,
+                        price=prices[symbol],
+                        strategy=self.strategy_name,
+                        notes=f"Force exit: {reason}"
+                    )
+                except Exception:
+                    logger.exception("Reporting failed for %s force exit; continuing", symbol)
         
         # Call original method
         return self.original_pm.force_exit_all(prices, reason)

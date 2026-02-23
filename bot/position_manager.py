@@ -346,23 +346,30 @@ class PositionManager:
                     decision_price=state.exit_price or fill.avg_price,
                     fill_price=fill.avg_price,
                 )
-            state.qty -= fill.filled_qty
+
+            remaining_qty = max(state.qty - fill.filled_qty, 0.0)
+            broker_qty = None
+            if hasattr(self.execution, "_get_broker_qty"):
+                try:
+                    broker_qty = self.execution._get_broker_qty(symbol)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to query broker qty for %s after partial fill: %s",
+                        symbol,
+                        exc,
+                    )
+            if broker_qty is not None:
+                remaining_qty = max(float(broker_qty), 0.0)
+
+            state.qty = remaining_qty
             state.exit_pending = False
             state.exit_order_id = None
             state.exit_client_order_id = None
             state.exit_submitted_ts = None
-            
-            # If remaining qty is meaningful, resubmit exit
-            if state.qty > 0.0001:
-                logger.info("%s partial exit: resubmitting for remaining %.4f shares", symbol, state.qty)
-                # Get current price from execution client
-                current_price = self.execution._reference_price(symbol, OrderSide.SELL, fill.avg_price)
-                self._exit(symbol, state, current_price, now, reason="partial_exit")
-            else:
-                # Close position completely
-                del self.positions[symbol]
-            
+            if state.qty <= 0.0:
+                self.positions.pop(symbol, None)
             self._persist()
+            return
         elif fill.status == "unfilled":
             logger.warning(
                 "Exit order for %s was unfilled; position remains open", symbol
@@ -461,10 +468,31 @@ class PositionManager:
             self._apply_fill_result(symbol, state, fill, now)
             
             # Check if we're done
-            if fill.status in {"filled", "dry_run", "partial"}:
+            if fill.status in {"filled", "dry_run"}:
                 logger.info(f"Exit {symbol} completed on attempt {attempt}: {fill.status}")
                 return
-            elif fill.status == "unfilled":
+            elif fill.status == "partial":
+                if state.qty <= 0.0:
+                    logger.info(f"Exit {symbol} fully closed via partial fills on attempt {attempt}")
+                    return
+                if attempt < max_attempts:
+                    aggressiveness_factors = [0.995, 0.99, 0.985]
+                    aggressiveness = aggressiveness_factors[min(attempt - 1, len(aggressiveness_factors) - 1)]
+                    new_price = max(state.exit_price or current_price, 0.0) * aggressiveness
+                    current_price = new_price if new_price > 0 else current_price
+                    logger.info(
+                        "Partial exit for %s left %.4f shares; retrying with price %.2f",
+                        symbol,
+                        state.qty,
+                        current_price,
+                    )
+                    continue
+                else:
+                    logger.error(f"Partial exit could not close {symbol} after {attempt} attempts - escalating to broker close_position")
+                    fill = FillResult(order_id=None, filled_qty=0.0, avg_price=current_price, status="unfilled")
+                    # fall through to escalation logic below
+
+            if fill.status == "unfilled" or (fill.status == "partial" and attempt >= max_attempts):
                 if attempt < max_attempts:
                     logger.warning(f"IOC exit unfilled for {symbol}, attempt {attempt} - retrying with more aggressive price")
                     # Retry with more aggressive pricing for SELL orders (lower limit = more marketable)
@@ -480,13 +508,15 @@ class PositionManager:
                     try:
                         if hasattr(self.execution, 'client') and self.execution.client:
                             logger.critical(f"Escalating {symbol} to broker close_position (market order)")
-                            self.execution.client.close_position(symbol)
-                            # Mark as closed locally
-                            state.exit_pending = False
+                            order = self.execution.client.close_position(symbol)
                             state.exit_reason = "emergency_market_close"
-                            state.exit_time = now
-                            state.exit_price = current_price  # Approximate
-                            self.positions.pop(symbol, None)
+                            state.exit_submitted_ts = time.monotonic()
+                            state.exit_pending = True
+                            state.exit_order_id = getattr(order, "id", state.exit_order_id)
+                            if getattr(order, "client_order_id", None):
+                                state.exit_client_order_id = order.client_order_id
+                            state.exit_price = current_price  # provisional until fill confirmed
+                            state.exit_time = None
                             self._persist()
                             logger.info(f"Emergency market close submitted for {symbol}")
                         else:

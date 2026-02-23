@@ -37,13 +37,13 @@ class Config:
     daily_kill_r: float = -3.0  # Stop trading if R <= -3R
 
     # Exit rules
-    take_profit_pct: float = 0.012  # 1.2% activation for trailing
+    breakeven_at_pct: float = 0.006  # Move stop to breakeven after +0.6%
+    take_profit_pct: float = 0.012  # Enable trailing once gains reach 1.2%
     trail_pct: float = 0.01  # 1% trailing stop
     stop_loss_pct: float = 0.05  # 5% hard stop
     stop_atr_mult: float = 2.0  # ATR multiplier for initial stop
     stop_min_pct: float = 0.02  # 2% minimum stop
     stop_max_pct: float = 0.05  # 5% maximum stop
-    breakeven_at_pct: float = 0.006  # Move stop to breakeven at 1.2% profit
 
     # Execution
     slippage_pct: float = 0.005  # 0.5% base slippage

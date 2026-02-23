@@ -158,6 +158,16 @@ class IntegratedBot:
                 logger.info("Reached 3:30 PM - exiting")
                 break
             
+            # If market has closed early, exit gracefully
+            if current_time >= datetime.strptime("09:30", "%H:%M").time() and not self.dry_run:
+                try:
+                    clock = broker.get_clock()
+                    if not clock.is_open:
+                        logger.info("Market clock indicates closed session; shutting down loop")
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to check market clock during run loop: {e}")
+
             # If clock check failed, be extra cautious before 9:30 AM
             if self.clock_check_failed and current_time < datetime.strptime("09:30", "%H:%M").time():
                 logger.info("Clock check failed - waiting until 9:30 AM to ensure market is open")
@@ -288,7 +298,31 @@ class IntegratedBot:
                                         self.mm_positions.exit_position(symbol, quote.bid_price, market_now(), reason="stop_loss")
                                     else:
                                         logger.warning("MM supervisor: no active position manager, forcing broker close for %s", symbol)
-                                        self.execution.client.close_position(symbol)
+                                        order = self.execution.client.close_position(symbol)
+                                        try:
+                                            stored_positions = self.mm_state_store.load_positions()
+                                        except RuntimeError as err:
+                                            logger.critical(
+                                                "Unable to load MM state while supervising %s broker close: %s",
+                                                symbol,
+                                                err,
+                                            )
+                                            stored_positions = {}
+
+                                        state = stored_positions.get(symbol)
+                                        if state is not None:
+                                            state.exit_pending = True
+                                            state.exit_reason = "supervisor_broker_close"
+                                            state.exit_submitted_ts = time.monotonic()
+                                            state.exit_order_id = getattr(order, "id", state.exit_order_id)
+                                            if getattr(order, "client_order_id", None):
+                                                state.exit_client_order_id = order.client_order_id
+                                            self.mm_state_store.save_positions(stored_positions)
+                                        else:
+                                            logger.warning(
+                                                "Supervisor broker close for %s without stored position; state may already be cleared",
+                                                symbol,
+                                            )
                     
                     # Sleep for 30 seconds
                     time.sleep(30)
@@ -322,56 +356,112 @@ class IntegratedBot:
             # Cancel all MM orders first
             self._cancel_all_mm_orders()
             
-            # Get current positions
-            mm_positions = self.mm_positions.positions
-            if not mm_positions:
-                logger.info("No MM positions to flatten")
+            runtime_manager = self.mm_positions
+            runtime_positions = {}
+            if runtime_manager is not None:
+                runtime_positions = dict(runtime_manager.positions)
+
+            try:
+                stored_positions = self.mm_state_store.load_positions()
+            except RuntimeError as e:
+                logger.critical(f"Unable to load stored MM positions during emergency flatten: {e}")
+                stored_positions = {}
+
+            allowed_symbols = set(runtime_positions.keys()) | set(stored_positions.keys())
+
+            if not allowed_symbols:
+                logger.info("No MM positions recorded; nothing to flatten")
                 return
-            
-            # Get current prices for force exit
+
+            # Get current prices for each tracked symbol
             price_lookup = {}
-            for symbol in mm_positions.keys():
+            for symbol in allowed_symbols:
                 try:
                     quote_dict = self.mm_data.alpaca.get_latest_quotes([symbol])
                     quote = quote_dict.get(symbol) if quote_dict else None
                     if quote and getattr(quote, "bid_price", 0) > 0:
                         price_lookup[symbol] = quote.bid_price
                     else:
-                        # Fallback to last known price
-                        position = mm_positions[symbol]
-                        price_lookup[symbol] = position.peak_price or position.entry_price
+                        position = runtime_positions.get(symbol) or stored_positions.get(symbol)
+                        if position:
+                            price_lookup[symbol] = position.peak_price or position.entry_price
                 except Exception as e:
                     logger.warning(f"Failed to get price for {symbol}: {e}")
-                    position = mm_positions[symbol]
-                    price_lookup[symbol] = position.peak_price or position.entry_price
-            
-            # Force exit all positions
-            self.mm_positions.force_exit_all(price_lookup, reason="emergency_hard_exit")
-            
-            # Time-based reconciliation
-            logger.info("Starting MM time-based exit reconciliation...")
-            remaining_pending = self.mm_positions.reconcile_pending_exits_time_based(max_wait_seconds=30.0)
-            
-            # Final status
-            remaining_positions = len(self.mm_positions.positions)
-            if remaining_positions > 0:
-                logger.error(f"CRITICAL: {remaining_positions} MM positions still open after emergency flatten!")
-                # Last resort: try to cancel any remaining orders and force close
-                self._emergency_mm_flatten()
+                    position = runtime_positions.get(symbol) or stored_positions.get(symbol)
+                    if position:
+                        price_lookup[symbol] = position.peak_price or position.entry_price
+
+            # Force exits using runtime manager when available, otherwise broker fallback
+            closed_symbols: set[str] = set()
+
+            if runtime_manager is not None and runtime_manager.positions:
+                before_symbols = set(runtime_manager.positions.keys())
+                runtime_manager.force_exit_all(price_lookup, reason="emergency_hard_exit")
+
+                logger.info("Starting MM time-based exit reconciliation...")
+                runtime_manager.reconcile_pending_exits_time_based(max_wait_seconds=30.0)
+
+                remaining_symbols = set(runtime_manager.positions.keys())
+                closed_symbols.update(before_symbols - remaining_symbols)
+
+                if remaining_symbols:
+                    logger.error(
+                        "CRITICAL: %d MM positions still open after emergency flatten via manager",
+                        len(remaining_symbols),
+                    )
+                    self._emergency_mm_flatten()
             else:
-                logger.info("All MM positions successfully flattened")
+                client = getattr(self.mm_execution, "client", None) or getattr(self.execution, "client", None)
+                if client is None:
+                    logger.critical("No execution client available for emergency flatten fallback")
+                for symbol in allowed_symbols:
+                    try:
+                        logger.critical(f"Emergency closing MM position (fallback) {symbol}")
+                        order = None
+                        if client:
+                            order = client.close_position(symbol)
+
+                        state = (
+                            runtime_positions.get(symbol)
+                            or stored_positions.get(symbol)
+                        )
+                        if state is None:
+                            logger.warning(
+                                "Fallback emergency close for %s without stored state; tracking skipped",
+                                symbol,
+                            )
+                            continue
+
+                        state.exit_reason = "integrated_emergency_close"
+                        state.exit_pending = True
+                        state.exit_submitted_ts = time.monotonic()
+                        state.exit_time = None
+                        if order is not None:
+                            state.exit_order_id = getattr(order, "id", state.exit_order_id)
+                            client_id = getattr(order, "client_order_id", None)
+                            if client_id:
+                                state.exit_client_order_id = client_id
+
+                        stored_positions[symbol] = state
+                        if runtime_manager is not None and symbol in runtime_manager.positions:
+                            runtime_manager.positions[symbol] = state
+                    except Exception as e:
+                        logger.error(f"Failed to emergency close {symbol}: {e}")
+
+            # Persist cleared state
+            if runtime_manager is not None:
+                stored_positions = dict(runtime_manager.positions)
+            self.mm_state_store.save_positions(stored_positions)
             
-            # Persist updated state after force exit attempts
-            self.mm_state_store.save_positions(self.mm_positions.positions)
-                
         except Exception as e:
             logger.error(f"Critical error forcing MM positions flat: {e}")
     
     def _cancel_all_mm_orders(self):
         """Cancel all MM-related orders."""
         try:
-            if hasattr(self.mm_execution, 'client') and self.mm_execution.client:
-                orders = self.mm_execution.client.get_orders()
+            client = getattr(self.mm_execution, "client", None) or getattr(self.execution, "client", None)
+            if client:
+                orders = client.get_orders()
                 mm_symbols = set()
                 if self.mm_positions is not None:
                     mm_symbols.update(self.mm_positions.positions.keys())
@@ -389,10 +479,15 @@ class IntegratedBot:
                     if (
                         order_status in {'new', 'partially_filled', 'submitted', 'accepted'}
                         and symbol in mm_symbols
-                        and client_order_id and client_order_id.startswith("ENTRY:")
+                        and client_order_id
+                        and (
+                            client_order_id.startswith("ENTRY:")
+                            or client_order_id.startswith("EXIT:")
+                            or client_order_id.startswith("MM:")
+                        )
                     ):
                         try:
-                            self.mm_execution.client.cancel_order(order.id)
+                            client.cancel_order(order.id)
                             logger.info(f"Cancelled MM order {order.id} for {symbol} ({client_order_id})")
                             
                             # Clear pending entry state if it's an entry order
@@ -410,33 +505,58 @@ class IntegratedBot:
         try:
             logger.critical("EMERGENCY MM FLATTEN: Closing all positions at market")
             
+            client = getattr(self.mm_execution, "client", None) or getattr(self.execution, "client", None)
+            if client is None:
+                logger.critical("No execution client available for emergency MM flatten")
+                return
+
             # Get all positions from broker
-            positions = self.mm_execution.client.get_positions()
+            positions = client.get_positions()
             allowed_symbols = set()
             if self.mm_positions is not None:
                 allowed_symbols.update(self.mm_positions.positions.keys())
             try:
-                allowed_symbols.update(self.mm_state_store.load_positions().keys())
+                stored_positions = self.mm_state_store.load_positions()
+                allowed_symbols.update(stored_positions.keys())
             except Exception:
-                pass
+                stored_positions = {}
             
             for pos in positions:
                 symbol = getattr(pos, 'symbol', None)
                 qty = float(getattr(pos, 'qty', 0) or 0)
-                
+
                 if symbol and qty > 0 and symbol in allowed_symbols:
                     try:
                         logger.critical(f"Emergency closing MM position {symbol} ({qty} shares)")
-                        self.mm_execution.client.close_position(symbol)
-                        
-                        # Clear from local state
-                        self.mm_positions.positions.pop(symbol, None)
+                        order = client.close_position(symbol)
+
+                        state = None
+                        if self.mm_positions is not None:
+                            state = self.mm_positions.positions.get(symbol)
+                        if state is None:
+                            state = stored_positions.get(symbol)
+                        if state is None:
+                            logger.warning("Emergency flatten: no state record for %s; unable to track close", symbol)
+                            continue
+
+                        state.exit_reason = "integrated_emergency_close"
+                        state.exit_pending = True
+                        state.exit_submitted_ts = time.monotonic()
+                        state.exit_time = None
+                        state.exit_order_id = getattr(order, "id", state.exit_order_id)
+                        client_id = getattr(order, "client_order_id", None)
+                        if client_id:
+                            state.exit_client_order_id = client_id
+
+                        stored_positions[symbol] = state
+                        if self.mm_positions is not None:
+                            self.mm_positions.positions[symbol] = state
                         
                     except Exception as e:
                         logger.error(f"Failed to emergency close {symbol}: {e}")
-            
+
             # Save state
-            self.mm_state_store.save_positions(self.mm_positions.positions)
+            self.mm_state_store.save_positions(stored_positions)
             
         except Exception as e:
             logger.error(f"Critical error in emergency MM flatten: {e}")
@@ -567,6 +687,7 @@ class IntegratedBot:
             # Sync MA holding/value from broker first
             current_ma, current_value = self._sync_ma_holding_from_broker(self.ma_state)
             logger.info(f"MA sync: holding={current_ma}, value=${current_value:,.0f}")
+            pending_buy = self.ma_state.get("ma_pending_buy")
             
             # Fetch common data
             ctx = self._fetch_ma_common_data()
@@ -581,12 +702,18 @@ class IntegratedBot:
                 self.ma_state, ctx["qqq_closes"], ctx["tlt_closes"]
             )
             
-            # Execute MA rotation if needed
-            if ma_target != current_ma:
+            # Execute MA rotation if needed or if pending buy exists
+            force_pending_buy = False
+            if pending_buy and pending_buy != current_ma:
+                logger.warning(f"Pending MA buy detected from prior failure: {pending_buy}")
+                ma_target = pending_buy
+                force_pending_buy = True
+
+            if ma_target != current_ma or force_pending_buy:
                 logger.info(f"MA rotation signal: {current_ma} -> {ma_target}")
                 
                 # Sell current position
-                if current_ma:
+                if current_ma and current_ma != ma_target:
                     try:
                         position = broker.get_position(current_ma)
                         sell_qty = float(getattr(position, "qty", 0) or 0)
@@ -601,8 +728,17 @@ class IntegratedBot:
                         # Log to both systems with actual quantity
                         log_trade(self.ma_state, "SELL", current_ma, "all", sell_price, 
                                  f"MA rotation -> {ma_target}")
-                        log_trade_with_reporting(current_ma, "SELL", sell_qty, sell_price, "etf_rotation",
-                                               notes="MA rotation")
+                        try:
+                            log_trade_with_reporting(
+                                current_ma,
+                                "SELL",
+                                sell_qty,
+                                sell_price,
+                                "etf_rotation",
+                                notes="MA rotation",
+                            )
+                        except Exception:
+                            logger.exception("ETF rotation reporting failed for %s SELL; continuing", current_ma)
                 
                 # Buy new position with same dollar value
                 if ma_target:
@@ -629,22 +765,52 @@ class IntegratedBot:
                     invest_amount = min(current_value, cash)
                     buy_price = ctx.get("live_prices", {}).get(ma_target, 0)
                     
-                    logger.info(f"MA BUY: {ma_target} notional=${invest_amount:,.2f} "
-                               f"price=${buy_price:.2f}")
-                    
+                    logger.info(
+                        f"MA BUY: {ma_target} notional=${invest_amount:,.2f} price=${buy_price:.2f}"
+                    )
+
                     if buy_price > 0 and invest_amount >= buy_price:
                         qty = int(invest_amount / buy_price)
-                        broker.buy(ma_target, qty)
-                        
-                        # Log to both systems
-                        log_trade(self.ma_state, "BUY", ma_target, qty, buy_price,
-                                 f"MA rotation <- {current_ma}")
-                        log_trade_with_reporting(ma_target, "BUY", qty, buy_price, "etf_rotation",
-                                               notes="MA rotation")
-                        
-                        # Update state
-                        self.ma_state["ma_holding"] = ma_target
-                        self.ma_state["ma_position_value"] = qty * buy_price
+                        if qty >= 1:
+                            broker.buy(ma_target, qty)
+
+                            # Log to both systems
+                            log_trade(
+                                self.ma_state,
+                                "BUY",
+                                ma_target,
+                                qty,
+                                buy_price,
+                                f"MA rotation <- {current_ma}",
+                            )
+                            try:
+                                log_trade_with_reporting(
+                                    ma_target,
+                                    "BUY",
+                                    qty,
+                                    buy_price,
+                                    "etf_rotation",
+                                    notes="MA rotation",
+                                )
+                            except Exception:
+                                logger.exception("ETF rotation reporting failed for %s BUY; continuing", ma_target)
+
+                            # Update state
+                            self.ma_state["ma_holding"] = ma_target
+                            self.ma_state["ma_position_value"] = qty * buy_price
+                            self.ma_state.pop("ma_pending_buy", None)
+                            save_state(self.ma_state)
+                        else:
+                            logger.critical(
+                                f"MA rotation for {ma_target} calculated qty {qty} < 1; will retry next check"
+                            )
+                            self.ma_state["ma_pending_buy"] = ma_target
+                            save_state(self.ma_state)
+                    else:
+                        logger.critical(
+                            f"MA rotation buy for {ma_target} skipped (price={buy_price}, invest_amount={invest_amount})"
+                        )
+                        self.ma_state["ma_pending_buy"] = ma_target
                         save_state(self.ma_state)
             
             # Check for orphaned broker positions after ETF operations

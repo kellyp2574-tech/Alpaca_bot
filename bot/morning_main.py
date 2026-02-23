@@ -205,6 +205,12 @@ class EntryLoop:
         finally:
             # GUARANTEED: Force exit all positions at hard exit time
             self._guarantee_hard_exit()
+
+            # Always release streaming subscriptions to avoid leaks
+            try:
+                self.alpaca.unsubscribe_all()
+            except Exception as exc:
+                logger.warning("Failed to unsubscribe data streams: %s", exc)
         
         logger.info("Entry loop completed")
 
@@ -261,7 +267,12 @@ class EntryLoop:
                 
                 for order in orders:
                     symbol = getattr(order, 'symbol', None)
-                    if symbol in watchlist_symbols:
+                    client_order_id = getattr(order, 'client_order_id', None)
+                    if symbol in watchlist_symbols and client_order_id and (
+                        client_order_id.startswith("ENTRY:")
+                        or client_order_id.startswith("EXIT:")
+                        or client_order_id.startswith("MM:")
+                    ):
                         order_status = getattr(order, 'status', None)
                         if order_status in {'new', 'partially_filled', 'submitted', 'accepted'}:
                             try:
@@ -290,23 +301,45 @@ class EntryLoop:
         except Exception as e:
             logger.error(f"Could not check broker positions during emergency flatten: {e}")
         
-        # Clear pending states and remove positions
-        for symbol in list(self.positions.positions.keys()):
-            state = self.positions.positions[symbol]
+        client = getattr(self.ctx.execution, "client", None)
+
+        # Update position state and request broker close
+        for symbol, state in list(self.positions.positions.items()):
             broker_qty = broker_positions.get(symbol, 0)
-            
-            logger.error(f"Emergency removing position {symbol} "
-                        f"(local_qty={state.qty}, broker_qty={broker_qty})")
-            
-            # Record as emergency exit
-            state.exit_time = market_now()
+
+            logger.error(
+                "Emergency flattening %s (local_qty=%.4f, broker_qty=%.4f)",
+                symbol,
+                state.qty,
+                broker_qty,
+            )
+
+            submitted_ts = time.monotonic()
+            order = None
+            if client is not None:
+                try:
+                    order = client.close_position(symbol)
+                except Exception as exc:
+                    logger.critical("Broker close_position failed for %s during emergency flatten: %s", symbol, exc)
+
+            # Record emergency exit request and keep state pending for reconciliation
             state.exit_reason = "emergency_flatten"
-            state.exit_pending = False
-            
-            # Remove from positions
-            self.positions.positions.pop(symbol, None)
-        
-        # Persist the cleared state
+            state.exit_pending = True
+            state.exit_submitted_ts = submitted_ts
+            state.exit_time = None
+            if order is not None:
+                state.exit_order_id = getattr(order, "id", state.exit_order_id)
+                client_id = getattr(order, "client_order_id", None)
+                if client_id:
+                    state.exit_client_order_id = client_id
+
+            # If broker reports zero shares, allow cleanup
+            if broker_qty <= 0:
+                state.exit_pending = False
+                state.exit_time = market_now()
+                self.positions.positions.pop(symbol, None)
+
+        # Persist updated state after emergency actions
         self.positions._persist()
         
         # Log critical warning about broker reality mismatch

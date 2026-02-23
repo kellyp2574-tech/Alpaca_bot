@@ -120,9 +120,9 @@ class ExecutionClient:
         else:
             slip = self.cfg.sell_slippage_pct
             raw = price * (1 - slip)
-            # Ensure we're not too aggressive on low-priced stocks  
-            # Use min to ensure we don't go below a reasonable marketable level
-            raw = min(raw, price - max(0.01, price * 0.001))  # At least 0.01 or 0.1% of price
+            # Ensure we maintain a marketable discount without going negative
+            tick = max(0.01, price * 0.001)
+            raw = max(raw, price - tick)
         raw = max(raw, self.cfg.min_price)
         return round(raw, 2)
 
@@ -274,8 +274,9 @@ class ExecutionClient:
             try:
                 order = self.client.get_order_by_id(order_id)
             except Exception:
-                logger.exception("Failed to poll order %s", order_id)
-                return FillResult(order_id=order_id, filled_qty=0.0, avg_price=fallback_price, status="unknown")
+                logger.warning("Transient error polling order %s; retrying", order_id, exc_info=True)
+                time.sleep(self.cfg.fill_poll_interval_s)
+                continue
             result = self._order_to_fill_result(order, fallback_price=fallback_price)
             if result.status != "unknown":
                 return result

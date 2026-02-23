@@ -4,7 +4,7 @@ Primary: Alpaca Market Data API. Fallback: Yahoo Finance (yfinance).
 """
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
@@ -21,7 +21,7 @@ def get_data_client():
 def _fetch_alpaca(tickers, lookback_days=150):
     """Fetch daily bars from Alpaca. Returns dict of ticker -> {dates, opens, closes}."""
     client = get_data_client()
-    end = datetime.now()
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=int(lookback_days * 1.6))
 
     request = StockBarsRequest(
@@ -50,14 +50,14 @@ def _fetch_alpaca(tickers, lookback_days=150):
 
 def _fetch_yahoo(tickers, lookback_days=150):
     """Fetch daily bars from Yahoo Finance as fallback."""
-    end = datetime.now()
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=int(lookback_days * 1.6))
 
     result = {}
     for ticker in tickers:
         try:
-            df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
-                           end=end.strftime("%Y-%m-%d"), progress=False)
+            df = yf.download(ticker, start=start.date().isoformat(),
+                           end=end.date().isoformat(), progress=False)
             if df.empty:
                 result[ticker] = {"dates": [], "opens": [], "closes": []}
                 continue

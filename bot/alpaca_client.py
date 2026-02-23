@@ -79,6 +79,23 @@ def buy_notional(symbol, dollar_amount):
     return order
 
 
+def buy(symbol, qty):
+    """Buy a specific quantity of shares."""
+    if qty <= 0:
+        logger.warning(f"Skipping buy of {symbol}: qty={qty} <= 0")
+        return None
+    client = get_trading_client()
+    order_data = MarketOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+    )
+    order = client.submit_order(order_data=order_data)
+    logger.info(f"BUY {symbol} qty={qty} | order_id={order.id}")
+    return order
+
+
 def sell_all(symbol):
     """Sell entire position of a symbol."""
     pos = get_position(symbol)

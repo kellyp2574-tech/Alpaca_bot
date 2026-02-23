@@ -10,8 +10,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from bot import config
+from zoneinfo import ZoneInfo
+
+from .state_manager import _atomic_write_json
 
 logger = logging.getLogger("trade_reporter")
+
+MARKET_TZ = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -93,35 +98,43 @@ class TradeReporter:
         """Load existing trade data"""
         try:
             if self.trades_file.exists():
-                with open(self.trades_file, 'r') as f:
+                with self.trades_file.open('r', encoding='utf-8') as f:
                     trades_data = json.load(f)
                     self.trades = [TradeRecord(**t) for t in trades_data]
             
             if self.completed_trades_file.exists():
-                with open(self.completed_trades_file, 'r') as f:
+                with self.completed_trades_file.open('r', encoding='utf-8') as f:
                     completed_data = json.load(f)
                     self.completed_trades = [CompletedTrade(**t) for t in completed_data]
                     
         except Exception as e:
+            timestamp = datetime.now(MARKET_TZ).strftime("%Y%m%d%H%M%S")
             logger.error(f"Error loading trade data: {e}")
-            self.trades = []
-            self.completed_trades = []
+            try:
+                if self.trades_file.exists():
+                    backup = self.trades_file.with_name(f"{self.trades_file.name}.corrupt-{timestamp}")
+                    os.replace(self.trades_file, backup)
+                if self.completed_trades_file.exists():
+                    backup = self.completed_trades_file.with_name(f"{self.completed_trades_file.name}.corrupt-{timestamp}")
+                    os.replace(self.completed_trades_file, backup)
+            except Exception as backup_exc:
+                logger.critical("Failed to back up corrupt trade data: %s", backup_exc)
+            raise
     
     def _save_data(self):
         """Save trade data to files"""
         try:
             # Save trades
             trades_data = [asdict(t) for t in self.trades]
-            with open(self.trades_file, 'w') as f:
-                json.dump(trades_data, f, indent=2)
+            _atomic_write_json(self.trades_file, trades_data)
             
             # Save completed trades
             completed_data = [asdict(t) for t in self.completed_trades]
-            with open(self.completed_trades_file, 'w') as f:
-                json.dump(completed_data, f, indent=2)
+            _atomic_write_json(self.completed_trades_file, completed_data)
                 
         except Exception as e:
             logger.error(f"Error saving trade data: {e}")
+            raise
     
     def add_trade(self, symbol: str, action: str, quantity: float, price: float, 
                   strategy: str, order_id: str = None, client_order_id: str = None, 
@@ -132,7 +145,7 @@ class TradeReporter:
             action=action,
             quantity=quantity,
             price=price,
-            timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now(MARKET_TZ).isoformat(),
             strategy=strategy,
             order_id=order_id,
             client_order_id=client_order_id,
@@ -374,14 +387,17 @@ def log_trade_with_reporting(symbol: str, action: str, quantity: float, price: f
                             strategy: str, order_id: str = None, client_order_id: str = None, 
                             notes: str = None):
     """Convenience function to log trade and update reporting"""
-    reporter = get_trade_reporter()
-    reporter.add_trade(
-        symbol=symbol,
-        action=action,
-        quantity=quantity,
-        price=price,
-        strategy=strategy,
-        order_id=order_id,
-        client_order_id=client_order_id,
-        notes=notes
-    )
+    try:
+        reporter = get_trade_reporter()
+        reporter.add_trade(
+            symbol=symbol,
+            action=action,
+            quantity=quantity,
+            price=price,
+            strategy=strategy,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            notes=notes
+        )
+    except Exception:
+        logger.exception("Trade reporting failed for %s %s; continuing", action, symbol)

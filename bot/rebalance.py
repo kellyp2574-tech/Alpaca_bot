@@ -176,6 +176,7 @@ def fetch_common_data():
 def run_rebalance(dry_run=False, force=False):
     """Rebalance portfolio to 50% 3 ETF rotation, 50% cash"""
     state = load_state()
+    logger.info("MMStateStore imported from %s", MMStateStore.__module__)
     logger.info("=" * 60)
     logger.info("REBALANCE RUN" + (" [DRY RUN]" if dry_run else ""))
     logger.info("Target: 50% 3 ETF rotation, 50% cash")
@@ -249,9 +250,17 @@ def run_rebalance(dry_run=False, force=False):
                 broker.buy_notional(ma_ticker, buy_amount)
                 log_trade(state, "BUY", ma_ticker, f"${buy_amount:.0f}", 0,
                           f"rebalance 50% allocation")
-                log_trade_with_reporting(ma_ticker, "BUY", buy_amount / ctx.get("live_prices", {}).get(ma_ticker, 1), 
-                                        ctx.get("live_prices", {}).get(ma_ticker, 0), 
-                                        "etf_rotation", notes="rebalance 50% allocation")
+                try:
+                    log_trade_with_reporting(
+                        ma_ticker,
+                        "BUY",
+                        buy_amount / ctx.get("live_prices", {}).get(ma_ticker, 1),
+                        ctx.get("live_prices", {}).get(ma_ticker, 0),
+                        "etf_rotation",
+                        notes="rebalance 50% allocation",
+                    )
+                except Exception:
+                    logger.exception("Rebalance reporting failed for %s BUY; continuing", ma_ticker)
             else:
                 logger.info(f"  [DRY RUN] Would buy ${buy_amount:,.2f} of {ma_ticker}")
             return finish("REBALANCE COMPLETE (buy)")
@@ -284,9 +293,17 @@ def run_rebalance(dry_run=False, force=False):
                 logger.info(f"TRIM order_id={order.id}")
                 log_trade(state, "SELL", ma_ticker, f"{trim_qty:.4f}", 0,
                           f"rebalance 50% allocation")
-                log_trade_with_reporting(ma_ticker, "SELL", trim_qty, 
-                                        ctx.get("live_prices", {}).get(ma_ticker, 0), 
-                                        "etf_rotation", notes="rebalance 50% allocation")
+                try:
+                    log_trade_with_reporting(
+                        ma_ticker,
+                        "SELL",
+                        trim_qty,
+                        ctx.get("live_prices", {}).get(ma_ticker, 0),
+                        "etf_rotation",
+                        notes="rebalance 50% allocation",
+                    )
+                except Exception:
+                    logger.exception("Rebalance reporting failed for %s SELL; continuing", ma_ticker)
             else:
                 logger.info(f"  [DRY RUN] Would trim {trim_qty:.4f} shares of {ma_ticker}")
             return finish("REBALANCE COMPLETE (trim)")
@@ -311,9 +328,17 @@ def run_rebalance(dry_run=False, force=False):
             log_trade(state, "BUY", ma_target, f"${buy_amount:.0f}", 0,
                       f"rebalance 50% allocation")
             state["ma_holding"] = ma_target
-            log_trade_with_reporting(ma_target, "BUY", buy_amount / ctx.get("live_prices", {}).get(ma_target, 1), 
-                                    ctx.get("live_prices", {}).get(ma_target, 0), 
-                                    "etf_rotation", notes="rebalance 50% allocation")
+            try:
+                log_trade_with_reporting(
+                    ma_target,
+                    "BUY",
+                    buy_amount / ctx.get("live_prices", {}).get(ma_target, 1),
+                    ctx.get("live_prices", {}).get(ma_target, 0),
+                    "etf_rotation",
+                    notes="rebalance 50% allocation",
+                )
+            except Exception:
+                logger.exception("Rebalance reporting failed for %s BUY; continuing", ma_target)
         else:
             logger.info(f"  [DRY RUN] Would buy ${buy_amount:,.2f} of {ma_target}")
         

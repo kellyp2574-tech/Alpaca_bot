@@ -3,11 +3,20 @@ Persistent State Manager — Saves/loads bot state to JSON.
 Tracks MA crossover counters, current holdings, dip trade state.
 """
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Dict, Any, Optional
+
+from zoneinfo import ZoneInfo
+
 from bot.config import STATE_FILE, STATE_DIR
+
+
+MARKET_TZ = ZoneInfo("America/New_York")
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_STATE = {
@@ -33,11 +42,53 @@ DEFAULT_STATE = {
 }
 
 
+def _read_json_strict(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        timestamp = datetime.now(MARKET_TZ).strftime("%Y%m%d%H%M%S")
+        backup = path.with_name(f"{path.name}.corrupt-{timestamp}")
+        try:
+            os.replace(path, backup)
+        except OSError:
+            # If replace fails, surface original error with context
+            raise RuntimeError(
+                f"State file {path} is corrupted and could not be backed up"
+            ) from exc
+        raise RuntimeError(
+            f"State file {path} is corrupted; moved to {backup}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read state file {path}") from exc
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with NamedTemporaryFile(
+            mode="w", dir=str(path.parent), delete=False, encoding="utf-8"
+        ) as tmp:
+            json.dump(payload, tmp, indent=2, default=str)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        # Ensure temp file is cleaned up on failure
+        try:
+            if 'tmp_path' in locals() and tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(f"Failed to persist state file {path}") from exc
+
+
 def load_state():
     os.makedirs(STATE_DIR, exist_ok=True)
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            saved = json.load(f)
+    state_path = Path(STATE_FILE)
+    if state_path.exists():
+        saved = _read_json_strict(state_path)
         # Merge with defaults to handle new fields
         state = {**DEFAULT_STATE, **saved}
         return state
@@ -46,14 +97,13 @@ def load_state():
 
 def save_state(state):
     os.makedirs(STATE_DIR, exist_ok=True)
-    state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    state["last_run"] = datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    _atomic_write_json(Path(STATE_FILE), state)
 
 
 def log_trade(state, action, ticker, qty, price, reason=""):
     entry = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(MARKET_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "action": action,
         "ticker": ticker,
         "qty": qty,
@@ -78,20 +128,12 @@ class StateStore:
     def _load_data(self) -> Dict[str, Any]:
         """Load data from file."""
         if self.file_path.exists():
-            try:
-                with open(self.file_path, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"Error loading state from {self.file_path}: {e}")
+            return _read_json_strict(self.file_path)
         return {}
     
     def _save_data(self, data: Dict[str, Any]) -> None:
         """Save data to file."""
-        try:
-            with open(self.file_path, 'w') as f:
-                json.dump(data, f, indent=2, default=str)
-        except IOError as e:
-            print(f"Error saving state to {self.file_path}: {e}")
+        _atomic_write_json(self.file_path, data)
     
     def save_positions(self, positions: Dict[str, Any]) -> None:
         """Save positions to state store."""
@@ -111,10 +153,14 @@ class StateStore:
             return {}
         
         from .storage import position_state_from_dict
-        return {
-            symbol: position_state_from_dict(state_data)
-            for symbol, state_data in positions_data.items()
-        }
+        positions: Dict[str, Any] = {}
+        for symbol, state_data in positions_data.items():
+            state = position_state_from_dict(state_data)
+            if state is not None:
+                positions[symbol] = state
+            else:
+                logger.error("Skipping corrupted position state for %s", symbol)
+        return positions
     
     def save_pending_entry(self, pending_entry) -> None:
         """Save a pending entry to state store."""

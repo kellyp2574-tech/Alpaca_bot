@@ -1,8 +1,16 @@
 """Dataclasses representing core runtime entities."""
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+from zoneinfo import ZoneInfo
+
+
+logger = logging.getLogger(__name__)
+
+MARKET_TZ = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -94,10 +102,20 @@ def pending_entry_from_dict(payload: Dict[str, Any]) -> PendingEntryState:
     )
 
 
+def _ensure_market_tz(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=MARKET_TZ)
+    return dt.astimezone(MARKET_TZ)
+
+
 def position_state_to_dict(state: PositionState) -> Dict[str, Any]:
+    entry_time = _ensure_market_tz(state.entry_time)
+    exit_time = _ensure_market_tz(state.exit_time)
     return {
         "symbol": state.symbol,
-        "entry_time": state.entry_time.isoformat(),
+        "entry_time": entry_time.isoformat() if entry_time else None,
         "entry_price": state.entry_price,
         "qty": state.qty,
         "stop_price": state.stop_price,
@@ -115,56 +133,63 @@ def position_state_to_dict(state: PositionState) -> Dict[str, Any]:
         "exit_submitted_ts": state.exit_submitted_ts,
         "exit_attempts": state.exit_attempts,
         "exit_reason": state.exit_reason,
-        "exit_time": state.exit_time.isoformat() if state.exit_time else None,
+        "exit_time": exit_time.isoformat() if exit_time else None,
         "exit_price": state.exit_price,
         "realized_r": state.realized_r,
     }
 
 
-def position_state_from_dict(payload: Dict[str, Any]) -> PositionState:
-    entry_time = datetime.fromisoformat(payload["entry_time"])
-    exit_time = (
-        datetime.fromisoformat(payload["exit_time"])
-        if payload.get("exit_time")
-        else None
-    )
-    return PositionState(
-        symbol=payload["symbol"],
-        entry_time=entry_time,
-        entry_price=float(payload["entry_price"]),
-        qty=float(payload["qty"]),
-        stop_price=float(payload["stop_price"]),
-        peak_price=float(payload["peak_price"]),
-        r_stop_pct=float(payload["r_stop_pct"]),
-        trail_pct=(
-            float(payload["trail_pct"])
-            if payload.get("trail_pct") is not None
-            else None
-        ),
-        breakeven_set=bool(payload.get("breakeven_set", False)),
-        trail_active=bool(payload.get("trail_active", False)),
-        entry_order_id=payload.get("entry_order_id") or None,
-        entry_client_order_id=payload.get("entry_client_order_id") or None,
-        spread_bad_count=int(payload.get("spread_bad_count", 0)),
-        exit_pending=bool(payload.get("exit_pending", False)),
-        exit_order_id=payload.get("exit_order_id") or None,
-        exit_client_order_id=payload.get("exit_client_order_id") or None,
-        exit_submitted_ts=(
-            float(payload["exit_submitted_ts"])
-            if payload.get("exit_submitted_ts") is not None
-            else None
-        ),
-        exit_attempts=int(payload.get("exit_attempts", 0)),
-        exit_reason=str(payload.get("exit_reason", "")),
-        exit_time=exit_time,
-        exit_price=(
-            float(payload["exit_price"])
-            if payload.get("exit_price") is not None
-            else None
-        ),
-        realized_r=(
-            float(payload["realized_r"])
-            if payload.get("realized_r") is not None
-            else None
-        ),
-    )
+def position_state_from_dict(payload: Dict[str, Any]) -> Optional[PositionState]:
+    try:
+        entry_raw = payload["entry_time"]
+        if not entry_raw:
+            raise ValueError("missing entry_time")
+        entry_time = _ensure_market_tz(datetime.fromisoformat(entry_raw))
+
+        exit_raw = payload.get("exit_time")
+        exit_time = _ensure_market_tz(datetime.fromisoformat(exit_raw)) if exit_raw else None
+
+        return PositionState(
+            symbol=str(payload["symbol"]),
+            entry_time=entry_time,
+            entry_price=float(payload["entry_price"]),
+            qty=float(payload["qty"]),
+            stop_price=float(payload["stop_price"]),
+            peak_price=float(payload["peak_price"]),
+            r_stop_pct=float(payload["r_stop_pct"]),
+            trail_pct=(
+                float(payload["trail_pct"])
+                if payload.get("trail_pct") is not None
+                else None
+            ),
+            breakeven_set=bool(payload.get("breakeven_set", False)),
+            trail_active=bool(payload.get("trail_active", False)),
+            entry_order_id=payload.get("entry_order_id") or None,
+            entry_client_order_id=payload.get("entry_client_order_id") or None,
+            spread_bad_count=int(payload.get("spread_bad_count", 0)),
+            exit_pending=bool(payload.get("exit_pending", False)),
+            exit_order_id=payload.get("exit_order_id") or None,
+            exit_client_order_id=payload.get("exit_client_order_id") or None,
+            exit_submitted_ts=(
+                float(payload["exit_submitted_ts"])
+                if payload.get("exit_submitted_ts") is not None
+                else None
+            ),
+            exit_attempts=int(payload.get("exit_attempts", 0)),
+            exit_reason=str(payload.get("exit_reason", "")),
+            exit_time=exit_time,
+            exit_price=(
+                float(payload["exit_price"])
+                if payload.get("exit_price") is not None
+                else None
+            ),
+            realized_r=(
+                float(payload["realized_r"])
+                if payload.get("realized_r") is not None
+                else None
+            ),
+        )
+    except Exception as exc:
+        symbol = payload.get("symbol", "UNKNOWN")
+        logger.error("Failed to deserialize position state for %s: %s", symbol, exc)
+        return None
