@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Iterable, List
 
 from .clock import window_from_strings
-from .config import Config
+from .morning_config import Config
 from .storage import Candidate
 
 

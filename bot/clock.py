@@ -8,7 +8,7 @@ from typing import Optional
 
 from zoneinfo import ZoneInfo
 
-from .config import Config
+from .morning_config import Config
 
 MARKET_TZ = ZoneInfo("America/New_York")
 
