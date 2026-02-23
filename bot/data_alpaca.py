@@ -78,7 +78,7 @@ class AlpacaDataAdapter:
     ) -> None:
         api_key = api_key or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
         secret_key = secret_key or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
-        feed = feed or os.getenv("ALPACA_DATA_FEED", "sip")
+        feed = (feed or os.getenv("ALPACA_DATA_FEED", "iex")).lower()
 
         if not api_key or not secret_key:
             raise ValueError(
