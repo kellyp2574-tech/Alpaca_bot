@@ -21,7 +21,7 @@ try:  # Run-time dependency on alpaca-py
         StockBarsRequest,
         StockLatestQuoteRequest,
     )
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 except (
     ImportError
 ) as exc:  # pragma: no cover - surfaced when module imported without deps
@@ -31,6 +31,15 @@ except (
 load_dotenv()  # loads ALPACA_* variables from .env if present
 
 from .clock import MARKET_TZ, market_now
+
+# TimeFrame mapping for alpaca-py compatibility
+_TIMEFRAME_MAP = {
+    "1Min": TimeFrame(1, TimeFrameUnit.Minute),
+    "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+    "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+    "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
+    "1Day": TimeFrame(1, TimeFrameUnit.Day),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +131,7 @@ class AlpacaDataAdapter:
         end_utc = self._ensure_utc(end)
 
         # Map timeframe to Alpaca TimeFrame
-        timeframe_map = {
-            "1Min": TimeFrame.Minute,
-            "5Min": TimeFrame.Minute * 5,
-        }
-        alpaca_timeframe = timeframe_map[timeframe]
+        alpaca_timeframe = _TIMEFRAME_MAP[timeframe]
 
         request = StockBarsRequest(
             symbol_or_symbols=list(symbols),
@@ -160,7 +165,7 @@ class AlpacaDataAdapter:
 
         request = StockBarsRequest(
             symbol_or_symbols=list(symbols),
-            timeframe=TimeFrame.Day,
+            timeframe=_TIMEFRAME_MAP["1Day"],
             start=self._ensure_utc(start_dt),
             end=self._ensure_utc(end_dt),
             feed=self.feed,
