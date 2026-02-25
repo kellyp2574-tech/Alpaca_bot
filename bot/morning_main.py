@@ -654,9 +654,19 @@ def fetch_candidates(
     """Fetch and filter candidates for the morning momentum strategy."""
     logger.info("Fetching morning momentum candidates...")
     
-    # Get most active symbols
-    symbols = data.alpaca.get_most_actives(most_active_count)
-    logger.info(f"Found {len(symbols)} most active symbols")
+    # Get most active symbols with fallback handling
+    try:
+        symbols = data.alpaca.get_most_actives(min(most_active_count, 100))
+        logger.info(f"Found {len(symbols)} most active symbols")
+    except Exception as e:
+        logger.error(f"Failed to fetch most actives with count={most_active_count}: {e}")
+        # Fallback: try with smaller count
+        try:
+            symbols = data.alpaca.get_most_actives(50)
+            logger.warning(f"Fallback: fetched {len(symbols)} symbols with count=50")
+        except Exception as fallback_e:
+            logger.error(f"Fallback also failed: {fallback_e}")
+            symbols = []  # Keep bot alive even if screener fails
     
     # Build candidates
     today = market_now().date()

@@ -101,8 +101,13 @@ class AlpacaDataAdapter:
 
     def get_most_actives(self, count: int = 50) -> List[str]:
         """Return the most-active symbols (by volume)."""
+        # Alpaca screener "most-actives" supports only up to 100
+        capped = max(1, min(int(count), 100))
+        if capped != count:
+            logger.warning(f"most_active_count={count} capped to {capped} (Alpaca limit is 100)")
+        
         by = getattr(MostActivesBy, "DOLLAR_VOLUME", None) or MostActivesBy.VOLUME
-        req = MostActivesRequest(top=count, by=by)
+        req = MostActivesRequest(top=capped, by=by)
         resp = self._screener.get_most_actives(req)
         items = resp.most_actives or []
         symbols = []
