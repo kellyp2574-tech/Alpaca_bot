@@ -158,13 +158,25 @@ class IntegratedBot:
                 logger.info("Reached 3:30 PM - exiting")
                 break
             
-            # If market has closed early, exit gracefully
-            if current_time >= datetime.strptime("09:30", "%H:%M").time() and not self.dry_run:
+            # If market has closed early, exit gracefully (avoid false negatives at the open)
+            if current_time >= datetime.strptime("09:35", "%H:%M").time() and not self.dry_run:
                 try:
                     clock = broker.get_clock()
                     if not clock.is_open:
-                        logger.info("Market clock indicates closed session; shutting down loop")
-                        break
+                        # require confirmation before exiting
+                        if not hasattr(self, "_closed_clock_first_seen"):
+                            self._closed_clock_first_seen = time.monotonic()
+                            logger.warning(
+                                "Clock reports closed after 9:35; will re-check before exiting. "
+                                f"next_open={getattr(clock,'next_open',None)} next_close={getattr(clock,'next_close',None)}"
+                            )
+                        elif time.monotonic() - self._closed_clock_first_seen > 60:
+                            logger.info("Market clock still closed after confirm window; shutting down loop")
+                            break
+                    else:
+                        # reset if clock is healthy again
+                        if hasattr(self, "_closed_clock_first_seen"):
+                            delattr(self, "_closed_clock_first_seen")
                 except Exception as e:
                     logger.warning(f"Failed to check market clock during run loop: {e}")
 
@@ -571,7 +583,7 @@ class IntegratedBot:
             candidates, stats = fetch_candidates(
                 self.mm_config,
                 self.mm_data,
-                most_active_count=50,
+                most_active_count=500,
                 force_universe_refresh=True,
             )
             
