@@ -129,8 +129,8 @@ class AlpacaDataAdapter:
         end: datetime,
     ) -> Dict[str, List[MinuteBar]]:
         """Fetch minute bars for symbols within [start, end]."""
-        if timeframe not in ["1Min", "5Min"]:
-            raise ValueError("Only 1Min and 5Min timeframes are supported")
+        if timeframe not in _TIMEFRAME_MAP:
+            raise ValueError(f"Supported timeframes: {list(_TIMEFRAME_MAP.keys())}")
 
         start_utc = self._ensure_utc(start)
         end_utc = self._ensure_utc(end)

@@ -583,7 +583,7 @@ class IntegratedBot:
             candidates, stats = fetch_candidates(
                 self.mm_config,
                 self.mm_data,
-                most_active_count=500,
+                most_active_count=100,
                 force_universe_refresh=True,
             )
             
