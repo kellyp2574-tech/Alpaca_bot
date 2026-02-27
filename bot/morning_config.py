@@ -26,7 +26,8 @@ class Config:
     max_gap_pct: float = 0.25  # 25% max gap (wider bucket)
     opening_strength: bool = True  # First 5-min candle must be green
     max_seed_universe: int = 600  # Max symbols from Massive snapshot
-    max_candidates: int = 35  # Max candidates to monitor (wider net)
+    max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
+    max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
 
     # Position sizing (50% of available cash)
     daily_deploy_pct: float = 0.50  # 50% of cash per day

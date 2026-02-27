@@ -503,15 +503,16 @@ class EntryLoop:
             effective_entry_price = entry_price * buy_slip_buffer if buy_slip_buffer > 0 else entry_price
             qty = target_notional_per_position / effective_entry_price
             
-            # Apply 5% volume constraint for first 5 minutes
+            # Apply volume constraint for first 5 minutes (use config value, default 1%)
             if len(first_5min_bars) >= 5:
                 dollar_vol_5min = sum(bar.v * bar.c for bar in first_5min_bars)
-                max_notional_5pct = dollar_vol_5min * 0.05  # 5% of 5-minute volume
-                max_qty_5pct = max_notional_5pct / effective_entry_price
-                qty = min(qty, max_qty_5pct)
+                vol_cap_pct = getattr(self.ctx.cfg, "max_position_pct_of_5min_vol", 0.01)
+                max_notional_vol_cap = dollar_vol_5min * vol_cap_pct
+                max_qty_vol_cap = max_notional_vol_cap / effective_entry_price
+                qty = min(qty, max_qty_vol_cap)
                 
-                logger.info("%s sizing: target=$%.0f, 5%%vol_cap=$%.0f, qty=%.0f shares", 
-                           symbol, target_notional_per_position, max_notional_5pct, qty)
+                logger.info("%s sizing: target=$%.0f, %.1f%%vol_cap=$%.0f, qty=%.0f shares", 
+                           symbol, target_notional_per_position, vol_cap_pct*100, max_notional_vol_cap, qty)
             
             # Check if fractional trading is allowed
             fractionable = self.ctx.execution.is_fractionable(symbol)
@@ -666,8 +667,12 @@ def fetch_candidates(
 
     # Optional: save audit file
     try:
-        report_path = Path("state/candidates") / f"{today.date().isoformat()}.json"
+        BASE_DIR = Path(__file__).resolve().parents[1]  # project root
+        report_path = BASE_DIR / "state" / "candidates" / f"{today.date().isoformat()}.json"
+        
+        # Ensure directories exist
         report_path.parent.mkdir(parents=True, exist_ok=True)
+        
         ledger.save(report_path)
         logger.info(f"Saved candidate ledger → {report_path}")
     except Exception as e:
@@ -771,8 +776,8 @@ def main() -> None:
         logger.error("No candidates found")
         return
 
-    # Use top candidates (wider net - monitor up to max_candidates)
-    n = getattr(cfg, "max_candidates", 35)
+    # Use top candidates (wider net - monitor up to max_candidates_monitored)
+    n = getattr(cfg, "max_candidates_monitored", 35)
     watchlist = candidates[:n]
     subscribe_symbols = [c.symbol for c in candidates[:n]]
     candidate_map = {c.symbol: c for c in candidates[:n]}

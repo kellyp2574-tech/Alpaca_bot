@@ -255,7 +255,7 @@ def build_candidates(
     ledger.drops.extend(seed_drops)
 
     # Stage B: Alpaca snapshot validates gap truth
-    max_candidates = getattr(cfg, "max_candidates", 300)
+    max_candidates = getattr(cfg, "max_candidates_returned", 300)
     candidates = build_candidates_alpaca_snapshot(
         cfg,
         alpaca,
