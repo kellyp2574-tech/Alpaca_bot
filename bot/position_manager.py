@@ -74,6 +74,40 @@ def calc_qty(
     return max(0.0, shares)
 
 
+def apply_volume_cap(
+    qty: float,
+    entry_price: float,
+    five_min_dollar_volume: float,
+    cfg: Config,
+) -> float:
+    """
+    Apply volume cap: max 1% of morning 5-min dollar volume.
+    Returns the smaller of risk-based qty or volume-capped qty.
+    """
+    if not cfg.use_smaller_of_sizing_or_vol_cap:
+        return qty
+    
+    if five_min_dollar_volume <= 0:
+        return qty
+    
+    # Max dollar amount = 1% of 5-min volume
+    max_dollar_amount = five_min_dollar_volume * cfg.max_position_pct_of_5min_vol
+    
+    # Convert to shares
+    max_qty_by_volume = max_dollar_amount / entry_price if entry_price > 0 else 0.0
+    
+    # Return smaller of the two
+    capped_qty = min(qty, max_qty_by_volume)
+    
+    if capped_qty < qty:
+        logger.info(
+            f"Volume cap applied: {qty:.0f} shares → {capped_qty:.0f} shares "
+            f"(1% of ${five_min_dollar_volume:,.0f} 5-min volume)"
+        )
+    
+    return capped_qty
+
+
 class PositionManager:
     def __init__(
         self,

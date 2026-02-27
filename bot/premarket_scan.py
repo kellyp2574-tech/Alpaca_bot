@@ -1,135 +1,278 @@
-"""Premarket scanning pipeline for the gap momentum strategy."""
+"""
+Premarket scanning pipeline (Option B):
+Massive seeds universe (broad + cheap), Alpaca snapshots validate gap (truth).
+"""
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Iterable, List
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
-from .clock import window_from_strings
 from .morning_config import Config
 from .storage import Candidate
 
 
-def build_candidates(
+# ---------------------------
+# Ledger tracking (audit)
+# ---------------------------
+
+@dataclass
+class Drop:
+    symbol: str
+    stage: str
+    reason: str
+    details: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateLedger:
+    run_date: str
+    seed_source: str = "massive_full_snapshot"
+    seed_total: int = 0          # total snapshot items we processed (usable)
+    seed_selected: int = 0       # seed symbols we pass to Alpaca validation
+    validated: int = 0           # symbols that passed Alpaca snapshot checks & filters
+    final: int = 0               # final candidates returned
+    drops: List[Drop] = field(default_factory=list)
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = asdict(self)
+        payload["drops"] = [asdict(d) for d in self.drops]
+        path.write_text(__import__("json").dumps(payload, indent=2))
+
+
+# ---------------------------
+# Massive: seed universe
+# ---------------------------
+
+def _safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def seed_universe_massive(
+    massive_client,
+    *,
+    max_seed: int = 600,
+    include_otc: bool = False,
+) -> Tuple[List[str], Dict[str, object], List[Drop]]:
+    """
+    Use Massive full market snapshot to get a broad, liquid seed universe.
+    We DO NOT use Massive 'todaysChangePerc' for gap truth (delay/session semantics).
+    We only use it to optionally pre-rank or loosen filters if you want later.
+
+    Returns:
+        seed_symbols: top max_seed by liquidity proxy
+        meta: summary stats
+        drops: any drop reasons observed
+    """
+    drops: List[Drop] = []
+
+    # Massive python SDK: get_snapshot_all("stocks", include_otc="false")
+    snapshot = massive_client.get_snapshot_all("stocks", include_otc=str(include_otc).lower())
+
+    rows: List[Tuple[str, float, float, float]] = []
+    # (symbol, liquidity_proxy, prev_close, prev_vol)
+
+    usable = 0
+    for item in snapshot:
+        # Support SDK objects (attributes) and dict-like
+        t = getattr(item, "ticker", None) or (item.get("ticker") if isinstance(item, dict) else None)
+        prev = getattr(item, "prev_day", None) or getattr(item, "prevDay", None) or (item.get("prevDay") if isinstance(item, dict) else None)
+
+        if not t or not prev:
+            continue
+
+        # prev close + volume (naming depends on model; your JSON shows prevDay.c, prevDay.v)
+        prev_c = getattr(prev, "c", None) if not isinstance(prev, dict) else prev.get("c")
+        prev_v = getattr(prev, "v", None) if not isinstance(prev, dict) else prev.get("v")
+
+        prev_close = _safe_float(prev_c)
+        prev_vol = _safe_float(prev_v)
+
+        if prev_close <= 0:
+            drops.append(Drop(t, "massive_seed", "no_prev_close", {}))
+            continue
+
+        # Liquidity proxy: prev_close * prev_vol
+        liq = prev_close * prev_vol
+        usable += 1
+        rows.append((t, liq, prev_close, prev_vol))
+
+    # Sort by liquidity and take top N
+    rows.sort(key=lambda r: r[1], reverse=True)
+    seed_rows = rows[:max_seed]
+    seed_symbols = [r[0] for r in seed_rows]
+
+    meta = {
+        "usable_snapshot_items": usable,
+        "max_seed": max_seed,
+    }
+    return seed_symbols, meta, drops
+
+
+# ---------------------------
+# Alpaca snapshots: gap truth
+# ---------------------------
+
+def build_candidates_alpaca_snapshot(
     cfg: Config,
     alpaca,
-    symbols: Iterable[str],
-    date: datetime,
+    seed_symbols: List[str],
+    now: datetime,
+    *,
+    max_candidates: int = 300,
+    ledger: Optional[CandidateLedger] = None,
 ) -> List[Candidate]:
-    """Build candidates based on gap strategy filters.
-
-    Args:
-        cfg: Strategy configuration.
-        alpaca: Adapter exposing Alpaca data helpers.
-        symbols: Iterable of symbols from most-actives list.
-        date: Trading date.
     """
+    Uses Alpaca Snapshot API data to compute real gap vs previous close:
+        prev_close = snapshot.prevDailyBar.c
+        price_now  = mid(quote) or latestTrade.p
 
-    scan_window = window_from_strings(
-        reference=date,
-        start_str=cfg.scan_start,
-        end_str=cfg.scan_end,
-    )
-    
-    # Get daily bars for gap calculation
-    daily = alpaca.get_daily_bars(
-        list(symbols), lookback_days=35, end_dt=scan_window.start
-    )
-    
-    # Get all premarket bars at once (more efficient than one-by-one)
-    pm_bars_all = alpaca.get_bars(
-        list(symbols),
-        timeframe="1Min",
-        start=scan_window.start,
-        end=scan_window.end,
-    )
-    
-    # Get 1-min bars for 9:30-9:35 and aggregate for 5-minute checks
-    market_open = window_from_strings(
-        reference=date,
-        start_str="09:30",
-        end_str="09:35",
-    )
-    min1_bars = alpaca.get_bars(
-        list(symbols),
-        timeframe="1Min",
-        start=market_open.start,
-        end=market_open.end,
-    )
+    Requires: alpaca.get_snapshots(symbols) -> Dict[str, snapshot]
+    """
+    drops: List[Drop] = []
+    out: List[Candidate] = []
 
-    candidates: List[Candidate] = []
-    for symbol in symbols:
-        daily_stats = daily.get(symbol)
-        if not daily_stats:
+    if not seed_symbols:
+        if ledger:
+            ledger.drops.extend(drops)
+        return out
+
+    snaps = alpaca.get_snapshots(seed_symbols)  # must be implemented in AlpacaDataAdapter
+
+    for sym in seed_symbols:
+        snap = snaps.get(sym)
+        if snap is None:
+            drops.append(Drop(sym, "alpaca_snapshot", "no_snapshot", {}))
             continue
 
-        prev_close = daily_stats.prev_close
+        # ---- prev close ----
+        prev_bar = getattr(snap, "prev_daily_bar", None) or getattr(snap, "prevDailyBar", None)
+        prev_close = getattr(prev_bar, "c", None) if prev_bar is not None else None
+        prev_close = _safe_float(prev_close)
         if prev_close <= 0:
+            drops.append(Drop(sym, "alpaca_snapshot", "no_prev_close", {}))
             continue
 
-        # Get latest premarket price from pre-fetched bars
-        pm_bars = pm_bars_all.get(symbol, [])
-        
-        if not pm_bars:
-            continue
-            
-        pm_last = pm_bars[-1].c
-        pm_volume = sum(bar.v for bar in pm_bars)
-        
-        # Price filter
-        price = pm_last
-        if not (cfg.min_price <= price <= cfg.max_price):
-            continue
-            
-        # Dollar volume filter
-        avg_vol_30d = daily_stats.avg_vol_30d
-        dollar_volume = avg_vol_30d * prev_close if avg_vol_30d else 0
-        if dollar_volume < cfg.min_dollar_volume:
-            continue
-            
-        # First 5-min volume filter (require exactly 5 bars for 9:30-9:35 window)
-        first_1min = min1_bars.get(symbol, [])
-        if len(first_1min) < 5:
-            continue  # Need complete 5-minute window
-        first_1min = first_1min[:5]  # Use exactly first 5 minutes
-        
-        # Aggregate 1-min bars for 5-minute volume
-        vol_5min = sum(bar.v for bar in first_1min)
-        dollar_vol_5min = sum(bar.v * bar.c for bar in first_1min)  # True dollar volume
-        if dollar_vol_5min < cfg.min_5min_volume:
+        # ---- price now (prefer quote mid) ----
+        lq = getattr(snap, "latest_quote", None) or getattr(snap, "latestQuote", None)
+        lt = getattr(snap, "latest_trade", None) or getattr(snap, "latestTrade", None)
+
+        price_now = 0.0
+        if lq is not None:
+            bp = _safe_float(getattr(lq, "bp", 0) or getattr(lq, "bid_price", 0))
+            ap = _safe_float(getattr(lq, "ap", 0) or getattr(lq, "ask_price", 0))
+            if bp > 0 and ap > 0:
+                price_now = (bp + ap) / 2.0
+
+        if price_now <= 0 and lt is not None:
+            price_now = _safe_float(getattr(lt, "p", 0) or getattr(lt, "price", 0))
+
+        if price_now <= 0:
+            drops.append(Drop(sym, "alpaca_snapshot", "no_price_now", {}))
             continue
 
-        # Gap calculation
-        gap_pct = (pm_last - prev_close) / prev_close
-        
-        # Gap range filter
+        # ---- Filters ----
+        if not (cfg.min_price <= price_now <= cfg.max_price):
+            drops.append(Drop(sym, "alpaca_snapshot", "price_out_of_range", {"price": price_now}))
+            continue
+
+        gap_pct = (price_now - prev_close) / prev_close
         if not (cfg.min_gap_pct <= gap_pct <= cfg.max_gap_pct):
+            drops.append(Drop(sym, "alpaca_snapshot", "gap_out_of_range", {"gap_pct": gap_pct}))
             continue
 
-        # Opening strength filter: 9:35 close > 9:30 open
-        if cfg.opening_strength and first_1min:
-            open_930 = first_1min[0].o  # First bar's open (9:30)
-            close_935 = first_1min[-1].c  # Last bar's close (9:35)
-            if close_935 <= open_930:
+        # Dollar volume filter (use your existing cfg.min_dollar_volume based on 30d avg in old version).
+        # We do NOT have 30d avg here unless you compute it. For now, use a conservative proxy:
+        # - If Alpaca snapshot includes dailyBar.v, you can approximate today's liquidity
+        daily_bar = getattr(snap, "daily_bar", None) or getattr(snap, "dailyBar", None)
+        day_v = _safe_float(getattr(daily_bar, "v", 0) if daily_bar is not None else 0)
+        day_liq_proxy = day_v * price_now
+
+        # If you want to keep cfg.min_dollar_volume semantics, you can:
+        # - set cfg.min_dollar_volume very low (or 0) for this stage,
+        # - and rely on your 5-min dollar volume check in EntryLoop after open.
+        if getattr(cfg, "min_dollar_volume", 0) and day_liq_proxy > 0:
+            if day_liq_proxy < float(cfg.min_dollar_volume) * 0.10:
+                # loose proxy gate (10% of the configured daily threshold)
+                drops.append(Drop(sym, "alpaca_snapshot", "liq_proxy_too_low", {"day_liq": day_liq_proxy}))
                 continue
 
-        candidates.append(
+        out.append(
             Candidate(
-                symbol=symbol,
-                price=price,
+                symbol=sym,
+                price=price_now,
                 prev_close=prev_close,
-                pm_last=pm_last,
-                pm_high=max(bar.h for bar in pm_bars) if pm_bars else pm_last,
-                pm_volume=pm_volume,
-                avg_vol_30d=avg_vol_30d,
-                float_shares=daily_stats.float_shares if hasattr(daily_stats, 'float_shares') else 0,
+                pm_last=price_now,   # in this architecture, pm_last means "latest snapshot price"
+                pm_high=price_now,   # unknown without premarket bars; safe placeholder
+                pm_volume=0,         # unknown without premarket bars
+                avg_vol_30d=0,       # unknown unless you compute it elsewhere
+                float_shares=0,
                 gap_pct=gap_pct,
                 pm_vol_float=0,
-                relvol=pm_volume / avg_vol_30d if avg_vol_30d > 0 else 0,
-                score=gap_pct,  # Score by gap size
+                relvol=0,
+                score=gap_pct,
             )
         )
 
-    # Sort by gap size (largest gaps first)
-    candidates.sort(key=lambda c: c.gap_pct, reverse=True)
-    return candidates
+        if len(out) >= max_candidates:
+            break
+
+    out.sort(key=lambda c: c.gap_pct, reverse=True)
+
+    if ledger is not None:
+        ledger.drops.extend(drops)
+        ledger.validated = len(out)
+
+    return out
+
+
+# ---------------------------
+# Public entry point (matches your morning_main.py call)
+# ---------------------------
+
+def build_candidates(
+    cfg: Config,
+    alpaca,
+    massive_client,
+    date: datetime,
+) -> Tuple[List[Candidate], CandidateLedger]:
+    """
+    Signature matches morning_main.fetch_candidates():
+        build_candidates(cfg, data.alpaca, data.massive, today)
+
+    Returns:
+        (candidates, ledger)
+    """
+    run_date = date.date().isoformat()
+    ledger = CandidateLedger(run_date=run_date)
+
+    # Stage A: Massive seeds universe
+    max_seed = getattr(cfg, "max_seed_universe", 600)
+    seed_symbols, meta, seed_drops = seed_universe_massive(
+        massive_client,
+        max_seed=max_seed,
+        include_otc=False,
+    )
+    ledger.seed_total = int(meta.get("usable_snapshot_items", 0))
+    ledger.seed_selected = len(seed_symbols)
+    ledger.drops.extend(seed_drops)
+
+    # Stage B: Alpaca snapshot validates gap truth
+    max_candidates = getattr(cfg, "max_candidates", 300)
+    candidates = build_candidates_alpaca_snapshot(
+        cfg,
+        alpaca,
+        seed_symbols,
+        date,
+        max_candidates=max_candidates,
+        ledger=ledger,
+    )
+
+    ledger.final = len(candidates)
+    return candidates, ledger

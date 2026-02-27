@@ -20,6 +20,7 @@ try:  # Run-time dependency on alpaca-py
     from alpaca.data.requests import (
         StockBarsRequest,
         StockLatestQuoteRequest,
+        StockSnapshotRequest,
     )
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 except (
@@ -65,6 +66,31 @@ class DailyStats:
 class Quote:
     bid_price: float
     ask_price: float
+
+
+@dataclass
+class SnapshotBar:
+    c: float
+    v: float
+
+
+@dataclass
+class SnapshotTrade:
+    p: float
+
+
+@dataclass
+class SnapshotQuote:
+    bp: float
+    ap: float
+
+
+@dataclass
+class Snapshot:
+    latest_trade: Optional[SnapshotTrade]
+    latest_quote: Optional[SnapshotQuote]
+    daily_bar: Optional[SnapshotBar]
+    prev_daily_bar: Optional[SnapshotBar]
 
 
 class AlpacaDataAdapter:
@@ -231,6 +257,93 @@ class AlpacaDataAdapter:
             ask = getattr(data, "ask_price", None) or 0.0
             quotes[symbol] = Quote(bid_price=float(bid), ask_price=float(ask))
         return quotes
+
+    def get_snapshots(self, symbols: Sequence[str]) -> Dict[str, "Snapshot"]:
+        """
+        Fetch Alpaca snapshots for multiple symbols.
+        Returns a dict: symbol -> Snapshot with normalized fields the scanner uses.
+        """
+        symbols = list(dict.fromkeys(symbols))
+        if not symbols:
+            return {}
+
+        # Alpaca snapshot endpoint supports multiple symbols, but keep batches sane.
+        # (Even if Alpaca allows more, batching avoids request-size surprises.)
+        def chunk(seq, n):
+            for i in range(0, len(seq), n):
+                yield seq[i:i+n]
+
+        out: Dict[str, Snapshot] = {}
+
+        for batch in chunk(symbols, 200):
+            req = StockSnapshotRequest(symbol_or_symbols=batch, feed=self.feed)
+            resp = self._historical.get_stock_snapshot(req)
+
+            # alpaca-py returns a mapping-like object: resp[symbol] -> snapshot
+            for sym in batch:
+                try:
+                    s = resp[sym]
+                except Exception:
+                    logger.warning("Snapshot missing for %s", sym)
+                    continue
+
+                # latest trade
+                lt = getattr(s, "latest_trade", None)
+                latest_trade = None
+                if lt is not None:
+                    p = getattr(lt, "price", None)
+                    if p is None:
+                        p = getattr(lt, "p", None)
+                    if p is not None:
+                        latest_trade = SnapshotTrade(p=float(p))
+
+                # latest quote
+                lq = getattr(s, "latest_quote", None)
+                latest_quote = None
+                if lq is not None:
+                    bp = getattr(lq, "bid_price", None)
+                    ap = getattr(lq, "ask_price", None)
+                    if bp is None:
+                        bp = getattr(lq, "bp", None)
+                    if ap is None:
+                        ap = getattr(lq, "ap", None)
+                    if bp is not None and ap is not None:
+                        latest_quote = SnapshotQuote(bp=float(bp), ap=float(ap))
+
+                # daily + prev daily bars
+                db = getattr(s, "daily_bar", None)
+                pdb = getattr(s, "prev_daily_bar", None)
+
+                daily_bar = None
+                if db is not None:
+                    c = getattr(db, "close", None)
+                    v = getattr(db, "volume", None)
+                    if c is None:
+                        c = getattr(db, "c", None)
+                    if v is None:
+                        v = getattr(db, "v", None)
+                    if c is not None:
+                        daily_bar = SnapshotBar(c=float(c), v=float(v or 0))
+
+                prev_daily_bar = None
+                if pdb is not None:
+                    c = getattr(pdb, "close", None)
+                    v = getattr(pdb, "volume", None)
+                    if c is None:
+                        c = getattr(pdb, "c", None)
+                    if v is None:
+                        v = getattr(pdb, "v", None)
+                    if c is not None:
+                        prev_daily_bar = SnapshotBar(c=float(c), v=float(v or 0))
+
+                out[sym] = Snapshot(
+                    latest_trade=latest_trade,
+                    latest_quote=latest_quote,
+                    daily_bar=daily_bar,
+                    prev_daily_bar=prev_daily_bar,
+                )
+
+        return out
 
     # ------------------------------------------------------------------
     # Live stream

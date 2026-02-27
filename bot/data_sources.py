@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from massive import RESTClient
 
 from .data_alpaca import AlpacaDataAdapter
+
+load_dotenv()  # Ensure .env is loaded before reading MASSIVE_API_KEY
 
 
 @dataclass
@@ -13,6 +21,7 @@ class DataStack:
     """Container for the core data dependencies."""
 
     alpaca: AlpacaDataAdapter
+    massive: "RESTClient"
 
     def unsubscribe_all(self) -> None:
         try:
@@ -25,6 +34,7 @@ def init_data_stack(
     alpaca_api_key: Optional[str] = None,
     alpaca_secret_key: Optional[str] = None,
     alpaca_feed: Optional[str] = None,
+    massive_api_key: Optional[str] = None,
 ) -> DataStack:
     """Initialize and return the data stack."""
     alpaca = AlpacaDataAdapter(
@@ -32,4 +42,12 @@ def init_data_stack(
         secret_key=alpaca_secret_key,
         feed=alpaca_feed,
     )
-    return DataStack(alpaca=alpaca)
+    
+    massive_api_key = massive_api_key or os.getenv("MASSIVE_API_KEY")
+    if not massive_api_key:
+        raise ValueError("Missing MASSIVE_API_KEY")
+    
+    from massive import RESTClient
+    massive = RESTClient(massive_api_key)
+    
+    return DataStack(alpaca=alpaca, massive=massive)

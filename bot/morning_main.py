@@ -648,36 +648,36 @@ def fetch_candidates(
     cfg: Config,
     data: DataStack,
     *,
-    most_active_count: int = 50,
+    most_active_count: int = 50,  # no longer used
     force_universe_refresh: bool = False,
 ) -> Tuple[List[Candidate], Dict[str, any]]:
     """Fetch and filter candidates for the morning momentum strategy."""
-    logger.info("Fetching morning momentum candidates...")
-    
-    # Get most active symbols with fallback handling
+    logger.info("Fetching morning momentum candidates via Massive + Alpaca snapshot...")
+
+    today = market_now()
+
+    # NEW: Massive seeds + Alpaca snapshot validation
+    candidates, ledger = build_candidates(
+        cfg,
+        data.alpaca,
+        data.massive,
+        today,
+    )
+
+    # Optional: save audit file
     try:
-        symbols = data.alpaca.get_most_actives(min(most_active_count, 100))
-        logger.info(f"Found {len(symbols)} most active symbols")
+        report_path = Path("state/candidates") / f"{today.date().isoformat()}.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger.save(report_path)
+        logger.info(f"Saved candidate ledger → {report_path}")
     except Exception as e:
-        logger.error(f"Failed to fetch most actives with count={most_active_count}: {e}")
-        # Fallback: try with smaller count
-        try:
-            symbols = data.alpaca.get_most_actives(50)
-            logger.warning(f"Fallback: fetched {len(symbols)} symbols with count=50")
-        except Exception as fallback_e:
-            logger.error(f"Fallback also failed: {fallback_e}")
-            symbols = []  # Keep bot alive even if screener fails
-    
-    # Build candidates
-    today = market_now().date()
-    candidates = build_candidates(cfg, data.alpaca, symbols, today)
-    
+        logger.warning(f"Failed to save candidate ledger: {e}")
+
     stats = {
-        "total_symbols": len(symbols),
         "candidates_found": len(candidates),
         "scan_time": market_now(),
     }
-    
+
     logger.info(f"Built {len(candidates)} candidates")
     return candidates, stats
 
