@@ -30,15 +30,14 @@ class Config:
     max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
 
     # Position sizing (50% of available cash)
-    daily_deploy_pct: float = 0.50  # 50% of cash per day
-    max_daily_deploy: float = 50_000  # $50k hard cap
+    daily_deploy_pct: float = 0.50  # 50% of cash per day (no fixed hard cap, scales with account)
     max_position_pct_of_5min_vol: float = 0.01  # Max 1% of morning 5-min volume
     use_smaller_of_sizing_or_vol_cap: bool = True  # Hard cap by smaller of risk sizing or volume cap
 
     # Risk guardrails
     risk_per_trade: float = 0.02  # 2% risk per trade
-    max_concurrent: int = 12  # Max open positions
-    max_trades_per_day: int = 12  # Max trades per day
+    max_concurrent: int = 25  # Max open positions
+    max_trades_per_day: int = 25  # Max trades per day
     daily_kill_r: float = -3.0  # Stop trading if R <= -3R
 
     # Exit rules
