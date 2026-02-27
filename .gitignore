@@ -9,7 +9,12 @@ __pycache__/
 venv/
 
 # Bot state & caches (all generated at runtime)
-state/
+# Track directory structure but ignore data files
+state/*.json
+state/*.jsonl
+state/candidates/*.json
+!state/.gitkeep
+!state/candidates/.gitkeep
 
 # IDE / OS
 .vscode/

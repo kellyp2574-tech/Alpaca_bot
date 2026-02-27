@@ -1,0 +1,5 @@
+# This file ensures the state/ directory is tracked by Git
+# The directory is needed for runtime data storage:
+# - morning_momentum_state.json (active positions)
+# - trades.json (completed trades)
+# - performance_metrics.jsonl (daily metrics)
