@@ -17,16 +17,16 @@ class Config:
     hard_exit: str = "10:30"        # Exit all positions
     market_open: str = "09:30"
 
-    # Universe filters (gap strategy - FINAL PRODUCTION)
+    # Universe filters (gap strategy - WIDER NET)
     min_price: float = 2.0
     max_price: float = 100.0
-    min_dollar_volume: float = 1_000_000  # $1M average daily dollar volume
-    min_5min_volume: float = 250_000  # $250K first 5-min dollar volume
-    min_gap_pct: float = 0.07  # 7% min gap (edge lives in 7-15% bucket)
-    max_gap_pct: float = 0.15  # 15% max gap (edge lives in 7-15% bucket)
+    min_dollar_volume: float = 0  # Daily volume baseline OFF (EntryLoop enforces real constraint)
+    min_5min_volume: float = 250_000  # $250K first 5-min dollar volume (enforced in EntryLoop)
+    min_gap_pct: float = 0.05  # 5% min gap (wider bucket)
+    max_gap_pct: float = 0.25  # 25% max gap (wider bucket)
     opening_strength: bool = True  # First 5-min candle must be green
     max_seed_universe: int = 600  # Max symbols from Massive snapshot
-    max_candidates: int = 300  # Max candidates after Alpaca validation
+    max_candidates: int = 35  # Max candidates to monitor (wider net)
 
     # Position sizing (50% of available cash)
     daily_deploy_pct: float = 0.50  # 50% of cash per day

@@ -144,6 +144,11 @@ def build_candidates_alpaca_snapshot(
         return out
 
     snaps = alpaca.get_snapshots(seed_symbols)  # must be implemented in AlpacaDataAdapter
+    
+    # Coverage logging: track snapshot availability
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Snapshot coverage: {len(snaps)}/{len(seed_symbols)} symbols returned")
 
     for sym in seed_symbols:
         snap = snaps.get(sym)
@@ -187,22 +192,8 @@ def build_candidates_alpaca_snapshot(
             drops.append(Drop(sym, "alpaca_snapshot", "gap_out_of_range", {"gap_pct": gap_pct}))
             continue
 
-        # Dollar volume filter (use your existing cfg.min_dollar_volume based on 30d avg in old version).
-        # We do NOT have 30d avg here unless you compute it. For now, use a conservative proxy:
-        # - If Alpaca snapshot includes dailyBar.v, you can approximate today's liquidity
-        daily_bar = getattr(snap, "daily_bar", None) or getattr(snap, "dailyBar", None)
-        day_v = _safe_float(getattr(daily_bar, "v", 0) if daily_bar is not None else 0)
-        day_liq_proxy = day_v * price_now
-
-        # If you want to keep cfg.min_dollar_volume semantics, you can:
-        # - set cfg.min_dollar_volume very low (or 0) for this stage,
-        # - and rely on your 5-min dollar volume check in EntryLoop after open.
-        if getattr(cfg, "min_dollar_volume", 0) and day_liq_proxy > 0:
-            if day_liq_proxy < float(cfg.min_dollar_volume) * 0.10:
-                # loose proxy gate (10% of the configured daily threshold)
-                drops.append(Drop(sym, "alpaca_snapshot", "liq_proxy_too_low", {"day_liq": day_liq_proxy}))
-                continue
-
+        # Daily volume baseline OFF - EntryLoop enforces real constraint (5-min $ volume)
+        
         out.append(
             Candidate(
                 symbol=sym,

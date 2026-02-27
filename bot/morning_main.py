@@ -771,10 +771,11 @@ def main() -> None:
         logger.error("No candidates found")
         return
 
-    # Use top candidates
-    watchlist = candidates[:12]
-    subscribe_symbols = [c.symbol for c in candidates[:25]]
-    candidate_map = {c.symbol: c for c in candidates[:25]}
+    # Use top candidates (wider net - monitor up to max_candidates)
+    n = getattr(cfg, "max_candidates", 35)
+    watchlist = candidates[:n]
+    subscribe_symbols = [c.symbol for c in candidates[:n]]
+    candidate_map = {c.symbol: c for c in candidates[:n]}
 
     logger.info(f"Watchlist: {', '.join(c.symbol for c in watchlist)}")
 
