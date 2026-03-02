@@ -61,9 +61,18 @@ def _fetch_yahoo(tickers, lookback_days=150):
             if df.empty:
                 result[ticker] = {"dates": [], "opens": [], "closes": []}
                 continue
+            
+            # Handle multi-level columns (Yahoo Finance returns ('Open', 'TICKER') format)
+            if isinstance(df.columns, pd.MultiIndex):
+                opens_col = [col for col in df.columns if col[0] == 'Open'][0]
+                closes_col = [col for col in df.columns if col[0] == 'Close'][0]
+            else:
+                opens_col = 'Open'
+                closes_col = 'Close'
+            
             dates = [d.strftime("%Y-%m-%d") for d in df.index]
-            opens = [float(v) for v in df["Open"]]
-            closes = [float(v) for v in df["Close"]]
+            opens = [float(v) for v in df[opens_col]]
+            closes = [float(v) for v in df[closes_col]]
             result[ticker] = {"dates": dates, "opens": opens, "closes": closes}
         except Exception as e:
             logger.error(f"Yahoo fallback failed for {ticker}: {e}")
