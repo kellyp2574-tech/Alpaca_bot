@@ -9,8 +9,8 @@ load_dotenv()
 # ═══════════════════════════════════════════════════
 # Alpaca API
 # ═══════════════════════════════════════════════════
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 # ═══════════════════════════════════════════════════

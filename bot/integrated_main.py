@@ -135,6 +135,36 @@ class IntegratedBot:
 
         state["ma_position_value"] = actual_value
         return actual_symbol, actual_value
+    
+    def _check_orphaned_broker_positions(self):
+        """Check for and log any unexpected positions in broker account."""
+        try:
+            positions = broker.get_all_positions()
+            if not positions:
+                return
+            
+            # Known tickers from both strategies
+            ma_tickers = {
+                ma_config.MA_TRADE_GROWTH,
+                ma_config.MA_TRADE_SAFE,
+                ma_config.MA_TRADE_ALT,
+            }
+            
+            # Get MM positions if available
+            mm_symbols = set()
+            if self.mm_positions:
+                mm_symbols = set(self.mm_positions.positions.keys())
+            
+            known_symbols = ma_tickers | mm_symbols
+            
+            # Check for orphaned positions
+            for pos in positions:
+                symbol = getattr(pos, "symbol", None)
+                qty = float(getattr(pos, "qty", 0) or 0)
+                if symbol and abs(qty) > 0 and symbol not in known_symbols:
+                    logger.warning(f"⚠️ ORPHANED POSITION DETECTED: {symbol} qty={qty} - not tracked by bot")
+        except Exception as e:
+            logger.error(f"Failed to check orphaned positions: {e}")
         
     def run(self):
         """Main bot loop from 8:30 AM to 3:30 PM"""
