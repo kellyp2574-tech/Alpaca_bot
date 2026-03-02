@@ -670,13 +670,16 @@ def fetch_candidates(
         BASE_DIR = Path(__file__).resolve().parents[1]  # project root
         report_path = BASE_DIR / "state" / "candidates" / f"{today.date().isoformat()}.json"
         
+        # Log absolute path for debugging
+        logger.info(f"Candidate ledger path (absolute): {report_path.resolve()}")
+        
         # Ensure directories exist
         report_path.parent.mkdir(parents=True, exist_ok=True)
         
         ledger.save(report_path)
         logger.info(f"Saved candidate ledger → {report_path}")
     except Exception as e:
-        logger.warning(f"Failed to save candidate ledger: {e}")
+        logger.exception(f"Failed to save candidate ledger: {e}")
 
     stats = {
         "candidates_found": len(candidates),

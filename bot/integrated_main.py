@@ -30,36 +30,50 @@ from bot.morning_main import fetch_candidates, EntryContext, EntryLoop, _reconci
 from bot.clock import market_datetime, market_now, config_window, MARKET_TZ
 
 # ═══════════════════════════════════════════════════
-# Logging setup
+# Global Logging setup - all modules will use this
 # ═══════════════════════════════════════════════════
 os.makedirs(ma_config.LOG_DIR, exist_ok=True)
 
+LOG_PATH = ma_config.LOG_FILE
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(),
+    ],
+)
+
 logger = logging.getLogger("integrated_bot")
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    file_handler = logging.FileHandler(ma_config.LOG_FILE)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    ))
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s"
-    ))
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+logger.info(f"Logging initialized: {LOG_PATH}")
 
 
 class IntegratedBot:
     """Integrated bot that runs morning momentum then 3 ETF rotation"""
     
     def __init__(self, dry_run=False):
+        logger.info("IntegratedBot.__init__ starting...")
         self.dry_run = dry_run
         self.mm_config = MMConfig()
-        self.ma_state = load_state()
+        
+        # Load state with error handling
+        try:
+            self.ma_state = load_state()
+            logger.info("MA state loaded successfully")
+        except Exception as e:
+            logger.exception("Failed to load MA state, using defaults: %s", e)
+            self.ma_state = {}
+        
         self.mm_state_store = MMStateStore("state/mm_positions.json")
         
-        # Initialize trade reporter
-        self.trade_reporter = get_trade_reporter()
+        # Initialize trade reporter with error handling (don't let reporting kill trading)
+        try:
+            self.trade_reporter = get_trade_reporter()
+            logger.info("TradeReporter initialized successfully")
+        except Exception as e:
+            logger.exception("TradeReporter init failed; disabling reporting. Error=%s", e)
+            self.trade_reporter = None
         
         # Initialize data stacks
         self.ma_data = ma_data
