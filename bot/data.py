@@ -4,6 +4,7 @@ Primary: Alpaca Market Data API. Fallback: Yahoo Finance (yfinance).
 """
 import logging
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, StockSnapshotRequest
@@ -12,9 +13,11 @@ import yfinance as yf
 from bot.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
 
 logger = logging.getLogger("bot.data")
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 
 
 def get_data_client():
+    logger.info(f"Alpaca feed in bot.data = {ALPACA_DATA_FEED}")
     return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 
@@ -29,6 +32,7 @@ def _fetch_alpaca(tickers, lookback_days=150):
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        feed=ALPACA_DATA_FEED,
     )
     bars = client.get_stock_bars(request)
 
@@ -137,7 +141,7 @@ def fetch_live_prices(tickers):
     # Try Alpaca latest trade
     try:
         client = get_data_client()
-        request = StockLatestTradeRequest(symbol_or_symbols=tickers)
+        request = StockLatestTradeRequest(symbol_or_symbols=tickers, feed=ALPACA_DATA_FEED)
         trades = client.get_stock_latest_trade(request)
         for ticker in tickers:
             if ticker in trades and trades[ticker]:
