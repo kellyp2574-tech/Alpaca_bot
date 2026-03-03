@@ -35,7 +35,7 @@ class TradeRecord:
 
 @dataclass
 class CompletedTrade:
-    """Completed buy-sell pair with P&L"""
+    """Completed buy-sell pair with P&L and comprehensive metrics"""
     symbol: str
     strategy: str
     buy_quantity: float
@@ -47,6 +47,26 @@ class CompletedTrade:
     buy_order_id: Optional[str] = None
     sell_order_id: Optional[str] = None
     notes: Optional[str] = None
+    
+    # Entry metrics
+    security_type: Optional[str] = None  # "stock", "etf", "etp"
+    gap_pct: Optional[float] = None
+    prev_close: Optional[float] = None
+    price_now: Optional[float] = None  # Price at entry signal
+    first_5min_volume: Optional[float] = None  # Dollar volume in first 5 minutes
+    daily_dollar_volume: Optional[float] = None
+    spread_at_entry: Optional[float] = None  # Bid-ask spread at entry
+    
+    # Exit metrics
+    exit_reason: Optional[str] = None  # "TP", "trail", "stop", "time", "manual"
+    r_multiple: Optional[float] = None  # R multiple (profit/risk)
+    
+    # Derived classifications
+    is_etp: Optional[bool] = None  # Exchange-traded product
+    is_leveraged: Optional[bool] = None  # Leveraged ETF/ETP
+    is_vol_product: Optional[bool] = None  # Volatility product (UVXY, VXX, etc.)
+    price_bucket: Optional[str] = None  # "2-5", "5-20", "20-100"
+    gap_bucket: Optional[str] = None  # "5-10", "10-15", "15-20", "20-25"
     
     @property
     def buy_value(self) -> float:
@@ -76,6 +96,54 @@ class CompletedTrade:
         buy_dt = datetime.fromisoformat(self.buy_timestamp.replace('Z', '+00:00'))
         sell_dt = datetime.fromisoformat(self.sell_timestamp.replace('Z', '+00:00'))
         return (sell_dt - buy_dt).total_seconds() / (24 * 3600)
+    
+    def classify(self):
+        """Auto-classify trade based on symbol and metrics"""
+        # Known leveraged ETFs/ETPs
+        leveraged_symbols = {
+            'TQQQ', 'SQQQ', 'UPRO', 'SPXU', 'TNA', 'TZA', 'UDOW', 'SDOW',
+            'QLD', 'QID', 'SSO', 'SDS', 'DDM', 'DXD', 'MVV', 'MZZ',
+            'UWM', 'TWM', 'SAA', 'SDD', 'UYG', 'SKF', 'UCC', 'SCC',
+            'UGE', 'SZK', 'URE', 'SRS', 'DIG', 'DUG', 'ERX', 'ERY',
+            'UCO', 'SCO', 'UGL', 'GLL', 'AGQ', 'ZSL', 'UYM', 'SMN',
+            'BOIL', 'KOLD', 'NUGT', 'DUST', 'JNUG', 'JDST', 'UGAZ', 'DGAZ',
+            'LABU', 'LABD', 'TECL', 'TECS', 'SOXL', 'SOXS', 'CURE', 'CURS',
+            'FAS', 'FAZ', 'WANT', 'BNKU', 'BNKD', 'RETL', 'RETS',
+            'TSDD', 'TSLL'
+        }
+        
+        # Volatility products
+        vol_symbols = {'UVXY', 'SVXY', 'VXX', 'VIXY', 'VIXM', 'VXZ', 'TVIX', 'SVIX'}
+        
+        # ETF/ETP indicators (usually 3-4 letters, all caps)
+        self.is_etp = len(self.symbol) <= 4 and self.symbol.isupper()
+        self.is_leveraged = self.symbol in leveraged_symbols
+        self.is_vol_product = self.symbol in vol_symbols
+        
+        # Price bucket
+        if self.buy_price:
+            if 2 <= self.buy_price < 5:
+                self.price_bucket = "2-5"
+            elif 5 <= self.buy_price < 20:
+                self.price_bucket = "5-20"
+            elif 20 <= self.buy_price <= 100:
+                self.price_bucket = "20-100"
+            else:
+                self.price_bucket = "other"
+        
+        # Gap bucket
+        if self.gap_pct is not None:
+            gap_abs = abs(self.gap_pct * 100)  # Convert to percentage
+            if 5 <= gap_abs < 10:
+                self.gap_bucket = "5-10"
+            elif 10 <= gap_abs < 15:
+                self.gap_bucket = "10-15"
+            elif 15 <= gap_abs < 20:
+                self.gap_bucket = "15-20"
+            elif 20 <= gap_abs <= 25:
+                self.gap_bucket = "20-25"
+            else:
+                self.gap_bucket = "other"
 
 
 class TradeReporter:
@@ -138,8 +206,8 @@ class TradeReporter:
     
     def add_trade(self, symbol: str, action: str, quantity: float, price: float, 
                   strategy: str, order_id: str = None, client_order_id: str = None, 
-                  notes: str = None):
-        """Add a new trade record"""
+                  notes: str = None, metadata: Dict = None):
+        """Add a new trade record with optional metadata for entry/exit metrics"""
         trade = TradeRecord(
             symbol=symbol,
             action=action,
@@ -153,16 +221,23 @@ class TradeReporter:
         )
         
         self.trades.append(trade)
+        
+        # Store metadata for later use when completing trade
+        if metadata and action == "BUY":
+            if not hasattr(self, '_trade_metadata'):
+                self._trade_metadata = {}
+            self._trade_metadata[f"{symbol}_{strategy}_{trade.timestamp}"] = metadata
+        
         self._save_data()
         
         logger.info(f"Trade recorded: {action} {quantity} {symbol} @ ${price:.2f}")
         
         # If this is a sell, try to complete a pair
         if action == "SELL":
-            self._try_complete_trade(trade)
+            self._try_complete_trade(trade, metadata)
     
-    def _try_complete_trade(self, sell_trade: TradeRecord):
-        """Try to find matching buy trade and complete the pair"""
+    def _try_complete_trade(self, sell_trade: TradeRecord, sell_metadata: Dict = None):
+        """Try to find matching buy trade and complete the pair with full metrics"""
         # Find unmatched buys for this symbol and strategy
         unmatched_buys = [
             t for t in self.trades 
@@ -178,6 +253,15 @@ class TradeReporter:
         # Use FIFO (first in, first out) - match oldest buy
         buy_trade = unmatched_buys[0]
         
+        # Retrieve buy metadata if available
+        buy_metadata = {}
+        if hasattr(self, '_trade_metadata'):
+            metadata_key = f"{buy_trade.symbol}_{buy_trade.strategy}_{buy_trade.timestamp}"
+            buy_metadata = self._trade_metadata.get(metadata_key, {})
+        
+        # Extract metrics from metadata
+        sell_metadata = sell_metadata or {}
+        
         completed = CompletedTrade(
             symbol=sell_trade.symbol,
             strategy=sell_trade.strategy,
@@ -189,8 +273,22 @@ class TradeReporter:
             sell_timestamp=sell_trade.timestamp,
             buy_order_id=buy_trade.order_id,
             sell_order_id=sell_trade.order_id,
-            notes=f"Buy: {buy_trade.notes or 'N/A'} | Sell: {sell_trade.notes or 'N/A'}"
+            notes=f"Buy: {buy_trade.notes or 'N/A'} | Sell: {sell_trade.notes or 'N/A'}",
+            # Entry metrics from buy metadata
+            security_type=buy_metadata.get('security_type'),
+            gap_pct=buy_metadata.get('gap_pct'),
+            prev_close=buy_metadata.get('prev_close'),
+            price_now=buy_metadata.get('price_now'),
+            first_5min_volume=buy_metadata.get('first_5min_volume'),
+            daily_dollar_volume=buy_metadata.get('daily_dollar_volume'),
+            spread_at_entry=buy_metadata.get('spread_at_entry'),
+            # Exit metrics from sell metadata
+            exit_reason=sell_metadata.get('exit_reason'),
+            r_multiple=sell_metadata.get('r_multiple')
         )
+        
+        # Auto-classify trade
+        completed.classify()
         
         self.completed_trades.append(completed)
         self._save_data()
@@ -307,13 +405,16 @@ class TradeReporter:
         
         # Recent Trades
         report.append("\nRECENT COMPLETED TRADES (Last 10):")
+        report.append(f"{'Date':<12} {'Symbol':<6} {'Entry':<8} {'Exit':<8} {'P&L $':<10} {'P&L %':<8} {'Strategy':<18} {'Hold':<5}")
+        report.append("-" * 90)
         recent_trades = sorted(self.completed_trades, key=lambda x: x.sell_timestamp, reverse=True)[:10]
         
         for trade in recent_trades:
             report.append(
-                f"{trade.sell_timestamp[:10]} {trade.symbol:<6} "
-                f"${trade.pnl_dollars:+8.2f} ({trade.pnl_percentage:+6.2f}%) "
-                f"{trade.strategy.replace('_', ' '):<15} "
+                f"{trade.sell_timestamp[:10]:<12} {trade.symbol:<6} "
+                f"${trade.buy_price:<7.2f} ${trade.sell_price:<7.2f} "
+                f"${trade.pnl_dollars:+9.2f} {trade.pnl_percentage:+7.2f}% "
+                f"{trade.strategy.replace('_', ' '):<18} "
                 f"{trade.hold_days:.1f}d"
             )
         
@@ -385,8 +486,14 @@ def get_trade_reporter() -> TradeReporter:
 
 def log_trade_with_reporting(symbol: str, action: str, quantity: float, price: float, 
                             strategy: str, order_id: str = None, client_order_id: str = None, 
-                            notes: str = None):
-    """Convenience function to log trade and update reporting"""
+                            notes: str = None, metadata: Dict = None):
+    """Convenience function to log trade and update reporting with optional metadata
+    
+    Metadata can include:
+    - Entry metrics (for BUY): gap_pct, prev_close, price_now, first_5min_volume, 
+      daily_dollar_volume, spread_at_entry, security_type
+    - Exit metrics (for SELL): exit_reason, r_multiple
+    """
     try:
         reporter = get_trade_reporter()
         reporter.add_trade(
@@ -397,7 +504,8 @@ def log_trade_with_reporting(symbol: str, action: str, quantity: float, price: f
             strategy=strategy,
             order_id=order_id,
             client_order_id=client_order_id,
-            notes=notes
+            notes=notes,
+            metadata=metadata
         )
     except Exception:
         logger.exception("Trade reporting failed for %s %s; continuing", action, symbol)
