@@ -30,7 +30,9 @@ class Drop:
 class CandidateLedger:
     run_date: str
     seed_source: str = "massive_full_snapshot"
-    seed_total: int = 0          # total snapshot items we processed (usable)
+    snapshot_count_seen: int = 0         # total items in Massive snapshot
+    snapshot_count_with_prev_obj: int = 0  # items with prev_day object
+    seed_total: int = 0          # usable items (prev_close > 0)
     seed_selected: int = 0       # seed symbols we pass to Alpaca validation
     validated: int = 0           # symbols that passed Alpaca snapshot checks & filters
     final: int = 0               # final candidates returned
@@ -54,12 +56,28 @@ def _safe_float(x) -> float:
         return 0.0
 
 
+def _get_any(obj, *names, default=None):
+    """Schema-tolerant field getter - supports both dict and object attributes."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        for n in names:
+            if n in obj and obj[n] is not None:
+                return obj[n]
+        return default
+    for n in names:
+        v = getattr(obj, n, None)
+        if v is not None:
+            return v
+    return default
+
+
 def seed_universe_massive(
     massive_client,
     *,
     max_seed: int = 600,
     include_otc: bool = False,
-) -> Tuple[List[str], Dict[str, object], List[Drop]]:
+) -> Tuple[List[str], Dict[str, float], Dict[str, object], List[Drop]]:
     """
     Use Massive full market snapshot to get a broad, liquid seed universe.
     We DO NOT use Massive 'todaysChangePerc' for gap truth (delay/session semantics).
@@ -67,6 +85,7 @@ def seed_universe_massive(
 
     Returns:
         seed_symbols: top max_seed by liquidity proxy
+        prev_close_map: dict of symbol -> prev_close from Massive
         meta: summary stats
         drops: any drop reasons observed
     """
@@ -78,24 +97,40 @@ def seed_universe_massive(
     rows: List[Tuple[str, float, float, float]] = []
     # (symbol, liquidity_proxy, prev_close, prev_vol)
 
+    snapshot_count_seen = 0
+    snapshot_count_with_prev_obj = 0
     usable = 0
+    
     for item in snapshot:
-        # Support SDK objects (attributes) and dict-like
-        t = getattr(item, "ticker", None) or (item.get("ticker") if isinstance(item, dict) else None)
-        prev = getattr(item, "prev_day", None) or getattr(item, "prevDay", None) or (item.get("prevDay") if isinstance(item, dict) else None)
+        snapshot_count_seen += 1
+        
+        # Schema-tolerant field extraction
+        t = _get_any(item, "ticker", "symbol")
+        prev = _get_any(item, "prev_day", "prevDay", "prev_daily_bar", "prevDailyBar", "prev")
 
-        if not t or not prev:
+        if not t:
             continue
+            
+        if not prev:
+            drops.append(Drop(t, "massive_seed", "no_prev_obj", {}))
+            continue
+        
+        snapshot_count_with_prev_obj += 1
 
-        # prev close + volume (naming depends on model; your JSON shows prevDay.c, prevDay.v)
-        prev_c = getattr(prev, "c", None) if not isinstance(prev, dict) else prev.get("c")
-        prev_v = getattr(prev, "v", None) if not isinstance(prev, dict) else prev.get("v")
+        # Schema-tolerant prev close + volume extraction
+        # Massive API uses: close, volume (not c, v)
+        prev_c = _get_any(prev, "close", "c", "prev_close", "closingPrice")
+        prev_v = _get_any(prev, "volume", "v", "prev_volume", "vol")
 
         prev_close = _safe_float(prev_c)
         prev_vol = _safe_float(prev_v)
 
         if prev_close <= 0:
-            drops.append(Drop(t, "massive_seed", "no_prev_close", {}))
+            drops.append(Drop(t, "massive_seed", "no_prev_close", {
+                "prev_type": type(prev).__name__,
+                "prev_c_raw": prev_c,
+                "prev_v_raw": prev_v,
+            }))
             continue
 
         # Liquidity proxy: prev_close * prev_vol
@@ -107,12 +142,17 @@ def seed_universe_massive(
     rows.sort(key=lambda r: r[1], reverse=True)
     seed_rows = rows[:max_seed]
     seed_symbols = [r[0] for r in seed_rows]
+    
+    # Build prev_close map for Alpaca validation stage
+    prev_close_map = {r[0]: r[2] for r in seed_rows}  # symbol -> prev_close
 
     meta = {
+        "snapshot_count_seen": snapshot_count_seen,
+        "snapshot_count_with_prev_obj": snapshot_count_with_prev_obj,
         "usable_snapshot_items": usable,
         "max_seed": max_seed,
     }
-    return seed_symbols, meta, drops
+    return seed_symbols, prev_close_map, meta, drops
 
 
 # ---------------------------
@@ -123,6 +163,7 @@ def build_candidates_alpaca_snapshot(
     cfg: Config,
     alpaca,
     seed_symbols: List[str],
+    prev_close_map: Dict[str, float],
     now: datetime,
     *,
     max_candidates: int = 300,
@@ -130,8 +171,8 @@ def build_candidates_alpaca_snapshot(
 ) -> List[Candidate]:
     """
     Uses Alpaca Snapshot API data to compute real gap vs previous close:
-        prev_close = snapshot.prevDailyBar.c
-        price_now  = mid(quote) or latestTrade.p
+        prev_close = from Massive (prev_close_map)
+        price_now  = mid(quote) or latestTrade.p from Alpaca snapshot
 
     Requires: alpaca.get_snapshots(symbols) -> Dict[str, snapshot]
     """
@@ -156,12 +197,10 @@ def build_candidates_alpaca_snapshot(
             drops.append(Drop(sym, "alpaca_snapshot", "no_snapshot", {}))
             continue
 
-        # ---- prev close ----
-        prev_bar = getattr(snap, "prev_daily_bar", None) or getattr(snap, "prevDailyBar", None)
-        prev_close = getattr(prev_bar, "c", None) if prev_bar is not None else None
-        prev_close = _safe_float(prev_close)
+        # ---- prev close from Massive ----
+        prev_close = prev_close_map.get(sym, 0.0)
         if prev_close <= 0:
-            drops.append(Drop(sym, "alpaca_snapshot", "no_prev_close", {}))
+            drops.append(Drop(sym, "alpaca_snapshot", "no_prev_close_from_massive", {}))
             continue
 
         # ---- price now (prefer quote mid) ----
@@ -245,11 +284,13 @@ def build_candidates(
 
     # Stage A: Massive seeds universe
     max_seed = getattr(cfg, "max_seed_universe", 600)
-    seed_symbols, meta, seed_drops = seed_universe_massive(
+    seed_symbols, prev_close_map, meta, seed_drops = seed_universe_massive(
         massive_client,
         max_seed=max_seed,
         include_otc=False,
     )
+    ledger.snapshot_count_seen = int(meta.get("snapshot_count_seen", 0))
+    ledger.snapshot_count_with_prev_obj = int(meta.get("snapshot_count_with_prev_obj", 0))
     ledger.seed_total = int(meta.get("usable_snapshot_items", 0))
     ledger.seed_selected = len(seed_symbols)
     ledger.drops.extend(seed_drops)
@@ -260,6 +301,7 @@ def build_candidates(
         cfg,
         alpaca,
         seed_symbols,
+        prev_close_map,
         date,
         max_candidates=max_candidates,
         ledger=ledger,
