@@ -1,0 +1,38 @@
+============================================================
+TRADE PERFORMANCE REPORT
+Generated: 2026-03-03 10:52:54
+============================================================
+
+OVERALL PERFORMANCE:
+Total Trades: 2
+Win Rate: 100.0%
+Winning Trades: 2
+Losing Trades: 0
+Average Win %: 11.50%
+Average Loss %: 0.00%
+Total P&L: $830.95
+Largest Win: $730.95
+Largest Loss: $0.00
+Average Hold Days: 0.0
+
+STRATEGY BREAKDOWN:
+
+Morning Momentum:
+  Trades: 2
+  Win Rate: 100.0%
+  Avg %: 11.50%
+  P&L: $830.95
+
+Etf Rotation:
+  Trades: 0
+  Win Rate: 0.0%
+  Avg %: 0.00%
+  P&L: $0.00
+
+RECENT COMPLETED TRADES (Last 10):
+Date         Symbol Entry    Exit     P&L $      P&L %    Strategy           Hold 
+------------------------------------------------------------------------------------------
+2026-03-03   TEST2  $25.00   $27.00   $  +100.00   +8.00% morning momentum   0.0d
+2026-03-03   UVXY   $48.73   $56.04   $  +730.95  +15.00% morning momentum   0.0d
+
+============================================================

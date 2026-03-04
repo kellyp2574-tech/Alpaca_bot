@@ -681,12 +681,31 @@ def fetch_candidates(
     except Exception as e:
         logger.exception(f"Failed to save candidate ledger: {e}")
 
+    # Build stats dict with per-symbol candidate data
     stats = {
+        c.symbol: {
+            "prev_close": c.prev_close,
+            "gap_pct": c.gap_pct,
+            "price": c.price,
+            "pm_last": c.pm_last,
+            "float_shares": c.float_shares,
+            "pm_vol_float": c.pm_vol_float,
+            "relvol": c.relvol,
+            "score": c.score,
+        }
+        for c in candidates
+    }
+    
+    stats["_meta"] = {
         "candidates_found": len(candidates),
         "scan_time": market_now(),
     }
 
+    # Sanity check: log first 5 candidates to verify data flow
     logger.info(f"Built {len(candidates)} candidates")
+    for c in candidates[:5]:
+        logger.info(f"  {c.symbol}: prev_close=${c.prev_close:.2f}, gap={c.gap_pct:.1%}, price=${c.price:.2f}")
+    
     return candidates, stats
 
 

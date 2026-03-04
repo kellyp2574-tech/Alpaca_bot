@@ -1,0 +1,46 @@
+[
+  {
+    "symbol": "UVXY",
+    "action": "BUY",
+    "quantity": 100.0,
+    "price": 48.730000000000004,
+    "timestamp": "2026-03-03T10:52:54.296282-05:00",
+    "strategy": "morning_momentum",
+    "order_id": "test_order_123",
+    "client_order_id": null,
+    "notes": "Test entry at 20.6% gap"
+  },
+  {
+    "symbol": "UVXY",
+    "action": "SELL",
+    "quantity": 100.0,
+    "price": 56.0395,
+    "timestamp": "2026-03-03T10:52:54.305227-05:00",
+    "strategy": "morning_momentum",
+    "order_id": "test_order_456",
+    "client_order_id": null,
+    "notes": "Test exit: TP"
+  },
+  {
+    "symbol": "TEST2",
+    "action": "BUY",
+    "quantity": 50.0,
+    "price": 25.0,
+    "timestamp": "2026-03-03T10:52:54.312992-05:00",
+    "strategy": "morning_momentum",
+    "order_id": null,
+    "client_order_id": null,
+    "notes": "Test without metadata"
+  },
+  {
+    "symbol": "TEST2",
+    "action": "SELL",
+    "quantity": 50.0,
+    "price": 27.0,
+    "timestamp": "2026-03-03T10:52:54.316573-05:00",
+    "strategy": "morning_momentum",
+    "order_id": null,
+    "client_order_id": null,
+    "notes": "Test without metadata"
+  }
+]
