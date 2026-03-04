@@ -221,6 +221,12 @@ def build_candidates_alpaca_snapshot(
             drops.append(Drop(sym, "alpaca_snapshot", "no_price_now", {}))
             continue
 
+        # ---- Instrument exclusion filter ----
+        excluded = getattr(cfg, "excluded_symbols", ())
+        if sym in excluded:
+            drops.append(Drop(sym, "alpaca_snapshot", "excluded_instrument", {"symbol": sym}))
+            continue
+
         # ---- Filters ----
         if not (cfg.min_price <= price_now <= cfg.max_price):
             drops.append(Drop(sym, "alpaca_snapshot", "price_out_of_range", {"price": price_now}))

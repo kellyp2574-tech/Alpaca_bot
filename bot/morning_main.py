@@ -148,9 +148,9 @@ class EntryLoop:
         self.stats = SessionStats()
         self.positions.stats = self.stats
         
-        # Store position sizing calculated at 9:35 for consistency
+        # Store position sizing calculated at entry_start for consistency
         self._calculated_position_size = None
-        self._positions_at_935 = 0
+        self._positions_at_entry_start = 0
         
         # Track symbols that are "done for today" (partial fills, failed attempts, etc.)
         self._done_today_symbols: set[str] = set()
@@ -434,8 +434,9 @@ class EntryLoop:
             if dollar_vol_5min < cfg.min_5min_volume:
                 continue
 
-            # Opening strength check if required
-            if cfg.opening_strength and first_5min_bars[-1].c <= first_5min_bars[0].o:
+            # Opening Breakout Filter: enter only if price > first 1-min bar high
+            first_1min_high = rth_bars[0].h
+            if cfg.opening_breakout and bars[-1].c <= first_1min_high:
                 continue
 
             # Risk check
@@ -465,7 +466,7 @@ class EntryLoop:
             # Calculate position size based on 50% of actual cash
             cash_for_positions = actual_cash * 0.50  # 50% of actual cash
             
-            # Calculate position sizing once at 9:35 mark for consistency
+            # Calculate position sizing once at entry_start for consistency
             if self._calculated_position_size is None:
                 entry_open_dt = market_datetime(None, cfg.entry_start)
                 if now < entry_open_dt:
@@ -475,7 +476,7 @@ class EntryLoop:
                 max_positions = min(len(self.ctx.watchlist), cfg.max_concurrent)
                 max_positions = max(max_positions, 1)
 
-                self._positions_at_935 = max_positions
+                self._positions_at_entry_start = max_positions
                 self._calculated_position_size = cash_for_positions / max_positions
 
                 logger.info(

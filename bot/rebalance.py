@@ -193,7 +193,7 @@ def run_rebalance(dry_run=False, force=False):
         for symbol, pos in mm_positions.items():
             logger.warning(f"  - {symbol}: {pos.get('qty', 0)} shares @ ${pos.get('entry_price', 0):.2f}")
         logger.error("❌ REBALANCE ABORTED: Close all Morning Momentum positions before rebalancing")
-        logger.error("   Morning momentum trades should be closed by 10:30 AM automatically")
+        logger.error("   Morning momentum trades should be closed by 11:00 AM automatically")
         logger.error("   If positions remain open, check the morning momentum bot status")
         return finish("REBALANCE ABORTED (Morning Momentum positions open)")
     
@@ -355,7 +355,7 @@ def check_morning_momentum_positions():
         entry_time = pos.get('entry_time', 'Unknown')
         print(f"  - {symbol}: {qty} shares @ ${entry_price:.2f} (entered: {entry_time})")
     
-    print(f"\n💡 These should be closed automatically by 10:30 AM")
+    print(f"\n💡 These should be closed automatically by 11:00 AM")
     print(f"   If they remain open, check the morning momentum bot status")
     return True
 

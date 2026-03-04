@@ -246,12 +246,14 @@ class IntegratedBot:
                     time.sleep(60)
                     continue
             
-            # Morning Momentum: 8:30 AM - 11:00 AM
-            if current_time < datetime.strptime("11:00", "%H:%M").time():
+            # Morning Momentum: 8:30 AM - hard_exit + 5 min cleanup buffer
+            mm_cleanup_deadline = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
+            mm_cleanup_deadline = (datetime.combine(datetime.today(), mm_cleanup_deadline) + timedelta(minutes=5)).time()
+            if current_time < mm_cleanup_deadline:
                 if not self.momentum_completed:
-                    # If after 10:30 AM, skip morning momentum (entry window closed)
-                    if current_time >= datetime.strptime("10:30", "%H:%M").time():
-                        logger.info("Started after 10:30 AM - morning momentum entry window closed, skipping")
+                    # If after entry cutoff, skip morning momentum (entry window closed)
+                    if current_time >= datetime.strptime(self.mm_config.entry_cutoff, "%H:%M").time():
+                        logger.info(f"Started after {self.mm_config.entry_cutoff} - morning momentum entry window closed, skipping")
                         self.momentum_completed = True
                         continue
                     
@@ -271,7 +273,7 @@ class IntegratedBot:
                     else:
                         logger.error("Morning momentum failed to start; will retry on next loop")
                 else:
-                    # After momentum completes, supervise positions until 10:30
+                    # After momentum completes, supervise positions until hard exit
                     self._supervise_mm_positions_until_hard_exit(now)
                     continue
             
@@ -290,7 +292,7 @@ class IntegratedBot:
     
     def _supervise_mm_positions_until_hard_exit(self, now):
         """Supervise MM positions until hard exit time, regardless of EntryLoop status."""
-        hard_exit_time = datetime.strptime("10:30", "%H:%M").time()
+        hard_exit_time = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
         
         if now.time() >= hard_exit_time:
             logger.info("Hard exit time reached - forcing MM positions flat")
@@ -306,7 +308,11 @@ class IntegratedBot:
             if not mm_positions:
                 logger.info("No MM positions to supervise - waiting for hard exit")
                 # Sleep until hard exit time
-                hard_exit_dt = now.replace(hour=10, minute=30, second=0, microsecond=0)
+                hard_exit_dt = now.replace(
+                    hour=int(self.mm_config.hard_exit.split(':')[0]),
+                    minute=int(self.mm_config.hard_exit.split(':')[1]),
+                    second=0, microsecond=0
+                )
                 wait_seconds = (hard_exit_dt - now).total_seconds()
                 if wait_seconds > 0:
                     logger.info(f"Waiting for hard exit at {hard_exit_time} ({wait_seconds/60:.1f} minutes)")

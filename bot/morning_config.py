@@ -12,9 +12,9 @@ class Config:
     scan_end: str = "09:29"        # End scanning at 9:29 (same as final_scan)
     scan_interval_minutes: int = 5  # Scan every 5 min
     final_scan: str = "09:29"       # Final candidate build
-    entry_start: str = "09:35"      # Entry time
-    entry_cutoff: str = "10:30"     # Last entry allowed
-    hard_exit: str = "10:30"        # Exit all positions
+    entry_start: str = "09:40"      # Entry time (after 10-min confirmation)
+    entry_cutoff: str = "11:00"     # Last entry allowed
+    hard_exit: str = "11:00"        # Exit all positions
     market_open: str = "09:30"
 
     # Universe filters (gap strategy - WIDER NET)
@@ -24,7 +24,7 @@ class Config:
     min_5min_volume: float = 250_000  # $250K first 5-min dollar volume (enforced in EntryLoop)
     min_gap_pct: float = 0.05  # 5% min gap (wider bucket)
     max_gap_pct: float = 0.25  # 25% max gap (wider bucket)
-    opening_strength: bool = True  # First 5-min candle must be green
+    opening_breakout: bool = True  # Enter only if price > first 1-min bar high
     max_seed_universe: int = 600  # Max symbols from Massive snapshot
     max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
     max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
@@ -49,10 +49,24 @@ class Config:
     stop_min_pct: float = 0.02  # 2% minimum stop
     stop_max_pct: float = 0.05  # 5% maximum stop
 
+    # Excluded instruments (leveraged ETFs, vol ETPs, commodity leveraged)
+    excluded_symbols: tuple = (
+        # Leveraged equity ETFs
+        "TQQQ", "SQQQ", "UPRO", "SPXU", "SSO", "SDS", "QLD", "QID",
+        "SOXL", "SOXS", "TNA", "TZA", "FAS", "FAZ",
+        # Volatility ETPs
+        "UVXY", "VXX", "SVXY", "VIXY",
+        # Commodity leveraged ETFs
+        "UCO", "SCO", "BOIL", "KOLD",
+        "NUGT", "DUST", "JNUG", "JDST",
+        "GUSH", "DRIP",
+        "ERX", "ERY",
+    )
+
     # Execution
-    slippage_pct: float = 0.005  # 0.5% base slippage
-    exec_slippage_buy_pct: float = 0.002
-    exec_slippage_sell_pct: float = 0.005
+    slippage_pct: float = 0.001  # 10 bps slippage
+    exec_slippage_buy_pct: float = 0.001
+    exec_slippage_sell_pct: float = 0.001
     exit_ack_timeout_seconds: float = 5.0  # Seconds to wait before exit reconciliation
     
     # Performance tracking & adaptive allocation

@@ -147,7 +147,7 @@ python -m bot.main --dry-run
 min_5min_volume: float = 1_000_000  # $1M first 5min volume
 min_gap_pct: float = 0.07            # 7% min gap
 max_gap_pct: float = 0.15            # 15% max gap
-opening_strength: bool = True         # Green opening candle
+opening_breakout: bool = True         # Price > first 1-min bar high
 
 # Risk
 max_concurrent: int = 12             # Max positions
