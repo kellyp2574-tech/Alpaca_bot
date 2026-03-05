@@ -238,13 +238,40 @@ class ExecutionClient:
             )
             return FillResult(order_id=None, filled_qty=float(qty), avg_price=limit_price, status="dry_run")
 
-        # Use IOC for ALL orders (entries and exits) to prevent hanging
-        is_entry = client_order_id.startswith("ENTRY:")
+        # Check if fractional and if symbol supports it
+        is_fractional = (qty % 1) != 0
         
-        if is_entry:
-            tif = TimeInForce.IOC  # Immediate or Cancel for entries
+        if is_fractional:
+            # Check if symbol is fractionable
+            fractionable = self.is_fractionable(symbol)
+            if fractionable is False:
+                # Floor to whole shares if not fractionable
+                import math
+                original_qty = qty
+                qty = math.floor(qty)
+                logger.info(
+                    "%s not fractionable: %.2f shares → %d shares",
+                    symbol, original_qty, qty
+                )
+                if qty <= 0:
+                    return FillResult(order_id=None, filled_qty=0.0, avg_price=0.0, status="unfilled")
+                is_fractional = False
+            elif fractionable is None:
+                # Transient error - default to whole shares for safety
+                import math
+                qty = math.floor(qty)
+                logger.warning(
+                    "%s fractionable check failed: defaulting to %d whole shares",
+                    symbol, qty
+                )
+                if qty <= 0:
+                    return FillResult(order_id=None, filled_qty=0.0, avg_price=0.0, status="unfilled")
+                is_fractional = False
+        
+        if is_fractional:
+            tif = TimeInForce.DAY  # Required for fractional shares
         else:
-            tif = TimeInForce.IOC  # Immediate or Cancel for exits too (no hanging)
+            tif = TimeInForce.IOC  # Immediate or Cancel for whole shares
         
         order = LimitOrderRequest(
             symbol=symbol,

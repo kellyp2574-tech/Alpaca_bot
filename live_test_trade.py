@@ -243,6 +243,51 @@ class LiveTestTrader:
         logger.info("POSITION MONITORING COMPLETE: All positions closed")
         logger.info(f"{'='*80}")
     
+    def cleanup_existing_positions(self):
+        """Close all existing positions to start with clean slate"""
+        logger.info(f"\n{'='*80}")
+        logger.info("CLEANUP: Closing all existing positions")
+        logger.info(f"{'='*80}")
+        
+        try:
+            if self.execution.dry_run or not self.execution.client:
+                logger.info("Dry-run mode: skipping position cleanup")
+                return
+            
+            # Get all open positions
+            positions = self.execution.client.get_all_positions()
+            
+            if not positions:
+                logger.info("No existing positions to close")
+                return
+            
+            logger.info(f"Found {len(positions)} open positions to close:")
+            
+            for pos in positions:
+                symbol = pos.symbol
+                qty = abs(float(pos.qty))
+                current_price = float(pos.current_price)
+                
+                logger.info(f"  Closing {symbol}: {qty} shares @ ${current_price:.2f}")
+                
+                # Place market sell order to close
+                fill = self.execution.place_exit(
+                    symbol,
+                    qty,
+                    current_price,
+                    client_order_id=f"CLEANUP_{symbol}_{int(time.time())}"
+                )
+                
+                if fill and fill.status in {"filled", "dry_run"}:
+                    logger.info(f"    ✓ Closed {symbol}: {fill.filled_qty} shares @ ${fill.avg_price:.2f}")
+                else:
+                    logger.warning(f"    ✗ Failed to close {symbol}: {fill.status if fill else 'No fill'}")
+            
+            logger.info("Cleanup complete\n")
+            
+        except Exception as e:
+            logger.exception(f"Cleanup failed: {e}")
+    
     def run(self):
         """Run the full test cycle"""
         logger.info(f"\n{'='*80}")
@@ -257,6 +302,8 @@ class LiveTestTrader:
         logger.info(f"{'='*80}\n")
         
         try:
+            # Step 0: Clean up existing positions
+            self.cleanup_existing_positions()
             # Step 1: Fetch candidates
             candidates = self.fetch_test_candidates()
             
