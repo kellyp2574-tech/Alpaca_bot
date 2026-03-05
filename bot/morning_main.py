@@ -33,21 +33,32 @@ def allocate_positions_dynamic(
     deploy_dollars: float,
     max_per_ticker_pct: float = 0.25,
     min_order_dollars: float = 25.0,
+    volume_participation_pct: float = 0.01,
 ) -> Dict[str, float]:
     """
     Allocate position sizes dynamically from low-volume to high-volume tickers.
     
     Strategy:
     - Sort candidates by liquidity (low → high)
-    - Use ladder allocation: small names get smaller amounts, large names get larger
-    - Cap each ticker at max_per_ticker_pct (default 25%)
+    - Iterate through candidates, allocating: remaining_cash / remaining_positions
+    - Apply THREE constraints: 25% cap, volume limit, and equal-weight
+    - target = min(remaining/remaining_positions, 25% cap, volume_limit)
+    - Stocks that hit constraints leave more cash for other positions
     - Distribute leftover to highest liquidity names
+    
+    Example with $10,000 deploy, 25% cap ($2,500), 1% volume participation:
+    - Position 0 (liq=$50K): min($10K/10, $2.5K, $50K*0.01=$500) = $500 (VOL CAP) → $9.5K left
+    - Position 1 (liq=$100K): min($9.5K/9, $2.5K, $100K*0.01=$1K) = $1K (VOL CAP) → $8.5K left
+    - Position 2 (liq=$200K): min($8.5K/8, $2.5K, $200K*0.01=$2K) = $1.06K → $7.44K left
+    - Position 3 (liq=$500K): min($7.44K/7, $2.5K, $500K*0.01=$5K) = $1.06K → $6.38K left
+    - ...continues, unused cash from vol-capped stocks flows to others
     
     Args:
         candidates: List of Candidate objects with liq_5m_dollar set
         deploy_dollars: Total cash to deploy
         max_per_ticker_pct: Max % of deploy_dollars per ticker (default 0.25)
         min_order_dollars: Minimum order size (default $25)
+        volume_participation_pct: Max % of 5-min volume per ticker (default 0.01)
     
     Returns:
         Dict[symbol, target_dollars] for each candidate
@@ -67,23 +78,7 @@ def allocate_positions_dynamic(
     # Per-ticker cap in dollars
     max_per_ticker_dollars = deploy_dollars * max_per_ticker_pct
     
-    # Build ladder: progressive allocation from min_order up to cap
-    # Ladder rungs: min, 2*min, 4*min, 8*min, ... up to cap
-    ladder = []
-    rung = min_order_dollars
-    while rung <= max_per_ticker_dollars:
-        ladder.append(rung)
-        rung *= 2
-    
-    # Handle edge case: cap is below min order (very small deploy)
-    if not ladder:
-        # Deploy too small for any positions
-        return {}
-    
-    if ladder[-1] < max_per_ticker_dollars:
-        ladder.append(max_per_ticker_dollars)
-    
-    # Allocate using ladder (low liq gets low rungs, high liq gets high rungs)
+    # Allocate iteratively: remaining / remaining_positions, capped at max_per_ticker AND volume limit
     allocations = {}
     remaining = deploy_dollars
     
@@ -91,11 +86,21 @@ def allocate_positions_dynamic(
         if remaining <= min_order_dollars:
             break
         
-        # Determine rung for this position (progress through ladder)
-        rung_idx = min(i, len(ladder) - 1)
-        target = min(ladder[rung_idx], remaining, max_per_ticker_dollars)
+        # Calculate how many positions are left to allocate
+        remaining_positions = len(tradable) - i
+        if remaining_positions <= 0:
+            break
         
-        # Enforce minimum
+        # Base allocation: equal split of remaining cash
+        base_allocation = remaining / remaining_positions
+        
+        # Volume limit: max % of this stock's 5-min dollar volume
+        volume_limit = c.liq_5m_dollar * volume_participation_pct
+        
+        # Apply THREE constraints: equal-weight, 25% cap, volume limit
+        target = min(base_allocation, max_per_ticker_dollars, volume_limit)
+        
+        # Enforce minimum order size
         if target < min_order_dollars:
             continue
         
@@ -114,8 +119,12 @@ def allocate_positions_dynamic(
             if c.symbol not in allocations:
                 continue
             
-            # Room left under the cap
-            room = max_per_ticker_dollars - allocations[c.symbol]
+            # Calculate room under BOTH caps (25% cap AND volume cap)
+            vol_cap = c.liq_5m_dollar * volume_participation_pct
+            room_cap = max_per_ticker_dollars - allocations[c.symbol]
+            room_vol = vol_cap - allocations[c.symbol]
+            room = min(room_cap, room_vol)
+            
             if room <= 0:
                 continue
             
@@ -606,6 +615,7 @@ class EntryLoop:
                     deploy_dollars,
                     max_per_ticker_pct=cfg.max_per_ticker_pct,
                     min_order_dollars=cfg.min_order_dollars,
+                    volume_participation_pct=cfg.max_position_pct_of_5min_vol,
                 )
                 
                 self._allocations_calculated = True

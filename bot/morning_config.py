@@ -25,14 +25,14 @@ class Config:
     min_gap_pct: float = 0.05  # 5% min gap
     max_gap_pct: float = 0.25  # 25% max gap
     opening_breakout: bool = True  # Enter only if price > first 1-min bar high
-    max_seed_universe: int = 2000  # Max symbols from Massive snapshot (wider net for gap filtering)
+    max_seed_universe: int = 4000  # Max symbols from Massive snapshot (wider net for gap filtering)
     max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
     max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
 
     # Position sizing (75% of available cash)
     daily_deploy_pct: float = 0.75  # 75% of equity deployed daily
     max_per_ticker_pct: float = 0.25  # 25% max per position (concentration cap)
-    max_position_pct_of_5min_vol: float = 0.05  # Max 5% of morning 5-min volume (volume participation cap)
+    max_position_pct_of_5min_vol: float = 0.01  # Max 1% of morning 5-min volume (volume participation cap)
     max_adv_pct: float = 0.01  # 1% of 20-day ADV cap
     min_order_dollars: float = 25.0  # Minimum order size in dollars
     use_smaller_of_sizing_or_vol_cap: bool = True  # Hard cap by smaller of risk sizing or volume cap
