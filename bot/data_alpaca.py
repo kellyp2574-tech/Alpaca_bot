@@ -23,6 +23,7 @@ try:  # Run-time dependency on alpaca-py
         StockSnapshotRequest,
     )
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from alpaca.data.enums import DataFeed
 except (
     ImportError
 ) as exc:  # pragma: no cover - surfaced when module imported without deps
@@ -104,14 +105,19 @@ class AlpacaDataAdapter:
     ) -> None:
         api_key = api_key or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
         secret_key = secret_key or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
-        feed = (feed or os.getenv("ALPACA_DATA_FEED", "iex")).lower()
+        raw_feed = (feed or os.getenv("ALPACA_DATA_FEED", "iex")).lower()
 
         if not api_key or not secret_key:
             raise ValueError(
                 "Alpaca API key/secret must be provided via args or environment"
             )
 
-        self.feed = feed
+        if raw_feed == "sip":
+            self.feed = DataFeed.SIP
+        elif raw_feed == "iex":
+            self.feed = DataFeed.IEX
+        else:
+            raise ValueError(f"Unsupported ALPACA_DATA_FEED={raw_feed!r} (use 'iex' or 'sip')")
         self._historical = StockHistoricalDataClient(api_key, secret_key)
         self._screener = ScreenerClient(api_key, secret_key)
         self._api_key = api_key
