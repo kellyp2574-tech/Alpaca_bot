@@ -28,6 +28,9 @@ class Candidate:
     pm_vol_float: float
     relvol: float
     score: float
+    
+    # Liquidity metric for dynamic position sizing (set during entry loop)
+    liq_5m_dollar: float = 0.0
 
 
 @dataclass

@@ -28,6 +28,105 @@ from .storage import Candidate, PendingEntryState
 logger = logging.getLogger(__name__)
 
 
+def allocate_positions_dynamic(
+    candidates: List,
+    deploy_dollars: float,
+    max_per_ticker_pct: float = 0.20,
+    min_order_dollars: float = 25.0,
+) -> Dict[str, float]:
+    """
+    Allocate position sizes dynamically from low-volume to high-volume tickers.
+    
+    Strategy:
+    - Sort candidates by liquidity (low → high)
+    - Use ladder allocation: small names get smaller amounts, large names get larger
+    - Cap each ticker at max_per_ticker_pct (default 20%)
+    - Distribute leftover to highest liquidity names
+    
+    Args:
+        candidates: List of Candidate objects with liq_5m_dollar set
+        deploy_dollars: Total cash to deploy
+        max_per_ticker_pct: Max % of deploy_dollars per ticker (default 0.20)
+        min_order_dollars: Minimum order size (default $25)
+    
+    Returns:
+        Dict[symbol, target_dollars] for each candidate
+    """
+    if not candidates or deploy_dollars <= 0:
+        return {}
+    
+    # Filter tradable candidates with valid liquidity
+    tradable = [c for c in candidates if c.price > 0 and c.liq_5m_dollar > 0]
+    
+    if not tradable:
+        return {}
+    
+    # Sort LOW liquidity → HIGH liquidity (small names first)
+    tradable.sort(key=lambda c: c.liq_5m_dollar)
+    
+    # Per-ticker cap in dollars
+    max_per_ticker_dollars = deploy_dollars * max_per_ticker_pct
+    
+    # Build ladder: progressive allocation from min_order up to cap
+    # Ladder rungs: min, 2*min, 4*min, 8*min, ... up to cap
+    ladder = []
+    rung = min_order_dollars
+    while rung <= max_per_ticker_dollars:
+        ladder.append(rung)
+        rung *= 2
+    
+    # Handle edge case: cap is below min order (very small deploy)
+    if not ladder:
+        # Deploy too small for any positions
+        return {}
+    
+    if ladder[-1] < max_per_ticker_dollars:
+        ladder.append(max_per_ticker_dollars)
+    
+    # Allocate using ladder (low liq gets low rungs, high liq gets high rungs)
+    allocations = {}
+    remaining = deploy_dollars
+    
+    for i, c in enumerate(tradable):
+        if remaining <= min_order_dollars:
+            break
+        
+        # Determine rung for this position (progress through ladder)
+        rung_idx = min(i, len(ladder) - 1)
+        target = min(ladder[rung_idx], remaining, max_per_ticker_dollars)
+        
+        # Enforce minimum
+        if target < min_order_dollars:
+            continue
+        
+        allocations[c.symbol] = target
+        remaining -= target
+    
+    # Second pass: distribute leftover to highest liquidity names
+    if remaining > min_order_dollars:
+        # Sort by liquidity (high → low) for topping up
+        by_high_liq = sorted(tradable, key=lambda c: c.liq_5m_dollar, reverse=True)
+        
+        for c in by_high_liq:
+            if remaining <= min_order_dollars:
+                break
+            
+            if c.symbol not in allocations:
+                continue
+            
+            # Room left under the cap
+            room = max_per_ticker_dollars - allocations[c.symbol]
+            if room <= 0:
+                continue
+            
+            # Add up to room or remaining
+            add = min(room, remaining)
+            allocations[c.symbol] += add
+            remaining -= add
+    
+    return allocations
+
+
 @dataclass
 class SessionStats:
     """Accumulates per-order observations for end-of-session rollup."""
@@ -148,9 +247,9 @@ class EntryLoop:
         self.stats = SessionStats()
         self.positions.stats = self.stats
         
-        # Store position sizing calculated at entry_start for consistency
-        self._calculated_position_size = None
-        self._positions_at_entry_start = 0
+        # Store dynamic position allocations calculated at entry_start
+        self._position_allocations: Dict[str, float] = {}  # symbol -> target_dollars
+        self._allocations_calculated = False
         
         # Track symbols that are "done for today" (partial fills, failed attempts, etc.)
         self._done_today_symbols: set[str] = set()
@@ -473,6 +572,57 @@ class EntryLoop:
         """Check for new entry opportunities."""
         cfg = self.ctx.cfg
         
+        # Calculate dynamic allocations once at entry_start (BEFORE symbol loop)
+        if not self._allocations_calculated:
+            entry_open_dt = market_datetime(None, cfg.entry_start)
+            if now >= entry_open_dt:
+                # Refresh cash
+                try:
+                    if hasattr(self.ctx.execution, 'client') and self.ctx.execution.client:
+                        account = self.ctx.execution.client.get_account()
+                        actual_cash = float(account.cash)
+                    else:
+                        actual_cash = self.ctx.account_cash
+                except Exception as e:
+                    logger.warning(f"Could not refresh cash, using snapshot: {e}")
+                    actual_cash = self.ctx.account_cash
+                
+                # Calculate deploy amount
+                deploy_dollars = actual_cash * cfg.daily_deploy_pct
+                
+                # Populate liquidity metrics for all candidates
+                for cand in self.ctx.watchlist:
+                    bars = list(self.bar_history.get(cand.symbol, []))
+                    rth_bars = [b for b in bars if b.timestamp >= self.market_open_dt]
+                    if len(rth_bars) >= 5:
+                        first_5min_bars = rth_bars[:5]
+                        cand.liq_5m_dollar = sum(bar.v * bar.c for bar in first_5min_bars)
+                    else:
+                        cand.liq_5m_dollar = 0.0
+                
+                # Calculate dynamic allocations
+                self._position_allocations = allocate_positions_dynamic(
+                    self.ctx.watchlist,
+                    deploy_dollars,
+                    max_per_ticker_pct=0.20,
+                    min_order_dollars=25.0,
+                )
+                
+                self._allocations_calculated = True
+                
+                logger.info(
+                    "Dynamic allocations calculated: %d positions, $%.0f total deploy",
+                    len(self._position_allocations),
+                    deploy_dollars,
+                )
+                
+                # Log top 5 allocations
+                sorted_allocs = sorted(self._position_allocations.items(), key=lambda x: x[1], reverse=True)
+                for sym, amt in sorted_allocs[:5]:
+                    cand = next((c for c in self.ctx.watchlist if c.symbol == sym), None)
+                    liq = cand.liq_5m_dollar if cand else 0
+                    logger.info(f"  {sym}: ${amt:.0f} (liq=${liq:,.0f})")
+        
         for candidate in self.ctx.watchlist:
             symbol = candidate.symbol
             
@@ -500,9 +650,16 @@ class EntryLoop:
             if dollar_vol_5min < cfg.min_5min_volume:
                 continue
 
-            # Opening Breakout Filter: enter only if price > first 1-min bar high
+            # Get entry price (latest quote or last bar close) - BEFORE breakout check
+            quote = self.latest_quotes.get(symbol)
+            if quote and quote.bid_price > 0 and quote.ask_price > 0:
+                entry_price = (quote.bid_price + quote.ask_price) / 2
+            else:
+                entry_price = bars[-1].c
+
+            # Opening Breakout Filter: use entry_price for consistency
             first_1min_high = rth_bars[0].h
-            if cfg.opening_breakout and bars[-1].c <= first_1min_high:
+            if cfg.opening_breakout and entry_price <= first_1min_high:
                 continue
 
             # Risk check
@@ -510,49 +667,12 @@ class EntryLoop:
             can_enter, reason = self.risk_manager.can_enter(open_positions)
             if not can_enter:
                 continue
-
-            # Get entry price (latest quote or last bar close)
-            quote = self.latest_quotes.get(symbol)
-            if quote and quote.bid_price > 0 and quote.ask_price > 0:
-                entry_price = (quote.bid_price + quote.ask_price) / 2
-            else:
-                entry_price = bars[-1].c
-
-            # Refresh cash for each entry decision
-            try:
-                if hasattr(self.ctx.execution, 'client') and self.ctx.execution.client:
-                    account = self.ctx.execution.client.get_account()
-                    actual_cash = float(account.cash)
-                else:
-                    actual_cash = self.ctx.account_cash  # Fallback to snapshot
-            except Exception as e:
-                logger.warning(f"Could not refresh cash, using snapshot: {e}")
-                actual_cash = self.ctx.account_cash
             
-            # Calculate position size based on 50% of actual cash
-            cash_for_positions = actual_cash * 0.50  # 50% of actual cash
-            
-            # Calculate position sizing once at entry_start for consistency
-            if self._calculated_position_size is None:
-                entry_open_dt = market_datetime(None, cfg.entry_start)
-                if now < entry_open_dt:
-                    # Wait until entry window opens to size against stable inputs
-                    continue
-
-                max_positions = min(len(self.ctx.watchlist), cfg.max_concurrent)
-                max_positions = max(max_positions, 1)
-
-                self._positions_at_entry_start = max_positions
-                self._calculated_position_size = cash_for_positions / max_positions
-
-                logger.info(
-                    "Position sizing anchored: $%.0f per position across %d slots",
-                    self._calculated_position_size,
-                    max_positions,
-                )
-            
-            # Use the pre-calculated position size
-            target_notional_per_position = self._calculated_position_size
+            # Get allocated amount for this symbol
+            target_notional_per_position = self._position_allocations.get(symbol, 0.0)
+            if target_notional_per_position <= 0:
+                # Symbol not allocated (too low volume or filtered out)
+                continue
             
             # Check daily deploy cap
             can_deploy, allowed_amount = self.risk_manager.can_deploy_amount(target_notional_per_position)
