@@ -194,6 +194,9 @@ class EntryLoop:
                     self._cancel_stale_entry_orders()
                     self._last_entry_cancel_check = time.monotonic()
 
+                # Reconcile pending entries (DAY orders that returned unknown)
+                self._reconcile_pending_entries(now)
+
                 # Check for entries
                 self._check_entries(now)
 
@@ -370,6 +373,69 @@ class EntryLoop:
         symbols = [c.symbol for c in self.ctx.watchlist]
         quotes = self.alpaca.get_latest_quotes(symbols)
         self.latest_quotes.update(quotes)
+
+    def _reconcile_pending_entries(self, now: datetime) -> None:
+        """Reconcile pending entries (DAY orders that returned unknown status)."""
+        pending_entries = self.ctx.state_store.load_pending_entries()
+        
+        for pending in pending_entries:
+            symbol = pending.symbol
+            client_order_id = pending.client_order_id
+            
+            # Skip if already in positions (filled and reconciled)
+            if symbol in self.positions.positions:
+                self.ctx.state_store.clear_pending_entry(client_order_id)
+                continue
+            
+            # Check order status
+            fill = self.ctx.execution.find_order_by_client_id(client_order_id)
+            
+            if fill is None:
+                # Transient error - keep pending and retry next cycle
+                continue
+            
+            if fill.status in {"filled", "dry_run"}:
+                # Order filled - open position
+                logger.info(
+                    f"RECONCILED ENTRY {symbol} qty={fill.filled_qty} @ {fill.avg_price:.2f}"
+                )
+                
+                self.positions.open_position(
+                    symbol,
+                    fill.filled_qty,
+                    fill.avg_price,
+                    pending.stop_pct,
+                    entry_order_id=fill.order_id,
+                    entry_client_order_id=client_order_id,
+                )
+                
+                # Record deployment
+                deployed_amount = float(fill.filled_qty) * float(fill.avg_price)
+                self.risk_manager.on_deploy(deployed_amount)
+                
+                # Record stats
+                self.stats.record_entry(
+                    fill.status, 0.0, pending.intended_price, fill.avg_price
+                )
+                
+                # Clear pending entry
+                self.ctx.state_store.clear_pending_entry(client_order_id)
+                
+            elif fill.status == "partial":
+                # Partial fill - mark as done for today
+                logger.warning(
+                    f"RECONCILED PARTIAL ENTRY {symbol} {fill.filled_qty} @ {fill.avg_price:.2f} - marking done"
+                )
+                self.ctx.state_store.clear_pending_entry(client_order_id)
+                self._done_today_symbols.add(symbol)
+                
+            elif fill.status in {"canceled", "expired", "rejected"}:
+                # Order failed - clear and mark done
+                logger.info(f"RECONCILED FAILED ENTRY {symbol}: {fill.status}")
+                self.ctx.state_store.clear_pending_entry(client_order_id)
+                self._done_today_symbols.add(symbol)
+                
+            # else: status is still "unknown" - keep pending for next cycle
 
     def _cancel_stale_entry_orders(self) -> None:
         """Cancel any remaining entry orders to prevent hanging."""
@@ -615,6 +681,11 @@ class EntryLoop:
             self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
             # Add to done_today_symbols to prevent re-entries
             self._done_today_symbols.add(decision.symbol)
+        elif fill.status == "unknown":
+            # DAY orders (fractional shares) may return unknown - keep pending for reconciliation
+            logger.info(f"ENTRY {decision.symbol} status unknown (likely DAY order) - keeping pending for reconciliation")
+            # DO NOT clear pending entry - let reconciliation handle it
+            # DO NOT mark as done_today - allow reconciliation to complete
         else:
             # Clear pending entry on failure
             self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
