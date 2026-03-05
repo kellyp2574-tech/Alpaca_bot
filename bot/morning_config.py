@@ -25,7 +25,7 @@ class Config:
     min_gap_pct: float = 0.05  # 5% min gap (wider bucket)
     max_gap_pct: float = 0.25  # 25% max gap (wider bucket)
     opening_breakout: bool = True  # Enter only if price > first 1-min bar high
-    max_seed_universe: int = 600  # Max symbols from Massive snapshot
+    max_seed_universe: int = 2000  # Max symbols from Massive snapshot (wider net for gap filtering)
     max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
     max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
 

@@ -80,8 +80,7 @@ def seed_universe_massive(
 ) -> Tuple[List[str], Dict[str, float], Dict[str, object], List[Drop]]:
     """
     Use Massive full market snapshot to get a broad, liquid seed universe.
-    We DO NOT use Massive 'todaysChangePerc' for gap truth (delay/session semantics).
-    We only use it to optionally pre-rank or loosen filters if you want later.
+    Returns top max_seed by liquidity (no gap filtering here - Alpaca does that).
 
     Returns:
         seed_symbols: top max_seed by liquidity proxy
@@ -289,7 +288,8 @@ def build_candidates(
     ledger = CandidateLedger(run_date=run_date)
 
     # Stage A: Massive seeds universe
-    max_seed = getattr(cfg, "max_seed_universe", 600)
+    # Increase max_seed to cast wider net for gap filtering
+    max_seed = getattr(cfg, "max_seed_universe", 2000)  # Increased from 600
     seed_symbols, prev_close_map, meta, seed_drops = seed_universe_massive(
         massive_client,
         max_seed=max_seed,
