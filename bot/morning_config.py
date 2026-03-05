@@ -18,20 +18,23 @@ class Config:
     market_open: str = "09:30"
 
     # Universe filters (gap strategy - WIDER NET)
-    min_price: float = 2.0
-    max_price: float = 100.0
-    min_dollar_volume: float = 0  # Daily volume baseline OFF (EntryLoop enforces real constraint)
+    min_price: float = 1.0  # $1 min price
+    max_price: float = 100.0  # $100 max price
+    min_dollar_volume: float = 10_000_000  # $10M ADV floor (20-day average daily volume)
     min_5min_volume: float = 250_000  # $250K first 5-min dollar volume (enforced in EntryLoop)
-    min_gap_pct: float = 0.05  # 5% min gap (wider bucket)
-    max_gap_pct: float = 0.25  # 25% max gap (wider bucket)
+    min_gap_pct: float = 0.05  # 5% min gap
+    max_gap_pct: float = 0.25  # 25% max gap
     opening_breakout: bool = True  # Enter only if price > first 1-min bar high
     max_seed_universe: int = 2000  # Max symbols from Massive snapshot (wider net for gap filtering)
     max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
     max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
 
-    # Position sizing (50% of available cash)
-    daily_deploy_pct: float = 0.50  # 50% of cash per day (no fixed hard cap, scales with account)
-    max_position_pct_of_5min_vol: float = 0.01  # Max 1% of morning 5-min volume
+    # Position sizing (75% of available cash)
+    daily_deploy_pct: float = 0.75  # 75% of equity deployed daily
+    max_per_ticker_pct: float = 0.25  # 25% max per position (concentration cap)
+    max_position_pct_of_5min_vol: float = 0.05  # Max 5% of morning 5-min volume (volume participation cap)
+    max_adv_pct: float = 0.01  # 1% of 20-day ADV cap
+    min_order_dollars: float = 25.0  # Minimum order size in dollars
     use_smaller_of_sizing_or_vol_cap: bool = True  # Hard cap by smaller of risk sizing or volume cap
 
     # Risk guardrails

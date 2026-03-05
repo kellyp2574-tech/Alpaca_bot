@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 def allocate_positions_dynamic(
     candidates: List,
     deploy_dollars: float,
-    max_per_ticker_pct: float = 0.20,
+    max_per_ticker_pct: float = 0.25,
     min_order_dollars: float = 25.0,
 ) -> Dict[str, float]:
     """
@@ -40,13 +40,13 @@ def allocate_positions_dynamic(
     Strategy:
     - Sort candidates by liquidity (low → high)
     - Use ladder allocation: small names get smaller amounts, large names get larger
-    - Cap each ticker at max_per_ticker_pct (default 20%)
+    - Cap each ticker at max_per_ticker_pct (default 25%)
     - Distribute leftover to highest liquidity names
     
     Args:
         candidates: List of Candidate objects with liq_5m_dollar set
         deploy_dollars: Total cash to deploy
-        max_per_ticker_pct: Max % of deploy_dollars per ticker (default 0.20)
+        max_per_ticker_pct: Max % of deploy_dollars per ticker (default 0.25)
         min_order_dollars: Minimum order size (default $25)
     
     Returns:
@@ -604,8 +604,8 @@ class EntryLoop:
                 self._position_allocations = allocate_positions_dynamic(
                     self.ctx.watchlist,
                     deploy_dollars,
-                    max_per_ticker_pct=0.20,
-                    min_order_dollars=25.0,
+                    max_per_ticker_pct=cfg.max_per_ticker_pct,
+                    min_order_dollars=cfg.min_order_dollars,
                 )
                 
                 self._allocations_calculated = True
