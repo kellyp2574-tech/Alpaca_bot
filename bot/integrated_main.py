@@ -1,6 +1,6 @@
 """
-Integrated Bot - Combines 3 ETF Rotation with Morning Momentum Strategy
-Runs from 8:30 AM to 3:30 PM with strategy switching at 11:00 AM
+Gap Momentum Trading Bot
+Runs from 8:30 AM until all positions are closed (typically by 11:30 AM)
 """
 import sys
 import logging
@@ -50,7 +50,7 @@ logger.info(f"Logging initialized: {LOG_PATH}")
 
 
 class IntegratedBot:
-    """Integrated bot that runs morning momentum then 3 ETF rotation"""
+    """Gap momentum trading bot - monitors positions until all closed"""
     
     def __init__(self, dry_run=False):
         logger.info("IntegratedBot.__init__ starting...")
@@ -167,7 +167,7 @@ class IntegratedBot:
             logger.error(f"Failed to check orphaned positions: {e}")
         
     def run(self):
-        """Main bot loop from 8:30 AM to 3:30 PM"""
+        """Main bot loop from 8:30 AM until all positions closed"""
         logger.info("=" * 60)
         logger.info("INTEGRATED BOT START" + (" [DRY RUN]" if self.dry_run else ""))
         logger.info("=" * 60)
@@ -197,9 +197,9 @@ class IntegratedBot:
             now = market_now()
             current_time = now.time()
             
-            # Exit at 3:30 PM
+            # Safety exit at 3:30 PM (should have exited earlier when positions closed)
             if current_time >= datetime.strptime("15:30", "%H:%M").time():
-                logger.info("Reached 3:30 PM - exiting")
+                logger.warning("Reached 3:30 PM safety exit - positions may still be open")
                 break
             
             # If market has closed early, exit gracefully (avoid false negatives at the open)
@@ -280,15 +280,14 @@ class IntegratedBot:
             # Check for any orphaned broker positions after emergency flatten
             self._check_orphaned_broker_positions()
             
-            # 3 ETF Rotation: 11:00 AM - 3:30 PM (hourly checks)
+            # After 11:00 AM: Monitor positions every 5 minutes until all closed
             if current_time >= datetime.strptime("11:00", "%H:%M").time():
-                self.run_etf_rotation_check(now)
-                # Sleep until next hour check
-                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-                sleep_seconds = (next_hour - now).total_seconds()
-                if sleep_seconds > 0:
-                    logger.info(f"Sleeping until next ETF rotation check at {next_hour.strftime('%H:%M')}")
-                    time.sleep(min(sleep_seconds, 3600))  # Cap at 1 hour
+                if self._all_positions_closed():
+                    logger.info("All positions closed and logs posted - shutting down")
+                    break
+                else:
+                    logger.info("Positions still open - checking again in 5 minutes")
+                    time.sleep(300)  # 5 minutes
     
     def _supervise_mm_positions_until_hard_exit(self, now):
         """Supervise MM positions until hard exit time, regardless of EntryLoop status."""
@@ -736,150 +735,37 @@ class IntegratedBot:
                 logger.warning(f"Failed to unsubscribe data feeds: {e}")
         return success
 
-    def run_etf_rotation_check(self, now):
-        """Run 3 ETF rotation strategy check"""
-        # Only check once per hour
-        if self.last_ma_check and (now - self.last_ma_check).total_seconds() < 3600:
-            return
-            
-        self.last_ma_check = now
-        logger.info(f"Running 3 ETF rotation check at {now.strftime('%H:%M')}")
-        
+    def _all_positions_closed(self) -> bool:
+        """Check if all MM positions are closed and logs are posted."""
         try:
-            # Sync MA holding/value from broker first
-            current_ma, current_value = self._sync_ma_holding_from_broker(self.ma_state)
-            logger.info(f"MA sync: holding={current_ma}, value=${current_value:,.0f}")
-            pending_buy = self.ma_state.get("ma_pending_buy")
+            # Check MM positions from state store
+            mm_positions = self.mm_state_store.load_positions()
+            if mm_positions:
+                logger.info(f"MM positions still open: {list(mm_positions.keys())}")
+                return False
             
-            # Fetch common data
-            ctx = self._fetch_ma_common_data()
-            if not ctx:
-                return
+            # Check runtime position manager
+            if self.mm_positions is not None and self.mm_positions.positions:
+                logger.info(f"Runtime MM positions still open: {list(self.mm_positions.positions.keys())}")
+                return False
             
-            # Bootstrap MA counters on first run
-            self._bootstrap_ma_counters(ctx["qqq_closes"], ctx["tlt_closes"])
+            # Check broker positions to be safe
+            try:
+                positions = broker.get_all_positions()
+                if positions:
+                    open_symbols = [p.symbol for p in positions if float(getattr(p, 'qty', 0) or 0) > 0]
+                    if open_symbols:
+                        logger.info(f"Broker positions still open: {open_symbols}")
+                        return False
+            except Exception as e:
+                logger.warning(f"Could not check broker positions: {e}")
             
-            # Check MA crossover signal
-            ma_target = ma_strategies.check_ma_crossover(
-                self.ma_state, ctx["qqq_closes"], ctx["tlt_closes"]
-            )
-            
-            # Execute MA rotation if needed or if pending buy exists
-            force_pending_buy = False
-            if pending_buy and pending_buy != current_ma:
-                logger.warning(f"Pending MA buy detected from prior failure: {pending_buy}")
-                ma_target = pending_buy
-                force_pending_buy = True
-
-            if ma_target != current_ma or force_pending_buy:
-                logger.info(f"MA rotation signal: {current_ma} -> {ma_target}")
-                
-                # Sell current position
-                if current_ma and current_ma != ma_target:
-                    try:
-                        position = broker.get_position(current_ma)
-                        sell_qty = float(getattr(position, "qty", 0) or 0)
-                    except Exception as e:
-                        logger.warning(f"Could not get position quantity for {current_ma}: {e}")
-                        sell_qty = 0
-                    
-                    if sell_qty > 0:
-                        sell_price = ctx.get("live_prices", {}).get(current_ma, 0)
-                        broker.close_position(current_ma)
-                        
-                        # Log to both systems with actual quantity
-                        log_trade(self.ma_state, "SELL", current_ma, "all", sell_price, 
-                                 f"MA rotation -> {ma_target}")
-                        try:
-                            log_trade_with_reporting(
-                                current_ma,
-                                "SELL",
-                                sell_qty,
-                                sell_price,
-                                "etf_rotation",
-                                notes="MA rotation",
-                            )
-                        except Exception:
-                            logger.exception("ETF rotation reporting failed for %s SELL; continuing", current_ma)
-                
-                # Buy new position with same dollar value
-                if ma_target:
-                    # Get the value we just sold (or use target allocation)
-                    current_value = self.ma_state.get("ma_position_value", 0)
-                    if current_value == 0:
-                        # Use 50% of equity as default allocation
-                        current_value = ctx["equity"] * ma_config.MA_ALLOC_PCT
-                    
-                    # Update state
-                    self.ma_state["ma_holding"] = ma_target
-                    self.ma_state["ma_position_value"] = current_value
-                    save_state(self.ma_state)
-                    
-                    # Get account info
-                    try:
-                        equity = broker.get_equity()
-                        cash = broker.get_cash()
-                    except Exception as e:
-                        logger.error(f"Could not fetch account info: {e}")
-                        equity = 100000  # Default
-                        cash = equity
-                    
-                    invest_amount = min(current_value, cash)
-                    buy_price = ctx.get("live_prices", {}).get(ma_target, 0)
-                    
-                    logger.info(
-                        f"MA BUY: {ma_target} notional=${invest_amount:,.2f} price=${buy_price:.2f}"
-                    )
-
-                    if buy_price > 0 and invest_amount >= buy_price:
-                        qty = int(invest_amount / buy_price)
-                        if qty >= 1:
-                            broker.buy(ma_target, qty)
-
-                            # Log to both systems
-                            log_trade(
-                                self.ma_state,
-                                "BUY",
-                                ma_target,
-                                qty,
-                                buy_price,
-                                f"MA rotation <- {current_ma}",
-                            )
-                            try:
-                                log_trade_with_reporting(
-                                    ma_target,
-                                    "BUY",
-                                    qty,
-                                    buy_price,
-                                    "etf_rotation",
-                                    notes="MA rotation",
-                                )
-                            except Exception:
-                                logger.exception("ETF rotation reporting failed for %s BUY; continuing", ma_target)
-
-                            # Update state
-                            self.ma_state["ma_holding"] = ma_target
-                            self.ma_state["ma_position_value"] = qty * buy_price
-                            self.ma_state.pop("ma_pending_buy", None)
-                            save_state(self.ma_state)
-                        else:
-                            logger.critical(
-                                f"MA rotation for {ma_target} calculated qty {qty} < 1; will retry next check"
-                            )
-                            self.ma_state["ma_pending_buy"] = ma_target
-                            save_state(self.ma_state)
-                    else:
-                        logger.critical(
-                            f"MA rotation buy for {ma_target} skipped (price={buy_price}, invest_amount={invest_amount})"
-                        )
-                        self.ma_state["ma_pending_buy"] = ma_target
-                        save_state(self.ma_state)
-            
-            # Check for orphaned broker positions after ETF operations
-            self._check_orphaned_broker_positions()
+            logger.info("All positions confirmed closed")
+            return True
             
         except Exception as e:
-            logger.error(f"Error in ETF rotation check: {e}", exc_info=True)
+            logger.error(f"Error checking if positions closed: {e}")
+            return False
     
     def _fetch_ma_common_data(self):
         """Fetch common market data for MA rotation strategy."""
