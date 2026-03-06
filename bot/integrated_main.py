@@ -344,16 +344,15 @@ class IntegratedBot:
                         logger.info("All MM positions closed - waiting for hard exit")
                         break
                     
-                    # Get current quotes for exit price checks
+                    # Get current quotes for exit price checks (batched)
                     symbols = list(current_positions.keys())
                     quotes = {}
-                    for symbol in symbols:
-                        try:
-                            quote_dict = self.mm_data.alpaca.get_latest_quotes([symbol])
-                            if quote_dict and symbol in quote_dict:
-                                quotes[symbol] = quote_dict[symbol]
-                        except Exception as e:
-                            logger.warning(f"Failed to get quote for {symbol}: {e}")
+                    try:
+                        quote_dict = self.mm_data.alpaca.get_latest_quotes(symbols)
+                        if quote_dict:
+                            quotes = quote_dict
+                    except Exception as e:
+                        logger.warning(f"Failed to get batched quotes for MM supervision: {e}")
                     
                     # Check position exits using quotes (not calling on_bar with Quote objects)
                     for symbol in list(current_positions.keys()):
@@ -443,20 +442,21 @@ class IntegratedBot:
                 logger.info("No MM positions recorded; nothing to flatten")
                 return
 
-            # Get current prices for each tracked symbol
+            # Get current prices for all tracked symbols (batched)
             price_lookup = {}
-            for symbol in allowed_symbols:
-                try:
-                    quote_dict = self.mm_data.alpaca.get_latest_quotes([symbol])
-                    quote = quote_dict.get(symbol) if quote_dict else None
-                    if quote and getattr(quote, "bid_price", 0) > 0:
-                        price_lookup[symbol] = quote.bid_price
-                    else:
-                        position = runtime_positions.get(symbol) or stored_positions.get(symbol)
-                        if position:
-                            price_lookup[symbol] = position.peak_price or position.entry_price
-                except Exception as e:
-                    logger.warning(f"Failed to get price for {symbol}: {e}")
+            symbols = list(allowed_symbols)
+            
+            try:
+                quote_dict = self.mm_data.alpaca.get_latest_quotes(symbols)
+            except Exception as e:
+                logger.warning(f"Failed to get batched quotes during emergency flatten: {e}")
+                quote_dict = {}
+            
+            for symbol in symbols:
+                quote = quote_dict.get(symbol) if quote_dict else None
+                if quote and getattr(quote, "bid_price", 0) > 0:
+                    price_lookup[symbol] = quote.bid_price
+                else:
                     position = runtime_positions.get(symbol) or stored_positions.get(symbol)
                     if position:
                         price_lookup[symbol] = position.peak_price or position.entry_price
