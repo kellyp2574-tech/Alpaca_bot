@@ -1,6 +1,6 @@
 """
 Gap Momentum Trading Bot
-Runs from 8:30 AM until all positions are closed (typically by 11:30 AM)
+Runs from 8:30 AM until all positions are closed (hard exit at 2:30 PM)
 """
 import sys
 import logging
@@ -246,9 +246,9 @@ class IntegratedBot:
                     time.sleep(60)
                     continue
             
-            # Morning Momentum: 8:30 AM - hard_exit + 5 min cleanup buffer
+            # Morning Momentum: 8:30 AM - hard_exit + 30 min cleanup buffer
             mm_cleanup_deadline = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
-            mm_cleanup_deadline = (datetime.combine(datetime.today(), mm_cleanup_deadline) + timedelta(minutes=5)).time()
+            mm_cleanup_deadline = (datetime.combine(datetime.today(), mm_cleanup_deadline) + timedelta(minutes=30)).time()
             if current_time < mm_cleanup_deadline:
                 if not self.momentum_completed:
                     # If after entry cutoff, skip morning momentum (entry window closed)
@@ -280,8 +280,9 @@ class IntegratedBot:
             # Check for any orphaned broker positions after emergency flatten
             self._check_orphaned_broker_positions()
             
-            # After 11:00 AM: Monitor positions every 5 minutes until all closed
-            if current_time >= datetime.strptime("11:00", "%H:%M").time():
+            # After hard exit: Monitor positions every 5 minutes until all closed
+            hard_exit_time = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
+            if current_time >= hard_exit_time:
                 if self._all_positions_closed():
                     logger.info("All positions closed and logs posted - shutting down")
                     break

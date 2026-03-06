@@ -4,14 +4,14 @@ Production-ready gap momentum trading bot that trades pre-market gappers during 
 
 ## Strategy Overview
 
-### Morning Gap Momentum (75% of equity deployed, 9:00 AM - 11:00 AM)
+### Morning Gap Momentum (85% of equity deployed, 9:00 AM - 2:30 PM)
 - **Signal:** Pre-market gap (5-25%) + opening breakout + volume confirmation
 - **Universe:** 4,000 stocks screened → $10M+ ADV, $1-$100 price range
 - **Screening:** $250K+ first 5-min volume, 5-25% gap, opening breakout filter
-- **Entry:** DAY limit orders at 9:40-11:00 AM with dynamic position sizing
-- **Exit:** 1.2% trailing activation, 1% trailing stop, 5% hard stop
+- **Entry:** DAY limit orders at 9:40-2:30 PM with dynamic position sizing
+- **Exit:** 5% trailing activation, 1.5% trailing stop, 5% hard stop
 - **Risk:** 25 max concurrent positions, 25 max trades/day, daily R limit -3R
-- **Guarantee:** Hard exit at 11:00 AM under ALL conditions
+- **Guarantee:** Hard exit at 2:30 PM under ALL conditions
 
 ## Dynamic Position Sizing
 
@@ -37,7 +37,7 @@ Each position sized using **minimum of three constraints**:
 ## Key Features
 
 ### 🚀 Production-Grade Reliability
-- **Hard Exit Guarantee:** All positions flat by 11:00 AM regardless of crashes
+- **Hard Exit Guarantee:** All positions flat by 2:30 PM regardless of crashes
 - **Supervision System:** Orchestrator monitors positions even if EntryLoop fails
 - **DAY Orders:** Fractional share support with async fill reconciliation
 - **Emergency Fallbacks:** Market order escalation, broker position cleanup
@@ -45,13 +45,13 @@ Each position sized using **minimum of three constraints**:
 ### 🔒 Risk Management
 - **Duplicate Prevention:** Each symbol max one entry attempt per day
 - **Position Sizing:** Dynamic allocation with 25% concentration cap, 1% volume participation
-- **Stop Logic:** 1% trailing stop after 1.2% gain, 5% hard stop, breakeven protection
+- **Stop Logic:** 1.5% trailing stop after 5% gain, 5% hard stop, breakeven protection
 - **Time-Based Exits:** Automatic reconciliation, DAY order fill tracking
 
 ### 📊 Market Coverage
 - **Pre-market Scanning:** 9:00 AM - 9:29 AM (every 5 minutes)
-- **Entry Window:** 9:40 AM - 11:00 AM (gap momentum)
-- **Hard Exit:** 11:00 AM (all positions closed)
+- **Entry Window:** 9:40 AM - 2:30 PM (gap momentum)
+- **Hard Exit:** 2:30 PM (all positions closed)
 - **Data Sources:** Alpaca Market Data API + Massive API for screening
 - **Quote Handling:** Real-time 1-min bars with quote mid for entries
 
@@ -60,7 +60,7 @@ Each position sized using **minimum of three constraints**:
 ```
 Alpaca_bot/
 ├── bot/                           # Trading bot
-│   ├── integrated_main.py         # Main orchestrator (8:30 AM - 11:00 AM)
+│   ├── integrated_main.py         # Main orchestrator (8:30 AM - 2:30 PM)
 │   ├── morning_main.py           # Gap momentum entry logic with dynamic sizing
 │   ├── position_manager.py       # Position management with trailing stops
 │   ├── execution.py              # Order execution with fractional share support
@@ -112,14 +112,14 @@ python close_all_positions.py
 | 9:29 AM | Final scan, lock watchlist (35 candidates) |
 | 9:30 AM | Market open, collect first 5 bars |
 | 9:40 AM | Entry window opens, dynamic allocation calculated |
-| 9:40-11:00 AM | Active trading with trailing stops |
-| 11:00 AM | **Hard exit guarantee** - all positions flat |
-| 11:00-11:30 AM | Cleanup, reconciliation, reporting |
+| 9:40-2:30 PM | Active trading with trailing stops |
+| 2:30 PM | **Hard exit guarantee** - all positions flat |
+| 2:30-3:00 PM | Cleanup, reconciliation, reporting |
 
 ## Critical Guarantees
 
 ### ✅ Hard Exit Guarantee
-- **All positions flat by 11:00 AM** regardless of:
+- **All positions flat by 2:30 PM** regardless of:
   - EntryLoop crashes or exceptions
   - Network connectivity issues
   - Stream data interruptions
@@ -162,7 +162,7 @@ max_seed_universe: int = 4000               # 4,000 stocks screened
 max_candidates_monitored: int = 35          # 35 final candidates
 
 # Position Sizing
-daily_deploy_pct: float = 0.75              # 75% of equity deployed
+daily_deploy_pct: float = 0.85              # 85% of equity deployed
 max_per_ticker_pct: float = 0.25            # 25% max per position
 max_position_pct_of_5min_vol: float = 0.01  # 1% of 5-min volume
 min_order_dollars: float = 25.0             # $25 minimum order
@@ -173,8 +173,8 @@ max_trades_per_day: int = 25                # Max trades/day
 daily_kill_r: float = -3.0                  # Stop at -3R daily
 
 # Exit Rules
-take_profit_pct: float = 0.012              # 1.2% trailing activation
-trail_pct: float = 0.01                     # 1% trailing stop
+take_profit_pct: float = 0.05               # 5% trailing activation
+trail_pct: float = 0.015                    # 1.5% trailing stop
 stop_loss_pct: float = 0.05                 # 5% hard stop
 ```
 
@@ -188,7 +188,7 @@ stop_loss_pct: float = 0.05                 # 5% hard stop
 # - 8:30 AM: Bot starts
 # - 9:00-9:29 AM: Pre-market screening
 # - 9:40 AM: Entry window opens
-# - 11:00 AM: Hard exit guarantee
+# - 2:30 PM: Hard exit guarantee
 ```
 
 ## Development Notes

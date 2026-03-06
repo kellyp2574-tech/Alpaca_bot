@@ -13,8 +13,8 @@ class Config:
     scan_interval_minutes: int = 5  # Scan every 5 min
     final_scan: str = "09:29"       # Final candidate build
     entry_start: str = "09:40"      # Entry time (after 10-min confirmation)
-    entry_cutoff: str = "11:00"     # Last entry allowed
-    hard_exit: str = "11:00"        # Exit all positions
+    entry_cutoff: str = "14:30"     # Last entry allowed
+    hard_exit: str = "14:30"        # Exit all positions
     market_open: str = "09:30"
 
     # Universe filters (gap strategy - WIDER NET)
@@ -29,8 +29,8 @@ class Config:
     max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
     max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
 
-    # Position sizing (75% of available cash)
-    daily_deploy_pct: float = 0.75  # 75% of equity deployed daily
+    # Position sizing (85% of available cash)
+    daily_deploy_pct: float = 0.85  # 85% of equity deployed daily
     max_per_ticker_pct: float = 0.25  # 25% max per position (concentration cap)
     max_position_pct_of_5min_vol: float = 0.01  # Max 1% of morning 5-min volume (volume participation cap)
     max_adv_pct: float = 0.01  # 1% of 20-day ADV cap
@@ -45,8 +45,8 @@ class Config:
 
     # Exit rules
     breakeven_at_pct: float = 0.006  # Move stop to breakeven after +0.6%
-    take_profit_pct: float = 0.012  # Enable trailing once gains reach 1.2%
-    trail_pct: float = 0.01  # 1% trailing stop
+    take_profit_pct: float = 0.05  # Enable trailing once gains reach 5%
+    trail_pct: float = 0.015  # 1.5% trailing stop
     stop_loss_pct: float = 0.05  # 5% hard stop
     stop_atr_mult: float = 2.0  # ATR multiplier for initial stop
     stop_min_pct: float = 0.02  # 2% minimum stop
