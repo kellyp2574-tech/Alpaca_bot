@@ -314,12 +314,45 @@ class IntegratedBot:
             # After hard exit: Monitor positions every 5 minutes until all closed
             hard_exit_time = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
             if current_time >= hard_exit_time:
-                if self._all_positions_closed():
-                    logger.info("All positions closed and logs posted - shutting down")
+                positions_closed = self._all_positions_closed()
+                
+                if positions_closed:
+                    logger.info("All positions closed - waiting for 4:05 PM to generate liquidity ranking")
+                    
+                    # Sleep until 4:05 PM for liquidity ranking generation
+                    ranking_time = now.replace(hour=16, minute=5, second=0, microsecond=0)
+                    if now < ranking_time:
+                        wait_seconds = (ranking_time - now).total_seconds()
+                        logger.info(f"Sleeping for {wait_seconds/60:.1f} minutes until 4:05 PM")
+                        time.sleep(wait_seconds)
+                    
+                    # Generate liquidity ranking for tomorrow's universe
+                    # This runs regardless of position state to ensure daily refresh
+                    logger.info("Generating liquidity ranking at 4:05 PM...")
+                    self._generate_liquidity_ranking()
+                    
+                    logger.info("Liquidity ranking complete - shutting down")
                     break
                 else:
-                    logger.info("Positions still open - checking again in 5 minutes")
-                    time.sleep(300)  # 5 minutes
+                    # If positions still open past 3:00 PM, generate ranking anyway at 4:05 PM
+                    # to ensure daily refresh even if there's a position state issue
+                    if current_time >= datetime.strptime("15:00", "%H:%M").time():
+                        logger.warning("Positions still open past 3:00 PM - will generate ranking at 4:05 PM anyway")
+                        
+                        ranking_time = now.replace(hour=16, minute=5, second=0, microsecond=0)
+                        if now < ranking_time:
+                            wait_seconds = (ranking_time - now).total_seconds()
+                            logger.info(f"Sleeping for {wait_seconds/60:.1f} minutes until 4:05 PM")
+                            time.sleep(wait_seconds)
+                        
+                        logger.info("Generating liquidity ranking at 4:05 PM (positions may still be open)...")
+                        self._generate_liquidity_ranking()
+                        
+                        logger.warning("Liquidity ranking complete - shutting down with positions potentially open")
+                        break
+                    else:
+                        logger.info("Positions still open - checking again in 5 minutes")
+                        time.sleep(300)  # 5 minutes
     
     def _supervise_mm_positions_until_hard_exit(self, now):
         """Supervise MM positions until hard exit time, regardless of EntryLoop status."""
@@ -946,6 +979,29 @@ class IntegratedBot:
 
         return status
 
+    def _generate_liquidity_ranking(self) -> None:
+        """Generate liquidity ranking file for tomorrow's universe selection."""
+        try:
+            from pathlib import Path
+            from .liquidity_ranker import generate_liquidity_ranking
+            from bot import broker
+            
+            output_path = Path(__file__).resolve().parents[1] / "state" / "universe" / "liquidity_ranking.json"
+            
+            success = generate_liquidity_ranking(
+                broker,
+                self.mm_data.alpaca,
+                output_path,
+            )
+            
+            if success:
+                logger.info("Successfully generated liquidity ranking for tomorrow")
+            else:
+                logger.error("Failed to generate liquidity ranking")
+        
+        except Exception as e:
+            logger.error(f"Error generating liquidity ranking: {e}", exc_info=True)
+    
     def _all_positions_closed(self) -> bool:
         """Check if all MM positions are closed and logs are posted."""
         try:
