@@ -378,10 +378,21 @@ class AlpacaDataAdapter:
         # Use provided feed or fall back to instance default
         feed_to_use = self._parse_feed(feed) if feed else self.feed
         
+        # If stream exists but with different feed, close and recreate
+        if self._stream is not None:
+            # Check if we need to switch feeds (stream object doesn't expose feed, so track it)
+            if not hasattr(self, '_current_stream_feed'):
+                self._current_stream_feed = self.feed
+            
+            if feed_to_use != self._current_stream_feed:
+                logger.info(f"Switching stream feed from {self._current_stream_feed} to {feed_to_use}")
+                self.close_stream()
+        
         if self._stream is None:
             self._stream = StockDataStream(
                 self._api_key, self._secret_key, feed=feed_to_use
             )
+            self._current_stream_feed = feed_to_use
 
         new_symbols = [sym for sym in symbols if sym not in self._subscribed_symbols]
         if not new_symbols:
@@ -410,6 +421,21 @@ class AlpacaDataAdapter:
         self._stream = None
         self._stream_thread = None
         self._subscribed_symbols.clear()
+        
+        # Drain bar queue to prevent stale bars from previous session
+        while not self._bar_queue.empty():
+            try:
+                self._bar_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # Reset stream feed tracking
+        if hasattr(self, '_current_stream_feed'):
+            delattr(self, '_current_stream_feed')
+    
+    def unsubscribe_all(self) -> None:
+        """Alias for close_stream() for compatibility with existing code."""
+        self.close_stream()
 
     # ------------------------------------------------------------------
 

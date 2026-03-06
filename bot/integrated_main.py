@@ -106,6 +106,13 @@ class IntegratedBot:
         self.mm_subscribe_symbols = None
         self.mm_candidate_map = None
         self.mm_candidates_date = None
+        
+        # Stage-specific caching to avoid rebuilding stage 1 on every call
+        self.mm_stage1_result = None
+        self.mm_stage2_result = None
+        self.mm_stage3_result = None
+        self.mm_prev_close_map = None
+        self.mm_stages_completed = set()  # Track which stages have been run
     
     def _sync_ma_holding_from_broker(self, state):
         """Ensure state['ma_holding'] matches actual Alpaca positions."""
@@ -180,17 +187,22 @@ class IntegratedBot:
         logger.info("=" * 60)
         
         try:
-            # Check if market is open
+            # Check if market is open (but allow morning momentum to start at 8:30)
             clock = broker.get_clock()
             if not clock.is_open and not self.dry_run:
                 now = market_now()
-                market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                universe_build_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
                 
-                # If it's after 8 AM but before market opens, idle until market open
-                if now.time() >= datetime.strptime("08:00", "%H:%M").time() and now < market_open_time:
-                    wait_seconds = (market_open_time - now).total_seconds()
-                    logger.info(f"Market not open yet. Idling for {wait_seconds/60:.1f} minutes until market opens at 9:30 AM")
-                    time.sleep(wait_seconds)
+                # If it's after 8:30 AM but before market opens, allow morning momentum to start
+                if now.time() >= datetime.strptime("08:30", "%H:%M").time():
+                    logger.info("Market not open yet, but starting morning momentum at 8:30 AM")
+                    # Continue to main loop to start staged candidate building
+                elif now.time() >= datetime.strptime("08:00", "%H:%M").time():
+                    # Between 8:00-8:30: wait for 8:30
+                    wait_seconds = (universe_build_time - now).total_seconds()
+                    if wait_seconds > 0:
+                        logger.info(f"Waiting for morning momentum start at 8:30 AM ({wait_seconds/60:.1f} minutes)")
+                        time.sleep(wait_seconds)
                 else:
                     logger.info("Market is closed and it's not within operating hours. Exiting.")
                     return
@@ -253,7 +265,7 @@ class IntegratedBot:
                     time.sleep(60)
                     continue
             
-            # Morning Momentum: 8:30 AM - hard_exit + 30 min cleanup buffer
+            # Morning Momentum: Staged timeline 8:30 AM - hard_exit + 30 min cleanup buffer
             mm_cleanup_deadline = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
             mm_cleanup_deadline = (datetime.combine(datetime.today(), mm_cleanup_deadline) + timedelta(minutes=30)).time()
             if current_time < mm_cleanup_deadline:
@@ -264,22 +276,33 @@ class IntegratedBot:
                         self.momentum_completed = True
                         continue
                     
-                    # If before 9:25 AM, idle until candidate check time
-                    if current_time < datetime.strptime("09:25", "%H:%M").time():
-                        candidate_check_time = now.replace(hour=9, minute=25, second=0, microsecond=0)
-                        wait_seconds = (candidate_check_time - now).total_seconds()
-                        if wait_seconds > 0:
-                            logger.info(f"Waiting for candidate check at 9:25 AM (idling {wait_seconds/60:.1f} minutes)")
-                            time.sleep(wait_seconds)
-                            continue  # Re-evaluate time after waking
+                    # Staged timeline: Run at appropriate times (8:30, 9:05, 9:15, 9:25)
+                    universe_build = datetime.strptime(self.mm_config.universe_build_time, "%H:%M").time()
                     
-                    # Run morning momentum strategy
-                    success = self.run_morning_momentum(now)
-                    if success:
+                    # If before 8:30, wait for universe build time
+                    if current_time < universe_build:
+                        wait_time = now.replace(hour=universe_build.hour, minute=universe_build.minute, second=0, microsecond=0)
+                        wait_seconds = (wait_time - now).total_seconds()
+                        if wait_seconds > 0:
+                            logger.info(f"Waiting for universe build at {self.mm_config.universe_build_time} ({wait_seconds/60:.1f} minutes)")
+                            time.sleep(min(wait_seconds, 60))  # Check every minute
+                            continue
+                    
+                    # Run morning momentum strategy (handles staged timeline internally)
+                    status = self.run_morning_momentum(now)
+                    if status == "completed":
                         self.momentum_completed = True
-                    else:
-                        logger.error("Morning momentum failed to start; waiting 30 seconds before retry")
+                        logger.info("Morning momentum completed successfully")
+                    elif status == "in_progress":
+                        # Stage completed, continue normal loop timing (no error, no backoff)
+                        logger.debug("Morning momentum stage completed, continuing...")
+                        time.sleep(5)  # Brief sleep to avoid tight loop
+                    elif status == "failed":
+                        logger.error("Morning momentum failed; waiting 30 seconds before retry")
                         time.sleep(30)  # Backoff to prevent rapid retry loops
+                    else:
+                        logger.error(f"Unexpected status from run_morning_momentum: {status}")
+                        time.sleep(30)
                 else:
                     # After momentum completes, supervise positions until hard exit
                     self._supervise_mm_positions_until_hard_exit(now)
@@ -631,71 +654,162 @@ class IntegratedBot:
         except Exception as e:
             logger.error(f"Critical error in emergency MM flatten: {e}")
 
-    def run_morning_momentum(self, now) -> bool:
-        """Run morning momentum strategy with staged timeline"""
+    def run_morning_momentum(self, now) -> str:
+        """Run morning momentum strategy with staged timeline.
+        
+        Returns:
+            "in_progress": Stage completed, more stages pending
+            "completed": All stages done, entry loop started
+            "failed": Error occurred
+        """
         logger.info("Starting morning momentum strategy (staged timeline)")
 
-        success = False
         try:
-            from .morning_main_staged import fetch_candidates_staged, wait_for_timeline_stage
+            from .premarket_scan_staged import (
+                stage1_broad_filter_delayed_sip,
+                stage2_first_iex_refinement,
+                stage3_second_iex_refinement,
+            )
+            from .morning_main_staged import wait_for_timeline_stage
             
-            # Cache candidates per day to avoid rescans on retry
+            # Check if we need to reset for a new day
             today = now.date()
-            
-            if self.mm_candidates_date != today or self.mm_candidates is None:
-                logger.info("Fetching fresh candidates for %s (staged timeline)", today)
-                
-                # Run staged candidate fetching based on current time
-                candidates, stats, prev_close_map = fetch_candidates_staged(
-                    self.mm_config,
-                    self.mm_data,
-                    current_time=now,
-                )
-                
-                if not candidates:
-                    logger.warning("No morning momentum candidates found")
-                    return True
-                
-                # Wait for second refinement if we haven't reached it yet
-                second_refine_time = datetime.strptime(self.mm_config.second_refinement, "%H:%M").time()
-                if now.time() < second_refine_time:
-                    logger.info("Waiting for second IEX refinement at %s", self.mm_config.second_refinement)
-                    wait_for_timeline_stage(self.mm_config, 'second_refinement')
-                    
-                    # Re-fetch with stage 3 (second refinement)
-                    logger.info("Running second IEX refinement...")
-                    candidates, stats, prev_close_map = fetch_candidates_staged(
-                        self.mm_config,
-                        self.mm_data,
-                        current_time=market_now(),
-                    )
-                
-                # Wait for candidate freeze time (9:25)
-                freeze_time = datetime.strptime(self.mm_config.candidate_freeze, "%H:%M").time()
-                if market_now().time() < freeze_time:
-                    logger.info("Waiting for candidate freeze at %s", self.mm_config.candidate_freeze)
-                    wait_for_timeline_stage(self.mm_config, 'candidate_freeze')
-                
-                logger.info("Candidates frozen at %s", self.mm_config.candidate_freeze)
-                
-                # Cache for the day
-                self.mm_candidates = candidates
-                self.mm_watchlist = candidates[:self.mm_config.max_candidates_monitored]
-                self.mm_subscribe_symbols = [c.symbol for c in candidates[:self.mm_config.max_subscribe_symbols]]
-                self.mm_candidate_map = {c.symbol: c for c in candidates[:self.mm_config.max_subscribe_symbols]}
+            if self.mm_candidates_date != today:
+                logger.info("New day detected - resetting stage cache")
+                self.mm_stage1_result = None
+                self.mm_stage2_result = None
+                self.mm_stage3_result = None
+                self.mm_prev_close_map = None
+                self.mm_stages_completed = set()
                 self.mm_candidates_date = today
-                
-                logger.info(f"Cached {len(candidates)} candidates for today")
-                logger.info(f"Watchlist: {len(self.mm_watchlist)} symbols")
-                logger.info(f"Subscribe: {len(self.mm_subscribe_symbols)} symbols")
-            else:
-                logger.info("Reusing cached candidates from %s (retry without rescan)", today)
-                candidates = self.mm_candidates
             
-            # Use cached values
+            # Determine current stage based on time
+            current_time = now.time()
+            stage1_time = datetime.strptime(self.mm_config.broad_filter_start, "%H:%M").time()
+            stage2_time = datetime.strptime(self.mm_config.first_refinement, "%H:%M").time()
+            stage3_time = datetime.strptime(self.mm_config.second_refinement, "%H:%M").time()
+            freeze_time = datetime.strptime(self.mm_config.candidate_freeze, "%H:%M").time()
+            
+            # Stage 1: 8:30-8:40 broad filter (run once)
+            if current_time >= stage1_time and 1 not in self.mm_stages_completed:
+                logger.info("Running Stage 1: Broad filter (delayed_sip) at %s", current_time.strftime('%H:%M'))
+                result1 = stage1_broad_filter_delayed_sip(
+                    self.mm_config,
+                    self.mm_data.alpaca,
+                    self.mm_data.massive,
+                    now,
+                )
+                self.mm_stage1_result = result1.candidates
+                self.mm_prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
+                self.mm_stages_completed.add(1)
+                logger.info(f"Stage 1 complete: {len(self.mm_stage1_result)} candidates cached")
+                # Return to loop - don't block waiting for next stage
+                return "in_progress"  # Stage 1 done, more stages pending
+            
+            # Stage 2: 9:05 first IEX refinement (run once)
+            if current_time >= stage2_time and 2 not in self.mm_stages_completed:
+                if 1 not in self.mm_stages_completed:
+                    logger.warning("Stage 2 triggered but Stage 1 not complete - running Stage 1 first")
+                    # Run stage 1 first if missed
+                    result1 = stage1_broad_filter_delayed_sip(
+                        self.mm_config,
+                        self.mm_data.alpaca,
+                        self.mm_data.massive,
+                        now,
+                    )
+                    self.mm_stage1_result = result1.candidates
+                    self.mm_prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
+                    self.mm_stages_completed.add(1)
+                
+                logger.info("Running Stage 2: First IEX refinement at %s", current_time.strftime('%H:%M'))
+                result2 = stage2_first_iex_refinement(
+                    self.mm_config,
+                    self.mm_data.alpaca,
+                    self.mm_prev_close_map,
+                    self.mm_stage1_result,
+                )
+                self.mm_stage2_result = result2.candidates
+                self.mm_stages_completed.add(2)
+                logger.info(f"Stage 2 complete: {len(self.mm_stage2_result)} candidates cached")
+                # Return to loop - don't block waiting for next stage
+                return "in_progress"  # Stage 2 done, more stages pending
+            
+            # Stage 3: 9:15 second IEX refinement (run once)
+            if current_time >= stage3_time and 3 not in self.mm_stages_completed:
+                if 2 not in self.mm_stages_completed:
+                    logger.warning("Stage 3 triggered but Stage 2 not complete - running stages in order")
+                    # Run missing stages first
+                    if 1 not in self.mm_stages_completed:
+                        result1 = stage1_broad_filter_delayed_sip(
+                            self.mm_config,
+                            self.mm_data.alpaca,
+                            self.mm_data.massive,
+                            now,
+                        )
+                        self.mm_stage1_result = result1.candidates
+                        self.mm_prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
+                        self.mm_stages_completed.add(1)
+                    
+                    result2 = stage2_first_iex_refinement(
+                        self.mm_config,
+                        self.mm_data.alpaca,
+                        self.mm_prev_close_map,
+                        self.mm_stage1_result,
+                    )
+                    self.mm_stage2_result = result2.candidates
+                    self.mm_stages_completed.add(2)
+                
+                logger.info("Running Stage 3: Second IEX refinement at %s", current_time.strftime('%H:%M'))
+                result3 = stage3_second_iex_refinement(
+                    self.mm_config,
+                    self.mm_data.alpaca,
+                    self.mm_prev_close_map,
+                    self.mm_stage2_result,
+                )
+                self.mm_stage3_result = result3.candidates
+                self.mm_stages_completed.add(3)
+                logger.info(f"Stage 3 complete: {len(self.mm_stage3_result)} candidates cached")
+                # Return to loop - don't block waiting for freeze
+                return "in_progress"  # Stage 3 done, waiting for freeze
+            
+            # Candidate freeze: 9:25 - only proceed if we've reached freeze time
+            if current_time < freeze_time:
+                logger.info("Waiting for candidate freeze at %s (returning to loop)", self.mm_config.candidate_freeze)
+                return "in_progress"  # Waiting for freeze time
+            
+            # Use final stage results
+            if 3 in self.mm_stages_completed:
+                candidates = self.mm_stage3_result
+            elif 2 in self.mm_stages_completed:
+                candidates = self.mm_stage2_result
+            elif 1 in self.mm_stages_completed:
+                candidates = self.mm_stage1_result
+            else:
+                logger.error("No stages completed - cannot proceed")
+                return "failed"
+            
+            if not candidates:
+                logger.warning("No morning momentum candidates found")
+                return "completed"  # No candidates but not an error
+            
+            logger.info("Candidates frozen at %s", self.mm_config.candidate_freeze)
+            
+            # Cache final results for entry loop
+            self.mm_candidates = candidates
+            self.mm_watchlist = candidates[:self.mm_config.max_candidates_monitored]
+            self.mm_subscribe_symbols = [c.symbol for c in candidates[:self.mm_config.max_subscribe_symbols]]
+            self.mm_candidate_map = {c.symbol: c for c in candidates[:self.mm_config.max_subscribe_symbols]}
+            
+            logger.info(f"Final candidates: {len(candidates)} total")
+            logger.info(f"Watchlist: {len(self.mm_watchlist)} symbols")
+            logger.info(f"Subscribe: {len(self.mm_subscribe_symbols)} symbols")
+            logger.info(f"Stages completed: {sorted(self.mm_stages_completed)}")
+            
+            # Use final cached values
             watchlist = self.mm_watchlist
             subscribe_symbols = self.mm_subscribe_symbols
             candidate_map = self.mm_candidate_map
+            candidates = self.mm_candidates
             
             logger.info(f"Morning momentum watchlist: {', '.join(c.symbol for c in watchlist)}")
             
@@ -758,7 +872,7 @@ class IntegratedBot:
 
             # After loop completes, mark done
             logger.info("Morning momentum loop completed")
-            success = True
+            status = "completed"
 
             # Save latest state
             if self.mm_positions is not None:
@@ -786,8 +900,9 @@ class IntegratedBot:
             self.mm_positions = None
             self.mm_execution = None
             logger.info("Keeping data feed subscriptions active for retry")
+            return "failed"
 
-        return success
+        return status
 
     def _all_positions_closed(self) -> bool:
         """Check if all MM positions are closed and logs are posted."""
