@@ -99,6 +99,13 @@ class IntegratedBot:
         self.mm_execution = None
         self.last_ma_check = None
         self.clock_check_failed = False
+        
+        # Candidate caching to prevent rescans on retry
+        self.mm_candidates = None
+        self.mm_watchlist = None
+        self.mm_subscribe_symbols = None
+        self.mm_candidate_map = None
+        self.mm_candidates_date = None
     
     def _sync_ma_holding_from_broker(self, state):
         """Ensure state['ma_holding'] matches actual Alpaca positions."""
@@ -271,7 +278,8 @@ class IntegratedBot:
                     if success:
                         self.momentum_completed = True
                     else:
-                        logger.error("Morning momentum failed to start; will retry on next loop")
+                        logger.error("Morning momentum failed to start; waiting 30 seconds before retry")
+                        time.sleep(30)  # Backoff to prevent rapid retry loops
                 else:
                     # After momentum completes, supervise positions until hard exit
                     self._supervise_mm_positions_until_hard_exit(now)
@@ -629,22 +637,38 @@ class IntegratedBot:
 
         success = False
         try:
-            # Build candidates
-            candidates, stats = fetch_candidates(
-                self.mm_config,
-                self.mm_data,
-                most_active_count=100,
-                force_universe_refresh=True,
-            )
+            # Cache candidates per day to avoid rescans on retry
+            today = now.date()
             
-            if not candidates:
-                logger.warning("No morning momentum candidates found")
-                return True
+            if self.mm_candidates_date != today or self.mm_candidates is None:
+                logger.info("Fetching fresh candidates for %s", today)
+                candidates, stats = fetch_candidates(
+                    self.mm_config,
+                    self.mm_data,
+                    most_active_count=100,
+                    force_universe_refresh=True,
+                )
+                
+                if not candidates:
+                    logger.warning("No morning momentum candidates found")
+                    return True
+                
+                # Cache for the day
+                self.mm_candidates = candidates
+                self.mm_watchlist = candidates[:12]
+                self.mm_subscribe_symbols = [c.symbol for c in candidates[:25]]
+                self.mm_candidate_map = {c.symbol: c for c in candidates[:25]}
+                self.mm_candidates_date = today
+                
+                logger.info(f"Cached {len(candidates)} candidates for today")
+            else:
+                logger.info("Reusing cached candidates from %s (retry without rescan)", today)
+                candidates = self.mm_candidates
             
-            # Use top candidates
-            watchlist = candidates[:12]
-            subscribe_symbols = [c.symbol for c in candidates[:25]]
-            candidate_map = {c.symbol: c for c in candidates[:25]}
+            # Use cached values
+            watchlist = self.mm_watchlist
+            subscribe_symbols = self.mm_subscribe_symbols
+            candidate_map = self.mm_candidate_map
             
             logger.info(f"Morning momentum watchlist: {', '.join(c.symbol for c in watchlist)}")
             

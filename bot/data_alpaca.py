@@ -412,7 +412,7 @@ class AlpacaDataAdapter:
             v=bar.volume,
         )
 
-    def _on_stream_bar(self, bar) -> None:
+    async def _on_stream_bar(self, bar) -> None:
         minute_bar = MinuteBar(
             symbol=bar.symbol,
             timestamp=bar.timestamp,
