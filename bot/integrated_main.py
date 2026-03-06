@@ -740,6 +740,13 @@ class IntegratedBot:
 
             # Check orphaned positions post MM run
             self._check_orphaned_broker_positions()
+            
+            # Only unsubscribe on success to avoid resubscription churn on retry
+            try:
+                self.mm_data.unsubscribe_all()
+                logger.info("Unsubscribed from all data feeds after successful completion")
+            except Exception as e:
+                logger.warning(f"Failed to unsubscribe data feeds: {e}")
 
         except Exception as e:
             logger.error(f"Error running morning momentum: {e}", exc_info=True)
@@ -748,16 +755,11 @@ class IntegratedBot:
                 logger.error("Morning momentum initialization failed before position manager setup")
             else:
                 logger.error("Morning momentum encountered an error after initialization; supervision will attempt emergency flatten if needed")
-            # On failure, avoid using partial state
+            # On failure, avoid using partial state and keep subscriptions for retry
             self.mm_positions = None
             self.mm_execution = None
+            logger.info("Keeping data feed subscriptions active for retry")
 
-        finally:
-            # Ensure all subscriptions are cleaned up
-            try:
-                self.mm_data.unsubscribe_all()
-            except Exception as e:
-                logger.warning(f"Failed to unsubscribe data feeds: {e}")
         return success
 
     def _all_positions_closed(self) -> bool:
