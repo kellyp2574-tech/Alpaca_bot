@@ -185,12 +185,48 @@ def _is_preferred_or_weird_class(symbol: str) -> bool:
     return False
 
 
+def load_liquidity_cache(cache_dir: Optional[Path] = None) -> Dict[str, Dict[str, float]]:
+    """
+    Load cached prior-day liquidity data for ranking.
+    
+    Expected file format:
+    {
+        "AAPL": {"prev_close": 172.23, "prev_volume": 53400000, "dollar_volume": 9197082000},
+        "MSFT": {"prev_close": 418.56, "prev_volume": 22100000, "dollar_volume": 9240176000}
+    }
+    
+    Args:
+        cache_dir: Directory containing liquidity cache (default: state/universe/)
+    
+    Returns:
+        Dict mapping symbol to liquidity stats, or empty dict if unavailable
+    """
+    if cache_dir is None:
+        cache_dir = Path(__file__).resolve().parents[1] / "state" / "universe"
+    
+    cache_path = cache_dir / "liquidity_ranking.json"
+    
+    try:
+        if not cache_path.exists():
+            logger.info(f"Liquidity cache not found: {cache_path}")
+            return {}
+        
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+        
+        logger.info(f"Loaded liquidity data for {len(data)} symbols")
+        return data
+    
+    except Exception as e:
+        logger.warning(f"Failed to load liquidity cache: {e}")
+        return {}
+
+
 def build_daily_universe(
     master_assets: List[Dict[str, Any]],
     target_size: int = 4000,
     *,
-    min_price: float = 1.0,
-    max_price: float = 100.0,
+    liquidity_cache: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> List[str]:
     """
     Build daily trading universe from master Alpaca asset list.
@@ -200,16 +236,19 @@ def build_daily_universe(
     - Active and tradable
     - Not OTC
     - Not preferred shares or weird share classes
-    - Price range (if available)
+    
+    Selection:
+    - Ranks by prior-day dollar volume (prev_close × prev_volume)
+    - Selects top N by liquidity
+    - Falls back to alphabetical if liquidity data unavailable
     
     Args:
         master_assets: Full Alpaca asset list
         target_size: Target universe size (default 4000)
-        min_price: Minimum price filter
-        max_price: Maximum price filter
+        liquidity_cache: Optional liquidity data for ranking
     
     Returns:
-        List of symbol strings for daily universe
+        List of symbol strings for daily universe, ranked by liquidity
     """
     logger.info(f"Building daily universe from {len(master_assets)} master assets (target: {target_size})")
     
@@ -242,13 +281,44 @@ def build_daily_universe(
     
     logger.info(f"After filtering: {len(filtered)} eligible US equities")
     
-    # Sort by symbol for deterministic ordering
-    filtered.sort()
+    # Rank by liquidity if data available
+    if liquidity_cache:
+        logger.info("Ranking symbols by prior-day dollar volume...")
+        
+        # Create list of (symbol, dollar_volume) tuples
+        ranked = []
+        for symbol in filtered:
+            liq_data = liquidity_cache.get(symbol, {})
+            dollar_volume = liq_data.get('dollar_volume', 0.0)
+            ranked.append((symbol, dollar_volume))
+        
+        # Sort by dollar volume descending (highest liquidity first)
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        
+        # Extract symbols
+        result = [symbol for symbol, _ in ranked[:target_size]]
+        
+        # Log ranking stats
+        if len(ranked) > target_size:
+            top_symbol, top_vol = ranked[0]
+            cutoff_symbol, cutoff_vol = ranked[target_size - 1]
+            logger.info(f"Selected top {len(result)} by liquidity from {len(filtered)} eligible")
+            logger.info(f"Top: {top_symbol} (${top_vol/1e9:.2f}B), Cutoff: {cutoff_symbol} (${cutoff_vol/1e9:.2f}B)")
+        else:
+            logger.info(f"Selected all {len(result)} eligible symbols (ranked by liquidity)")
     
-    # Return up to target size
-    result = filtered[:target_size]
+    else:
+        # Fallback to alphabetical if no liquidity data
+        logger.warning("No liquidity data available, falling back to alphabetical selection")
+        logger.warning("For better universe quality, populate state/universe/liquidity_ranking.json")
+        filtered.sort()
+        result = filtered[:target_size]
+        
+        if len(filtered) > target_size:
+            logger.info(f"Selected {len(result)} symbols from {len(filtered)} eligible (alphabetical fallback)")
+        else:
+            logger.info(f"Selected all {len(result)} eligible symbols")
     
-    logger.info(f"Final daily universe: {len(result)} symbols")
     return result
 
 
@@ -310,21 +380,21 @@ def build_universe(
     *,
     cache_dir: Optional[Path] = None,
     force_refresh: bool = False,
-    min_price: float = 1.0,
-    max_price: float = 100.0,
 ) -> List[str]:
     """
     Build daily trading universe from Alpaca Assets API.
     
     This is the main entry point for universe building.
     
+    Note:
+        Price filtering is NOT done here (Assets API doesn't include prices).
+        Price filtering happens in Stage 1 snapshot filtering.
+    
     Args:
         broker: Alpaca TradingClient
         target_size: Target universe size (default 4000)
         cache_dir: Directory for asset cache (default: state/universe/)
         force_refresh: Force refresh even if cache is fresh
-        min_price: Minimum price filter
-        max_price: Maximum price filter
     
     Returns:
         List of symbol strings
@@ -342,12 +412,14 @@ def build_universe(
         logger.error("Failed to get master assets, universe will be empty")
         return []
     
+    # Load liquidity cache for ranking
+    liquidity_cache = load_liquidity_cache(cache_dir)
+    
     # Build daily universe from master assets
     universe = build_daily_universe(
         master_assets,
         target_size=target_size,
-        min_price=min_price,
-        max_price=max_price,
+        liquidity_cache=liquidity_cache,
     )
     
     return universe

@@ -702,8 +702,6 @@ class IntegratedBot:
                 seed_symbols = build_universe(
                     broker,
                     target_size=self.mm_config.max_seed_universe,
-                    min_price=self.mm_config.min_price,
-                    max_price=self.mm_config.max_price,
                 )
                 
                 if not seed_symbols:
@@ -738,8 +736,6 @@ class IntegratedBot:
                     seed_symbols = build_universe(
                         broker,
                         target_size=self.mm_config.max_seed_universe,
-                        min_price=self.mm_config.min_price,
-                        max_price=self.mm_config.max_price,
                     )
                     
                     if not seed_symbols:
@@ -782,8 +778,6 @@ class IntegratedBot:
                         seed_symbols = build_universe(
                             broker,
                             target_size=self.mm_config.max_seed_universe,
-                            min_price=self.mm_config.min_price,
-                            max_price=self.mm_config.max_price,
                         )
                         
                         if not seed_symbols:
