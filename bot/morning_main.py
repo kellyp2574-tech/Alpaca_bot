@@ -275,9 +275,18 @@ class EntryLoop:
             f"Entry window: {entry_window.start.strftime('%H:%M')} - {entry_window.end.strftime('%H:%M')}"
         )
 
-        # Subscribe to live data for all watchlist symbols
-        self.alpaca.subscribe_stream(self.ctx.watch_symbols())
-        logger.info(f"Subscribed to {len(self.ctx.watch_symbols())} symbols")
+        # Wait for stream start time (9:28 AM) before subscribing
+        from .morning_main_staged import wait_for_timeline_stage
+        stream_start_time = datetime.strptime(self.ctx.cfg.stream_start, "%H:%M").time()
+        if market_now().time() < stream_start_time:
+            logger.info(f"Waiting for stream start at {self.ctx.cfg.stream_start}")
+            wait_for_timeline_stage(self.ctx.cfg, 'stream_start')
+        
+        # Subscribe to live data using IEX feed
+        feed = self.ctx.cfg.live_stream_feed
+        logger.info(f"Subscribing to {len(self.ctx.watch_symbols())} symbols using {feed} feed")
+        self.alpaca.subscribe_stream(self.ctx.watch_symbols(), feed=feed)
+        logger.info(f"Subscribed to {len(self.ctx.watch_symbols())} symbols with {feed} feed")
 
         # Track last entry order cancellation time
         self._last_entry_cancel_check = 0.0
@@ -340,7 +349,8 @@ class EntryLoop:
             price_lookup = {}
             for symbol in self.positions.positions.keys():
                 try:
-                    quote_dict = self.alpaca.get_latest_quotes([symbol])
+                    feed = self.ctx.cfg.live_quote_refresh_feed
+                    quote_dict = self.alpaca.get_latest_quotes([symbol], feed=feed)
                     quote = quote_dict.get(symbol) if quote_dict else None
                     if quote and getattr(quote, "bid_price", 0) > 0:
                         price_lookup[symbol] = quote.bid_price
@@ -477,9 +487,10 @@ class EntryLoop:
             self.positions.on_bar(symbol, bar)
 
     def _refresh_quotes(self) -> None:
-        """Refresh latest quotes for all symbols."""
+        """Refresh latest quotes for all symbols using IEX feed."""
         symbols = [c.symbol for c in self.ctx.watchlist]
-        quotes = self.alpaca.get_latest_quotes(symbols)
+        feed = self.ctx.cfg.live_quote_refresh_feed
+        quotes = self.alpaca.get_latest_quotes(symbols, feed=feed)
         self.latest_quotes.update(quotes)
 
     def _reconcile_pending_entries(self, now: datetime) -> None:

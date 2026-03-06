@@ -632,35 +632,62 @@ class IntegratedBot:
             logger.error(f"Critical error in emergency MM flatten: {e}")
 
     def run_morning_momentum(self, now) -> bool:
-        """Run morning momentum strategy"""
-        logger.info("Starting morning momentum strategy")
+        """Run morning momentum strategy with staged timeline"""
+        logger.info("Starting morning momentum strategy (staged timeline)")
 
         success = False
         try:
+            from .morning_main_staged import fetch_candidates_staged, wait_for_timeline_stage
+            
             # Cache candidates per day to avoid rescans on retry
             today = now.date()
             
             if self.mm_candidates_date != today or self.mm_candidates is None:
-                logger.info("Fetching fresh candidates for %s", today)
-                candidates, stats = fetch_candidates(
+                logger.info("Fetching fresh candidates for %s (staged timeline)", today)
+                
+                # Run staged candidate fetching based on current time
+                candidates, stats, prev_close_map = fetch_candidates_staged(
                     self.mm_config,
                     self.mm_data,
-                    most_active_count=100,
-                    force_universe_refresh=True,
+                    current_time=now,
                 )
                 
                 if not candidates:
                     logger.warning("No morning momentum candidates found")
                     return True
                 
+                # Wait for second refinement if we haven't reached it yet
+                second_refine_time = datetime.strptime(self.mm_config.second_refinement, "%H:%M").time()
+                if now.time() < second_refine_time:
+                    logger.info("Waiting for second IEX refinement at %s", self.mm_config.second_refinement)
+                    wait_for_timeline_stage(self.mm_config, 'second_refinement')
+                    
+                    # Re-fetch with stage 3 (second refinement)
+                    logger.info("Running second IEX refinement...")
+                    candidates, stats, prev_close_map = fetch_candidates_staged(
+                        self.mm_config,
+                        self.mm_data,
+                        current_time=market_now(),
+                    )
+                
+                # Wait for candidate freeze time (9:25)
+                freeze_time = datetime.strptime(self.mm_config.candidate_freeze, "%H:%M").time()
+                if market_now().time() < freeze_time:
+                    logger.info("Waiting for candidate freeze at %s", self.mm_config.candidate_freeze)
+                    wait_for_timeline_stage(self.mm_config, 'candidate_freeze')
+                
+                logger.info("Candidates frozen at %s", self.mm_config.candidate_freeze)
+                
                 # Cache for the day
                 self.mm_candidates = candidates
-                self.mm_watchlist = candidates[:12]
-                self.mm_subscribe_symbols = [c.symbol for c in candidates[:25]]
-                self.mm_candidate_map = {c.symbol: c for c in candidates[:25]}
+                self.mm_watchlist = candidates[:self.mm_config.max_candidates_monitored]
+                self.mm_subscribe_symbols = [c.symbol for c in candidates[:self.mm_config.max_subscribe_symbols]]
+                self.mm_candidate_map = {c.symbol: c for c in candidates[:self.mm_config.max_subscribe_symbols]}
                 self.mm_candidates_date = today
                 
                 logger.info(f"Cached {len(candidates)} candidates for today")
+                logger.info(f"Watchlist: {len(self.mm_watchlist)} symbols")
+                logger.info(f"Subscribe: {len(self.mm_subscribe_symbols)} symbols")
             else:
                 logger.info("Reusing cached candidates from %s (retry without rescan)", today)
                 candidates = self.mm_candidates

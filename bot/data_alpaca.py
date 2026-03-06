@@ -112,12 +112,7 @@ class AlpacaDataAdapter:
                 "Alpaca API key/secret must be provided via args or environment"
             )
 
-        if raw_feed == "sip":
-            self.feed = DataFeed.SIP
-        elif raw_feed == "iex":
-            self.feed = DataFeed.IEX
-        else:
-            raise ValueError(f"Unsupported ALPACA_DATA_FEED={raw_feed!r} (use 'iex' or 'sip')")
+        self.feed = self._parse_feed(raw_feed)
         self._historical = StockHistoricalDataClient(api_key, secret_key)
         self._screener = ScreenerClient(api_key, secret_key)
         self._api_key = api_key
@@ -128,6 +123,20 @@ class AlpacaDataAdapter:
         self._bar_queue: "queue.Queue[MinuteBar]" = queue.Queue(maxsize=5000)
         self._subscribed_symbols: set[str] = set()
 
+    def _parse_feed(self, feed_str: str) -> DataFeed:
+        """Parse feed string to DataFeed enum, supporting delayed_sip, iex, and sip."""
+        feed_lower = feed_str.lower()
+        if feed_lower == "sip":
+            return DataFeed.SIP
+        elif feed_lower == "iex":
+            return DataFeed.IEX
+        elif feed_lower == "delayed_sip":
+            # delayed_sip is a valid feed option for snapshot/quote endpoints
+            # Return as string since DataFeed enum may not have it
+            return "delayed_sip"  # type: ignore
+        else:
+            raise ValueError(f"Unsupported feed={feed_str!r} (use 'iex', 'sip', or 'delayed_sip')")
+    
     # ------------------------------------------------------------------
     # Historical endpoints
 
@@ -244,13 +253,16 @@ class AlpacaDataAdapter:
         ask = getattr(quote, "ask_price", None) or 0.0
         return Quote(bid_price=float(bid), ask_price=float(ask))
 
-    def get_latest_quotes(self, symbols: Sequence[str]) -> Dict[str, Quote]:
-        """Fetch best bid/ask for multiple symbols with a single request."""
-
+    def get_latest_quotes(self, symbols: Sequence[str], feed: Optional[str] = None) -> Dict[str, Quote]:
+        """Fetch latest quotes for multiple symbols with optional feed override."""
         symbols = list(dict.fromkeys(symbols))
         if not symbols:
             return {}
-        request = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=self.feed)
+        
+        # Use provided feed or fall back to instance default
+        feed_to_use = self._parse_feed(feed) if feed else self.feed
+        
+        request = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=feed_to_use)
         response = self._historical.get_stock_latest_quote(request)
         quotes: Dict[str, Quote] = {}
         for symbol in symbols:
@@ -264,14 +276,17 @@ class AlpacaDataAdapter:
             quotes[symbol] = Quote(bid_price=float(bid), ask_price=float(ask))
         return quotes
 
-    def get_snapshots(self, symbols: Sequence[str]) -> Dict[str, "Snapshot"]:
+    def get_snapshots(self, symbols: Sequence[str], feed: Optional[str] = None) -> Dict[str, "Snapshot"]:
         """
-        Fetch Alpaca snapshots for multiple symbols.
+        Fetch Alpaca snapshots for multiple symbols with optional feed override.
         Returns a dict: symbol -> Snapshot with normalized fields the scanner uses.
         """
         symbols = list(dict.fromkeys(symbols))
         if not symbols:
             return {}
+        
+        # Use provided feed or fall back to instance default
+        feed_to_use = self._parse_feed(feed) if feed else self.feed
 
         # Alpaca snapshot endpoint supports multiple symbols, but keep batches sane.
         # (Even if Alpaca allows more, batching avoids request-size surprises.)
@@ -282,7 +297,7 @@ class AlpacaDataAdapter:
         out: Dict[str, Snapshot] = {}
 
         for batch in chunk(symbols, 200):
-            req = StockSnapshotRequest(symbol_or_symbols=batch, feed=self.feed)
+            req = StockSnapshotRequest(symbol_or_symbols=batch, feed=feed_to_use)
             resp = self._historical.get_stock_snapshot(req)
 
             # alpaca-py returns a mapping-like object: resp[symbol] -> snapshot
@@ -354,14 +369,18 @@ class AlpacaDataAdapter:
     # ------------------------------------------------------------------
     # Live stream
 
-    def subscribe_stream(self, symbols: Iterable[str]) -> None:
-        """Subscribe to live 1m bars for the provided symbols."""
+    def subscribe_stream(self, symbols: Iterable[str], feed: Optional[str] = None) -> None:
+        """Subscribe to live 1m bars for the provided symbols with optional feed override."""
         symbols = list(dict.fromkeys(symbols))
         if not symbols:
             return
+        
+        # Use provided feed or fall back to instance default
+        feed_to_use = self._parse_feed(feed) if feed else self.feed
+        
         if self._stream is None:
             self._stream = StockDataStream(
-                self._api_key, self._secret_key, feed=self.feed
+                self._api_key, self._secret_key, feed=feed_to_use
             )
 
         new_symbols = [sym for sym in symbols if sym not in self._subscribed_symbols]

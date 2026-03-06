@@ -7,15 +7,26 @@ from dataclasses import dataclass
 class Config:
     """Strategy parameters and guardrails - Gap Momentum Strategy."""
 
-    # Strategy window
-    scan_start: str = "09:00"      # Start scanning at 9am
-    scan_end: str = "09:29"        # End scanning at 9:29 (same as final_scan)
-    scan_interval_minutes: int = 5  # Scan every 5 min
-    final_scan: str = "09:29"       # Final candidate build
-    entry_start: str = "09:40"      # Entry time (after 10-min confirmation)
-    entry_cutoff: str = "14:30"     # Last entry allowed
-    hard_exit: str = "14:30"        # Exit all positions
-    market_open: str = "09:30"
+    # Strategy window - New Timeline
+    universe_build_time: str = "08:30"     # Build 4,000-symbol universe
+    broad_filter_start: str = "08:30"      # Start delayed_sip broad filter
+    broad_filter_end: str = "08:40"        # End delayed_sip broad filter
+    first_pool_save: str = "08:45"         # Save first filtered pool
+    first_refinement: str = "09:05"        # First live IEX refinement
+    second_refinement: str = "09:15"       # Second live IEX refinement
+    candidate_freeze: str = "09:25"        # Freeze candidates, build watchlist
+    stream_start: str = "09:28"            # Start IEX live stream
+    market_open: str = "09:30"             # Market open
+    entry_start: str = "09:40"             # Entry time (after 10-min confirmation)
+    entry_cutoff: str = "14:30"            # Last entry allowed
+    hard_exit: str = "14:30"               # Exit all positions
+    
+    # Data feed strategy
+    universe_filter_feed: str = "delayed_sip"  # Broad filter (8:30-8:40)
+    preopen_refine_feed: str = "iex"           # First refinement (9:05)
+    final_preopen_refresh_feed: str = "iex"    # Second refinement (9:15)
+    live_stream_feed: str = "iex"              # Live stream (9:28 onward)
+    live_quote_refresh_feed: str = "iex"       # Live quote refresh (9:30 onward)
 
     # Universe filters (gap strategy - WIDER NET)
     min_price: float = 1.0  # $1 min price
@@ -25,9 +36,11 @@ class Config:
     min_gap_pct: float = 0.05  # 5% min gap
     max_gap_pct: float = 0.25  # 25% max gap
     opening_breakout: bool = True  # Enter only if price > first 1-min bar high
-    max_seed_universe: int = 4000  # Max symbols from Massive snapshot (wider net for gap filtering)
-    max_candidates_returned: int = 300  # Max candidates returned from scanner (wide funnel)
-    max_candidates_monitored: int = 35  # Max candidates to actively monitor/trade (focused)
+    max_seed_universe: int = 4000  # Max symbols from Massive snapshot (8:30 AM universe build)
+    first_filter_pool_size: int = 800  # Max after delayed_sip broad filter (8:30-8:40)
+    max_candidates_returned: int = 300  # Max after IEX refinements (9:05, 9:15)
+    max_subscribe_symbols: int = 25    # Top symbols to subscribe to stream (9:28)
+    max_candidates_monitored: int = 12  # Top watchlist for active trading (9:25)
 
     # Position sizing (85% of available cash)
     daily_deploy_pct: float = 0.85  # 85% of equity deployed daily
