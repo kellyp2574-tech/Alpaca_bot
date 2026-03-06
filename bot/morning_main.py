@@ -2,25 +2,21 @@
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
-import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime
+from typing import Deque, Dict, List, Optional
 
 from .clock import MARKET_TZ, config_window, market_datetime, market_now
 from .morning_config import Config
 from .data_alpaca import Quote
-from .data_sources import DataStack, init_data_stack
+from .data_sources import DataStack
 from .execution import ExecutionClient, ExecutionConfig, FillResult
 from .indicators import VWAPState, atr_1m
-from .position_manager import PositionManager, calc_qty, initial_stop_pct, _entry_client_id
-from .premarket_scan import build_candidates
+from .position_manager import PositionManager, initial_stop_pct, _entry_client_id
 from .risk_manager import RiskManager
 from .state_manager import StateStore
 from .storage import Candidate, PendingEntryState
@@ -290,6 +286,7 @@ class EntryLoop:
 
         # Track last entry order cancellation time
         self._last_entry_cancel_check = 0.0
+        self._last_pending_reconcile = 0.0
 
         try:
             while True:
@@ -311,8 +308,10 @@ class EntryLoop:
                     self._cancel_stale_entry_orders()
                     self._last_entry_cancel_check = time.monotonic()
 
-                # Reconcile pending entries (DAY orders that returned unknown)
-                self._reconcile_pending_entries(now)
+                # Reconcile pending entries every 10s (rate-limit safe)
+                if time.monotonic() - self._last_pending_reconcile > 10.0:
+                    self._reconcile_pending_entries(now)
+                    self._last_pending_reconcile = time.monotonic()
 
                 # Check for entries
                 self._check_entries(now)
@@ -345,20 +344,22 @@ class EntryLoop:
             # Step 1: Cancel any open orders first
             self._cancel_all_open_orders()
             
-            # Step 2: Get current prices for all positions
+            # Step 2: Get current prices for all positions (single batched API call)
             price_lookup = {}
-            for symbol in self.positions.positions.keys():
-                try:
-                    feed = self.ctx.cfg.live_quote_refresh_feed
-                    quote_dict = self.alpaca.get_latest_quotes([symbol], feed=feed)
+            position_symbols = list(self.positions.positions.keys())
+            try:
+                feed = self.ctx.cfg.live_quote_refresh_feed
+                quote_dict = self.alpaca.get_latest_quotes(position_symbols, feed=feed)
+                for symbol in position_symbols:
                     quote = quote_dict.get(symbol) if quote_dict else None
                     if quote and getattr(quote, "bid_price", 0) > 0:
                         price_lookup[symbol] = quote.bid_price
                     else:
                         position = self.positions.positions[symbol]
                         price_lookup[symbol] = position.peak_price or position.entry_price
-                except Exception as e:
-                    logger.warning(f"Failed to get price for {symbol}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to batch-fetch quotes: {e}")
+                for symbol in position_symbols:
                     position = self.positions.positions[symbol]
                     price_lookup[symbol] = position.peak_price or position.entry_price
             
@@ -858,70 +859,6 @@ class EntryLoop:
                 self.positions.exit_position(symbol, current_price, now, reason="hard_exit")
 
 
-def fetch_candidates(
-    cfg: Config,
-    data: DataStack,
-    *,
-    most_active_count: int = 50,  # no longer used
-    force_universe_refresh: bool = False,
-) -> Tuple[List[Candidate], Dict[str, any]]:
-    """Fetch and filter candidates for the morning momentum strategy."""
-    logger.info("Fetching morning momentum candidates via Massive + Alpaca snapshot...")
-
-    today = market_now()
-
-    # NEW: Massive seeds + Alpaca snapshot validation
-    candidates, ledger = build_candidates(
-        cfg,
-        data.alpaca,
-        data.massive,
-        today,
-    )
-
-    # Optional: save audit file
-    try:
-        BASE_DIR = Path(__file__).resolve().parents[1]  # project root
-        report_path = BASE_DIR / "state" / "candidates" / f"{today.date().isoformat()}.json"
-        
-        # Log absolute path for debugging
-        logger.info(f"Candidate ledger path (absolute): {report_path.resolve()}")
-        
-        # Ensure directories exist
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        ledger.save(report_path)
-        logger.info(f"Saved candidate ledger → {report_path}")
-    except Exception as e:
-        logger.exception(f"Failed to save candidate ledger: {e}")
-
-    # Build stats dict with per-symbol candidate data
-    stats = {
-        c.symbol: {
-            "prev_close": c.prev_close,
-            "gap_pct": c.gap_pct,
-            "price": c.price,
-            "pm_last": c.pm_last,
-            "float_shares": c.float_shares,
-            "pm_vol_float": c.pm_vol_float,
-            "relvol": c.relvol,
-            "score": c.score,
-        }
-        for c in candidates
-    }
-    
-    stats["_meta"] = {
-        "candidates_found": len(candidates),
-        "scan_time": market_now(),
-    }
-
-    # Sanity check: log first 5 candidates to verify data flow
-    logger.info(f"Built {len(candidates)} candidates")
-    for c in candidates[:5]:
-        logger.info(f"  {c.symbol}: prev_close=${c.prev_close:.2f}, gap={c.gap_pct:.1%}, price=${c.price:.2f}")
-    
-    return candidates, stats
-
-
 def _reconcile_pending_entries(
     execution: ExecutionClient,
     state_store: StateStore,
@@ -967,94 +904,3 @@ def _reconcile_pending_entries(
         logger.info(f"Cleared {len(cleared_ids)} reconciled pending entries")
     if unresolved:
         logger.info(f"{len(unresolved)} pending entries retained for retry")
-
-
-def main() -> None:
-    """Main entry point for the morning momentum bot."""
-    parser = argparse.ArgumentParser(description="Morning Momentum Bot")
-    parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode")
-    args = parser.parse_args()
-
-    # Initialize data stack
-    data = init_data_stack()
-
-    # Load configuration
-    cfg = Config()
-
-    # Initialize execution client
-    exec_cfg = ExecutionConfig(
-        buy_slippage_pct=cfg.exec_slippage_buy_pct,
-        sell_slippage_pct=cfg.exec_slippage_sell_pct,
-    )
-    execution = ExecutionClient(dry_run=args.dry_run, cfg=exec_cfg)
-
-    # Initialize state store
-    state_store = StateStore("state/mm_positions.json")
-
-    # Initialize risk manager
-    risk_manager = RiskManager(cfg, state_store=state_store)
-
-    # Initialize position manager
-    positions = PositionManager(cfg, execution, risk_manager, state_store=state_store)
-
-    # Load existing positions
-    existing_positions = state_store.load_positions()
-    if existing_positions:
-        positions.load_states(existing_positions)
-
-    # Reconcile pending entries
-    _reconcile_pending_entries(execution, state_store, positions)
-
-    # Fetch candidates
-    candidates, stats = fetch_candidates(cfg, data, most_active_count=50)
-    if not candidates:
-        logger.error("No candidates found")
-        return
-
-    # Use top candidates (wider net - monitor up to max_candidates_monitored)
-    n = getattr(cfg, "max_candidates_monitored", 35)
-    watchlist = candidates[:n]
-    subscribe_symbols = [c.symbol for c in candidates[:n]]
-    candidate_map = {c.symbol: c for c in candidates[:n]}
-
-    logger.info(f"Watchlist: {', '.join(c.symbol for c in watchlist)}")
-
-    # Get account info
-    try:
-        account = execution.client.get_account() if not args.dry_run else None
-        equity = float(account.equity) if account else 100000
-        cash = float(account.cash) if account else 100000
-    except Exception as e:
-        logger.error(f"Could not get account info: {e}")
-        equity = 100000
-        cash = 100000
-
-    # Create entry context
-    ctx = EntryContext(
-        cfg=cfg,
-        data=data,
-        watchlist=watchlist,
-        max_bar_history=120,
-        candidate_map=candidate_map,
-        risk_manager=risk_manager,
-        account_equity=equity,
-        account_cash=cash,
-        execution=execution,
-        positions=positions,
-        state_store=state_store,
-        subscribe_symbols=subscribe_symbols,
-    )
-
-    # Run entry loop
-    loop = EntryLoop(ctx)
-    loop.run()
-
-    # Print session stats
-    stats = loop.stats
-    logger.info("Session Summary:")
-    logger.info(f"  Entries: {stats.entry_filled} filled, {stats.entry_partial} partial, {stats.entry_unfilled} unfilled")
-    logger.info(f"  Exits: {stats.exit_filled} filled, {stats.exit_partial} partial, {stats.exit_unfilled} unfilled")
-
-
-if __name__ == "__main__":
-    main()

@@ -54,6 +54,7 @@ class Config:
     risk_per_trade: float = 0.02  # 2% risk per trade
     max_concurrent: int = 25  # Max open positions
     max_trades_per_day: int = 25  # Max trades per day
+    max_daily_deploy: float = -1.0  # Max total $ deployed per day (-1 = no cap)
     daily_kill_r: float = -3.0  # Stop trading if R <= -3R
 
     # Exit rules

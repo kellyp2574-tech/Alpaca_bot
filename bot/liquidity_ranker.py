@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any
@@ -88,6 +89,9 @@ def generate_liquidity_ranking(
             except Exception as e:
                 logger.warning(f"Failed to fetch bars for batch: {e}")
                 continue
+            
+            # Rate-limit: stay under Alpaca 200 req/min Data API limit
+            time.sleep(0.5)
         
         logger.info(f"Fetched bars for {len(all_bars)} symbols")
         

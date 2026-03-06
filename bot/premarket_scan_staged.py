@@ -18,7 +18,6 @@ from .morning_config import Config
 from .premarket_scan import (
     CandidateLedger,
     Drop,
-    seed_universe_massive,
     _safe_float,
 )
 from .storage import Candidate

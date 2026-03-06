@@ -10,13 +10,10 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Import current bot components (3 ETF rotation)
+# Import bot components
 from bot import config as ma_config
-from bot.state_manager import load_state, save_state, log_trade
 from bot import alpaca_client as broker
-from bot import data as ma_data
-from bot import strategies as ma_strategies
-from bot.trade_reporter import get_trade_reporter, log_trade_with_reporting
+from bot.trade_reporter import get_trade_reporter
 from bot.reporting_position_manager import create_reporting_position_manager
 
 # Import morning momentum components (now local)
@@ -26,7 +23,7 @@ from bot.execution import ExecutionClient, ExecutionConfig
 from bot.position_manager import PositionManager
 from bot.risk_manager import RiskManager
 from bot.state_manager import StateStore as MMStateStore
-from bot.morning_main import fetch_candidates, EntryContext, EntryLoop, _reconcile_pending_entries
+from bot.morning_main import EntryContext, EntryLoop, _reconcile_pending_entries
 from bot.clock import market_datetime, market_now, config_window, MARKET_TZ
 
 # ═══════════════════════════════════════════════════
@@ -56,15 +53,6 @@ class IntegratedBot:
         logger.info("IntegratedBot.__init__ starting...")
         self.dry_run = dry_run
         self.mm_config = MMConfig()
-        
-        # Load state with error handling
-        try:
-            self.ma_state = load_state()
-            logger.info("MA state loaded successfully")
-        except Exception as e:
-            logger.exception("Failed to load MA state, using defaults: %s", e)
-            self.ma_state = {}
-        
         self.mm_state_store = MMStateStore("state/mm_positions.json")
         
         # Initialize trade reporter with error handling (don't let reporting kill trading)
@@ -75,8 +63,7 @@ class IntegratedBot:
             logger.exception("TradeReporter init failed; disabling reporting. Error=%s", e)
             self.trade_reporter = None
         
-        # Initialize data stacks
-        self.ma_data = ma_data
+        # Initialize data stack
         self.mm_data = init_data_stack()
         
         # Initialize execution client
@@ -97,7 +84,6 @@ class IntegratedBot:
         self.momentum_completed = False
         self.mm_positions = None
         self.mm_execution = None
-        self.last_ma_check = None
         self.clock_check_failed = False
         
         # Candidate caching to prevent rescans on retry
@@ -111,44 +97,7 @@ class IntegratedBot:
         self.mm_stage1_result = None
         self.mm_stage2_result = None
         self.mm_stage3_result = None
-        self.mm_prev_close_map = None
         self.mm_stages_completed = set()  # Track which stages have been run
-    
-    def _sync_ma_holding_from_broker(self, state):
-        """Ensure state['ma_holding'] matches actual Alpaca positions."""
-        ma_tickers = {
-            ma_config.MA_TRADE_GROWTH,
-            ma_config.MA_TRADE_SAFE,
-            ma_config.MA_TRADE_ALT,
-        }
-
-        try:
-            positions = broker.get_all_positions()
-        except Exception as e:
-            logger.error(f"Could not fetch positions to sync MA holding: {e}")
-            return state.get("ma_holding"), 0.0
-
-        active = []
-        for pos in positions:
-            symbol = getattr(pos, "symbol", None)
-            if symbol in ma_tickers:
-                qty = float(getattr(pos, "qty", 0) or 0)
-                if abs(qty) > 0:
-                    market_value = float(getattr(pos, "market_value", 0) or 0)
-                    active.append((symbol, market_value))
-
-        active.sort(key=lambda item: abs(item[1]), reverse=True)
-        actual_symbol = active[0][0] if active else None
-        actual_value = active[0][1] if active else 0.0
-
-        if state.get("ma_holding") != actual_symbol:
-            logger.warning(
-                f"MA HOLDING SYNC: state={state.get('ma_holding')} -> broker={actual_symbol}"
-            )
-            state["ma_holding"] = actual_symbol
-
-        state["ma_position_value"] = actual_value
-        return actual_symbol, actual_value
     
     def _check_orphaned_broker_positions(self):
         """Check for and log any unexpected positions in broker account."""
@@ -306,6 +255,7 @@ class IntegratedBot:
                 else:
                     # After momentum completes, supervise positions until hard exit
                     self._supervise_mm_positions_until_hard_exit(now)
+                    time.sleep(30)  # Prevent tight loop after supervision returns
                     continue
             
             # Check for any orphaned broker positions after emergency flatten
@@ -712,7 +662,6 @@ class IntegratedBot:
                 self.mm_stage1_result = None
                 self.mm_stage2_result = None
                 self.mm_stage3_result = None
-                self.mm_prev_close_map = None
                 self.mm_stages_completed = set()
                 self.mm_candidates_date = today
             
@@ -729,7 +678,6 @@ class IntegratedBot:
                 
                 # Build universe from Alpaca Assets API (cached)
                 from .universe_loader import build_universe
-                from bot import broker
                 
                 logger.info("Building 4,000-symbol universe from Alpaca Assets API...")
                 seed_symbols = build_universe(
@@ -751,7 +699,6 @@ class IntegratedBot:
                     now,
                 )
                 self.mm_stage1_result = result1.candidates
-                self.mm_prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
                 self.mm_stages_completed.add(1)
                 logger.info(f"Stage 1 complete: {len(self.mm_stage1_result)} candidates cached")
                 # Return to loop - don't block waiting for next stage
@@ -764,7 +711,6 @@ class IntegratedBot:
                     
                     # Build universe from Alpaca Assets API
                     from .universe_loader import build_universe
-                    from bot import broker
                     
                     seed_symbols = build_universe(
                         broker,
@@ -783,7 +729,6 @@ class IntegratedBot:
                         now,
                     )
                     self.mm_stage1_result = result1.candidates
-                    self.mm_prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
                     self.mm_stages_completed.add(1)
                 
                 logger.info("Running Stage 2: First IEX refinement at %s", current_time.strftime('%H:%M'))
@@ -806,7 +751,6 @@ class IntegratedBot:
                     if 1 not in self.mm_stages_completed:
                         # Build universe from Alpaca Assets API
                         from .universe_loader import build_universe
-                        from bot import broker
                         
                         seed_symbols = build_universe(
                             broker,
@@ -824,7 +768,6 @@ class IntegratedBot:
                             now,
                         )
                         self.mm_stage1_result = result1.candidates
-                        self.mm_prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
                         self.mm_stages_completed.add(1)
                     
                     result2 = stage2_first_iex_refinement(
@@ -984,7 +927,6 @@ class IntegratedBot:
         try:
             from pathlib import Path
             from .liquidity_ranker import generate_liquidity_ranking
-            from bot import broker
             
             output_path = Path(__file__).resolve().parents[1] / "state" / "universe" / "liquidity_ranking.json"
             
@@ -1034,86 +976,6 @@ class IntegratedBot:
             logger.error(f"Error checking if positions closed: {e}")
             return False
     
-    def _fetch_ma_common_data(self):
-        """Fetch common market data for MA rotation strategy."""
-        try:
-            equity = broker.get_equity()
-            cash = broker.get_cash()
-            logger.info(f"Account: equity=${equity:,.2f} cash=${cash:,.2f}")
-        except Exception as e:
-            logger.error(f"Could not fetch account info: {e}")
-            return None
-        
-        try:
-            logger.info("Fetching market data...")
-            all_bars = ma_data.fetch_daily_bars(ma_config.ALL_TICKERS, lookback_days=150)
-            
-            ctx = {
-                "equity": equity, "cash": cash,
-                "spy_dates":  all_bars.get("SPY", {}).get("dates", []),
-                "spy_closes": all_bars.get("SPY", {}).get("closes", []),
-                "spy_opens":  all_bars.get("SPY", {}).get("opens", []),
-                "qqq_closes": all_bars.get("QQQ", {}).get("closes", []),
-                "tlt_closes": all_bars.get("TLT", {}).get("closes", []),
-                "upro_closes": all_bars.get("UPRO", {}).get("closes", []),
-            }
-            ctx["upro_price"] = ctx["upro_closes"][-1] if ctx["upro_closes"] else 0
-            
-            if not ctx["spy_closes"] or not ctx["qqq_closes"] or not ctx["tlt_closes"]:
-                logger.error("Missing critical price data -- aborting")
-                return None
-            
-            # Fetch live prices
-            try:
-                live_tickers = ["SPY", "UPRO", ma_config.MA_TRADE_GROWTH,
-                               ma_config.MA_TRADE_SAFE, ma_config.MA_TRADE_ALT]
-                live = ma_data.fetch_live_prices(list(set(live_tickers)))
-                ctx["spy_live"] = float(live["SPY"]) if live.get("SPY") else None
-                ctx["upro_live"] = float(live["UPRO"]) if live.get("UPRO") else None
-                ctx["live_prices"] = {k: float(v) for k, v in live.items() if v}
-            except Exception as e:
-                logger.warning(f"Live price fetch failed: {e}")
-                ctx["spy_live"] = None
-                ctx["upro_live"] = None
-                ctx["live_prices"] = {}
-            
-            return ctx
-        except Exception as e:
-            logger.error(f"Could not fetch market data: {e}", exc_info=True)
-            return None
-    
-    def _bootstrap_ma_counters(self, qqq_closes, tlt_closes):
-        """Bootstrap MA counters on first run"""
-        if self.ma_state.get("ma_bootstrapped"):
-            return
-        
-        logger.info("First run — bootstrapping MA counters from history...")
-        period = ma_config.MA_PERIOD
-        buf = ma_config.MA_BUFFER_PCT
-        qa, qb, ta, tb = 0, 0, 0, 0
-        
-        for i in range(period, len(qqq_closes)):
-            qqq_sma = sum(qqq_closes[i - period + 1:i + 1]) / period
-            if qqq_closes[i] > qqq_sma * (1 + buf):
-                qa += 1; qb = 0
-            elif qqq_closes[i] < qqq_sma * (1 - buf):
-                qb += 1; qa = 0
-        
-        for i in range(period, len(tlt_closes)):
-            tlt_sma = sum(tlt_closes[i - period + 1:i + 1]) / period
-            if tlt_closes[i] > tlt_sma * (1 + buf):
-                ta += 1; tb = 0
-            elif tlt_closes[i] < tlt_sma * (1 - buf):
-                tb += 1; ta = 0
-        
-        self.ma_state["ma_qa"] = qa
-        self.ma_state["ma_qb"] = qb
-        self.ma_state["ma_ta"] = ta
-        self.ma_state["ma_tb"] = tb
-        self.ma_state["ma_bootstrapped"] = True
-        logger.info(f"Bootstrapped: qa={qa} qb={qb} ta={ta} tb={tb}")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Integrated Bot - Morning Momentum + 3 ETF Rotation")
     parser.add_argument("--dry-run", action="store_true", help="Show signals without trading")

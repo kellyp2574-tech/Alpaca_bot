@@ -20,12 +20,15 @@ class ReportingPositionManager:
         """Delegate all other attributes to original position manager"""
         return getattr(self.original_pm, name)
     
-    def open_position(self, symbol, qty, price, stop_pct, entry_time=None, 
-                     entry_order_id=None, entry_client_order_id=None):
+    def open_position(self, symbol, qty, price, stop_pct, *,
+                     entry_time=None, entry_order_id=None, entry_client_order_id=None):
         """Open position with trade reporting"""
         # Call original method
         result = self.original_pm.open_position(
-            symbol, qty, price, stop_pct, entry_time, entry_order_id, entry_client_order_id
+            symbol, qty, price, stop_pct,
+            entry_time=entry_time,
+            entry_order_id=entry_order_id,
+            entry_client_order_id=entry_client_order_id,
         )
         
         # Log trade to reporting system
@@ -45,7 +48,7 @@ class ReportingPositionManager:
         
         return result
     
-    def exit_position(self, symbol, price, timestamp, reason=""):
+    def exit_position(self, symbol, price, timestamp, *, reason=""):
         """Exit position with trade reporting"""
         # Get position info before exit
         position = self.original_pm.positions.get(symbol)
@@ -57,7 +60,7 @@ class ReportingPositionManager:
             entry_price = position.entry_price
         
         # Call original method
-        result = self.original_pm.exit_position(symbol, price, timestamp, reason)
+        result = self.original_pm.exit_position(symbol, price, timestamp, reason=reason)
         
         # Log trade to reporting system
         if exit_qty > 0:
@@ -75,7 +78,7 @@ class ReportingPositionManager:
         
         return result
     
-    def force_exit_all(self, prices, reason=""):
+    def force_exit_all(self, prices, *, reason=""):
         """Force exit all positions with trade reporting"""
         # Log all exits before calling original
         for symbol, position in self.original_pm.positions.items():
@@ -93,7 +96,7 @@ class ReportingPositionManager:
                     logger.exception("Reporting failed for %s force exit; continuing", symbol)
         
         # Call original method
-        return self.original_pm.force_exit_all(prices, reason)
+        return self.original_pm.force_exit_all(prices, reason=reason)
 
 
 def create_reporting_position_manager(original_pm, strategy_name="morning_momentum"):

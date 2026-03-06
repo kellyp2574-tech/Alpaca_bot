@@ -238,12 +238,16 @@ class PositionManager:
     def force_exit_all(
         self, price_lookup: Dict[str, float], *, reason: str = "hard_exit"
     ) -> None:
-        for symbol, state in list(self.positions.items()):
+        items = list(self.positions.items())
+        for i, (symbol, state) in enumerate(items):
             # Use current bid price from lookup, fallback to reference price, not peak
             price = price_lookup.get(symbol)
             if not price or price <= 0:
                 price = self.execution._reference_price(symbol, OrderSide.SELL, state.entry_price)
             self._exit(symbol, state, price, market_now(), reason=reason)
+            # Rate-limit: pause between exits to stay under Alpaca 200 req/min
+            if i < len(items) - 1:
+                time.sleep(1.0)
 
     def reconcile_pending_exits_time_based(self, max_wait_seconds: float = 30.0) -> int:
         """Time-based reconciliation of pending exits (not bar-driven). Returns remaining pending count."""
@@ -256,13 +260,15 @@ class PositionManager:
                     pending_count += 1
                     # Force reconcile without waiting for bars
                     self._reconcile_pending_exit_time_based(symbol, state, market_now())
+                    # Rate-limit: small delay between position checks to stay under 200 req/min
+                    time.sleep(0.5)
             
             if pending_count == 0:
                 logger.info("All exits reconciled successfully")
                 return 0
             
             logger.info(f"Waiting for {pending_count} exits to reconcile...")
-            time.sleep(1.0)  # Check every second
+            time.sleep(2.0)  # Check every 2 seconds
         
         remaining_pending = sum(1 for state in self.positions.values() if state.exit_pending)
         logger.warning(f"{remaining_pending} exits still pending after {max_wait_seconds}s")

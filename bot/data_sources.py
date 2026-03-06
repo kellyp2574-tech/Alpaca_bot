@@ -21,7 +21,7 @@ class DataStack:
     """Container for the core data dependencies."""
 
     alpaca: AlpacaDataAdapter
-    massive: "RESTClient"
+    massive: Optional["RESTClient"] = None
 
     def unsubscribe_all(self) -> None:
         try:
@@ -43,11 +43,13 @@ def init_data_stack(
         feed=alpaca_feed,
     )
     
+    massive = None
     massive_api_key = massive_api_key or os.getenv("MASSIVE_API_KEY")
-    if not massive_api_key:
-        raise ValueError("Missing MASSIVE_API_KEY")
-    
-    from massive import RESTClient
-    massive = RESTClient(massive_api_key)
+    if massive_api_key:
+        try:
+            from massive import RESTClient
+            massive = RESTClient(massive_api_key)
+        except ImportError:
+            logging.getLogger(__name__).warning("massive package not installed; Massive client unavailable")
     
     return DataStack(alpaca=alpaca, massive=massive)
