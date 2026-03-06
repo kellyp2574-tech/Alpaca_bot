@@ -145,21 +145,20 @@ def _build_candidates_from_snapshots(
 def stage1_broad_filter_delayed_sip(
     cfg: Config,
     alpaca,
+    seed_symbols: List[str],
     date: datetime,
-    *,
-    universe_file: Optional[str] = None,
 ) -> StagedScanResult:
     """
     Stage 1: 8:30-8:40 AM - Broad filter using delayed_sip.
     
-    Build 4,000-symbol universe locally (no Massive dependency), then filter using delayed_sip snapshots.
+    Takes pre-built universe and filters using delayed_sip snapshots.
     Target: 800 candidates after broad filter.
     
     Args:
         cfg: Configuration
         alpaca: AlpacaDataAdapter
+        seed_symbols: Pre-built universe (from Alpaca Assets API)
         date: Current date
-        universe_file: Optional path to local universe file
     
     Returns:
         StagedScanResult with ~800 candidates
@@ -168,22 +167,8 @@ def stage1_broad_filter_delayed_sip(
     logger.info("STAGE 1: Broad Filter (delayed_sip) - 8:30-8:40 AM")
     logger.info("=" * 80)
     
-    from .universe_loader import build_universe
-    
     run_date = date.date().isoformat()
     ledger = CandidateLedger(run_date=run_date)
-    
-    # Build 4,000-symbol universe locally (no Massive dependency)
-    max_seed = cfg.max_seed_universe
-    logger.info(f"Building {max_seed}-symbol universe from local sources...")
-    
-    seed_symbols = build_universe(
-        alpaca,
-        max_symbols=max_seed,
-        universe_file=universe_file,
-        min_price=cfg.min_price,
-        max_price=cfg.max_price,
-    )
     
     ledger.seed_total = len(seed_symbols)
     ledger.seed_selected = len(seed_symbols)
@@ -330,43 +315,9 @@ def stage3_second_iex_refinement(
     )
 
 
-def build_candidates_staged(
-    cfg: Config,
-    alpaca,
-    massive_client,
-    date: datetime,
-    *,
-    stage: int = 3,
-) -> Tuple[List[Candidate], CandidateLedger, Dict[str, float]]:
-    """
-    Multi-stage candidate building with feed-specific data collection.
-    
-    Args:
-        cfg: Configuration
-        alpaca: Alpaca data adapter
-        massive_client: Massive API client
-        date: Current date
-        stage: Which stage to run up to (1, 2, or 3). Default 3 = full pipeline.
-    
-    Returns:
-        (candidates, ledger, prev_close_map)
-    """
-    # Stage 1: Broad filter with delayed_sip (8:30-8:40)
-    result1 = stage1_broad_filter_delayed_sip(cfg, alpaca, massive_client, date)
-    
-    if stage == 1:
-        return result1.candidates, result1.ledger, {}
-    
-    # Extract prev_close_map from stage 1 candidates
-    prev_close_map = {c.symbol: c.prev_close for c in result1.candidates}
-    
-    # Stage 2: First IEX refinement (9:05)
-    result2 = stage2_first_iex_refinement(cfg, alpaca, prev_close_map, result1.candidates)
-    
-    if stage == 2:
-        return result2.candidates, result1.ledger, prev_close_map
-    
-    # Stage 3: Second IEX refinement (9:15)
-    result3 = stage3_second_iex_refinement(cfg, alpaca, prev_close_map, result2.candidates)
-    
-    return result3.candidates, result1.ledger, prev_close_map
+# REMOVED: build_candidates_staged() - Stale function with outdated signatures
+# integrated_main.py now calls stage1/stage2/stage3 functions directly
+# If you need a helper function, use the individual stage functions:
+#   result1 = stage1_broad_filter_delayed_sip(cfg, alpaca, date)
+#   result2 = stage2_first_iex_refinement(cfg, alpaca, result1.candidates)
+#   result3 = stage3_second_iex_refinement(cfg, alpaca, result2.candidates)

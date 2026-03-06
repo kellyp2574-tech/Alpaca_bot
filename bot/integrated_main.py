@@ -693,9 +693,30 @@ class IntegratedBot:
             # Stage 1: 8:30-8:40 broad filter (run once)
             if current_time >= stage1_time and 1 not in self.mm_stages_completed:
                 logger.info("Running Stage 1: Broad filter (delayed_sip) at %s", current_time.strftime('%H:%M'))
+                
+                # Build universe from Alpaca Assets API (cached)
+                from .universe_loader import build_universe
+                from bot import broker
+                
+                logger.info("Building 4,000-symbol universe from Alpaca Assets API...")
+                seed_symbols = build_universe(
+                    broker,
+                    target_size=self.mm_config.max_seed_universe,
+                    min_price=self.mm_config.min_price,
+                    max_price=self.mm_config.max_price,
+                )
+                
+                if not seed_symbols:
+                    logger.error("Failed to build universe, cannot proceed with Stage 1")
+                    return "failed"
+                
+                logger.info(f"Universe built: {len(seed_symbols)} symbols from Alpaca Assets")
+                
+                # Run stage 1 with pre-built universe
                 result1 = stage1_broad_filter_delayed_sip(
                     self.mm_config,
                     self.mm_data.alpaca,
+                    seed_symbols,
                     now,
                 )
                 self.mm_stage1_result = result1.candidates
@@ -709,10 +730,27 @@ class IntegratedBot:
             if current_time >= stage2_time and 2 not in self.mm_stages_completed:
                 if 1 not in self.mm_stages_completed:
                     logger.warning("Stage 2 triggered but Stage 1 not complete - running Stage 1 first")
+                    
+                    # Build universe from Alpaca Assets API
+                    from .universe_loader import build_universe
+                    from bot import broker
+                    
+                    seed_symbols = build_universe(
+                        broker,
+                        target_size=self.mm_config.max_seed_universe,
+                        min_price=self.mm_config.min_price,
+                        max_price=self.mm_config.max_price,
+                    )
+                    
+                    if not seed_symbols:
+                        logger.error("Failed to build universe for recovery Stage 1")
+                        return "failed"
+                    
                     # Run stage 1 first if missed
                     result1 = stage1_broad_filter_delayed_sip(
                         self.mm_config,
                         self.mm_data.alpaca,
+                        seed_symbols,
                         now,
                     )
                     self.mm_stage1_result = result1.candidates
@@ -737,9 +775,25 @@ class IntegratedBot:
                     logger.warning("Stage 3 triggered but Stage 2 not complete - running stages in order")
                     # Run missing stages first
                     if 1 not in self.mm_stages_completed:
+                        # Build universe from Alpaca Assets API
+                        from .universe_loader import build_universe
+                        from bot import broker
+                        
+                        seed_symbols = build_universe(
+                            broker,
+                            target_size=self.mm_config.max_seed_universe,
+                            min_price=self.mm_config.min_price,
+                            max_price=self.mm_config.max_price,
+                        )
+                        
+                        if not seed_symbols:
+                            logger.error("Failed to build universe for recovery Stage 1")
+                            return "failed"
+                        
                         result1 = stage1_broad_filter_delayed_sip(
                             self.mm_config,
                             self.mm_data.alpaca,
+                            seed_symbols,
                             now,
                         )
                         self.mm_stage1_result = result1.candidates
