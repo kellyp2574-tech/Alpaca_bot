@@ -38,7 +38,6 @@ class StagedScanResult:
 def _build_candidates_from_snapshots(
     cfg: Config,
     snapshots: Dict,
-    prev_close_map: Dict[str, float],
     seed_symbols: List[str],
     max_candidates: int,
     stage_name: str,
@@ -47,10 +46,11 @@ def _build_candidates_from_snapshots(
     """
     Build candidates from snapshot data (shared logic for all stages).
     
+    Extracts prev_close from Alpaca snapshot.prev_daily_bar (no Massive dependency).
+    
     Args:
         cfg: Configuration
         snapshots: Dict of symbol -> snapshot from Alpaca
-        prev_close_map: Dict of symbol -> prev_close from Massive
         seed_symbols: Symbols to process
         max_candidates: Max candidates to return
         stage_name: Stage name for drop tracking
@@ -70,10 +70,13 @@ def _build_candidates_from_snapshots(
             drops.append(Drop(sym, stage_name, "no_snapshot", {}))
             continue
         
-        # Get prev close from Massive
-        prev_close = prev_close_map.get(sym, 0.0)
+        # Get prev close from Alpaca snapshot.prev_daily_bar (no Massive dependency)
+        prev_close = 0.0
+        if snap.prev_daily_bar is not None:
+            prev_close = _safe_float(snap.prev_daily_bar.c)
+        
         if prev_close <= 0:
-            drops.append(Drop(sym, stage_name, "no_prev_close", {}))
+            drops.append(Drop(sym, stage_name, "no_prev_close_from_snapshot", {}))
             continue
         
         # Get current price (prefer quote mid)
@@ -142,14 +145,21 @@ def _build_candidates_from_snapshots(
 def stage1_broad_filter_delayed_sip(
     cfg: Config,
     alpaca,
-    massive_client,
     date: datetime,
+    *,
+    universe_file: Optional[str] = None,
 ) -> StagedScanResult:
     """
     Stage 1: 8:30-8:40 AM - Broad filter using delayed_sip.
     
-    Build 4,000-symbol universe from Massive, then filter using delayed_sip snapshots.
+    Build 4,000-symbol universe locally (no Massive dependency), then filter using delayed_sip snapshots.
     Target: 800 candidates after broad filter.
+    
+    Args:
+        cfg: Configuration
+        alpaca: AlpacaDataAdapter
+        date: Current date
+        universe_file: Optional path to local universe file
     
     Returns:
         StagedScanResult with ~800 candidates
@@ -158,26 +168,27 @@ def stage1_broad_filter_delayed_sip(
     logger.info("STAGE 1: Broad Filter (delayed_sip) - 8:30-8:40 AM")
     logger.info("=" * 80)
     
+    from .universe_loader import build_universe
+    
     run_date = date.date().isoformat()
     ledger = CandidateLedger(run_date=run_date)
     
-    # Build 4,000-symbol universe from Massive
+    # Build 4,000-symbol universe locally (no Massive dependency)
     max_seed = cfg.max_seed_universe
-    logger.info(f"Building {max_seed}-symbol universe from Massive...")
+    logger.info(f"Building {max_seed}-symbol universe from local sources...")
     
-    seed_symbols, prev_close_map, meta, seed_drops = seed_universe_massive(
-        massive_client,
-        max_seed=max_seed,
-        include_otc=False,
+    seed_symbols = build_universe(
+        alpaca,
+        max_symbols=max_seed,
+        universe_file=universe_file,
+        min_price=cfg.min_price,
+        max_price=cfg.max_price,
     )
     
-    ledger.snapshot_count_seen = int(meta.get("snapshot_count_seen", 0))
-    ledger.snapshot_count_with_prev_obj = int(meta.get("snapshot_count_with_prev_obj", 0))
-    ledger.seed_total = int(meta.get("usable_snapshot_items", 0))
+    ledger.seed_total = len(seed_symbols)
     ledger.seed_selected = len(seed_symbols)
-    ledger.drops.extend(seed_drops)
     
-    logger.info(f"Universe built: {len(seed_symbols)} symbols")
+    logger.info(f"Universe built: {len(seed_symbols)} symbols (from local sources)")
     
     # Get delayed_sip snapshots with fallback to IEX
     feed_used = cfg.universe_filter_feed
@@ -192,12 +203,11 @@ def stage1_broad_filter_delayed_sip(
         snapshots = alpaca.get_snapshots(seed_symbols, feed=feed_used)
         logger.info(f"Fetched {len(snapshots)} snapshots using fallback {feed_used}")
     
-    # Build candidates from snapshots
+    # Build candidates from snapshots (prev_close extracted from snapshots)
     max_first_pool = cfg.first_filter_pool_size
     candidates = _build_candidates_from_snapshots(
         cfg,
         snapshots,
-        prev_close_map,
         seed_symbols,
         max_first_pool,
         "stage1_delayed_sip",
@@ -221,7 +231,6 @@ def stage1_broad_filter_delayed_sip(
 def stage2_first_iex_refinement(
     cfg: Config,
     alpaca,
-    prev_close_map: Dict[str, float],
     stage1_candidates: List[Candidate],
 ) -> StagedScanResult:
     """
@@ -229,6 +238,11 @@ def stage2_first_iex_refinement(
     
     Take ~800 candidates from stage 1, refresh with live IEX data.
     Target: 300 candidates after refinement.
+    
+    Args:
+        cfg: Configuration
+        alpaca: AlpacaDataAdapter
+        stage1_candidates: Candidates from stage 1
     
     Returns:
         StagedScanResult with ~300 candidates
@@ -244,12 +258,11 @@ def stage2_first_iex_refinement(
     snapshots = alpaca.get_snapshots(symbols, feed=feed_used)
     logger.info(f"Fetched {len(snapshots)} snapshots using {feed_used}")
     
-    # Build candidates from fresh IEX snapshots
+    # Build candidates from fresh IEX snapshots (prev_close from snapshots)
     max_candidates = cfg.max_candidates_returned
     candidates = _build_candidates_from_snapshots(
         cfg,
         snapshots,
-        prev_close_map,
         symbols,
         max_candidates,
         "stage2_iex_refine",
@@ -269,7 +282,6 @@ def stage2_first_iex_refinement(
 def stage3_second_iex_refinement(
     cfg: Config,
     alpaca,
-    prev_close_map: Dict[str, float],
     stage2_candidates: List[Candidate],
 ) -> StagedScanResult:
     """
@@ -277,6 +289,11 @@ def stage3_second_iex_refinement(
     
     Take ~300 candidates from stage 2, refresh with latest IEX data.
     Final ranking and selection of top candidates.
+    
+    Args:
+        cfg: Configuration
+        alpaca: AlpacaDataAdapter
+        stage2_candidates: Candidates from stage 2
     
     Returns:
         StagedScanResult with final ranked candidates
@@ -292,11 +309,10 @@ def stage3_second_iex_refinement(
     snapshots = alpaca.get_snapshots(symbols, feed=feed_used)
     logger.info(f"Fetched {len(snapshots)} snapshots using {feed_used}")
     
-    # Build final candidate list (no max limit, return all that pass filters)
+    # Build final candidate list (prev_close from snapshots, no max limit)
     candidates = _build_candidates_from_snapshots(
         cfg,
         snapshots,
-        prev_close_map,
         symbols,
         max_candidates=len(symbols),  # No limit, keep all that pass
         stage_name="stage3_iex_final",

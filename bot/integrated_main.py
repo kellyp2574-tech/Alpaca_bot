@@ -696,7 +696,6 @@ class IntegratedBot:
                 result1 = stage1_broad_filter_delayed_sip(
                     self.mm_config,
                     self.mm_data.alpaca,
-                    self.mm_data.massive,
                     now,
                 )
                 self.mm_stage1_result = result1.candidates
@@ -714,7 +713,6 @@ class IntegratedBot:
                     result1 = stage1_broad_filter_delayed_sip(
                         self.mm_config,
                         self.mm_data.alpaca,
-                        self.mm_data.massive,
                         now,
                     )
                     self.mm_stage1_result = result1.candidates
@@ -725,7 +723,6 @@ class IntegratedBot:
                 result2 = stage2_first_iex_refinement(
                     self.mm_config,
                     self.mm_data.alpaca,
-                    self.mm_prev_close_map,
                     self.mm_stage1_result,
                 )
                 self.mm_stage2_result = result2.candidates
@@ -743,7 +740,6 @@ class IntegratedBot:
                         result1 = stage1_broad_filter_delayed_sip(
                             self.mm_config,
                             self.mm_data.alpaca,
-                            self.mm_data.massive,
                             now,
                         )
                         self.mm_stage1_result = result1.candidates
@@ -753,7 +749,6 @@ class IntegratedBot:
                     result2 = stage2_first_iex_refinement(
                         self.mm_config,
                         self.mm_data.alpaca,
-                        self.mm_prev_close_map,
                         self.mm_stage1_result,
                     )
                     self.mm_stage2_result = result2.candidates
@@ -763,7 +758,6 @@ class IntegratedBot:
                 result3 = stage3_second_iex_refinement(
                     self.mm_config,
                     self.mm_data.alpaca,
-                    self.mm_prev_close_map,
                     self.mm_stage2_result,
                 )
                 self.mm_stage3_result = result3.candidates
