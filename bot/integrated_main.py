@@ -931,7 +931,7 @@ class IntegratedBot:
             output_path = Path(__file__).resolve().parents[1] / "state" / "universe" / "liquidity_ranking.json"
             
             success = generate_liquidity_ranking(
-                broker,
+                broker.get_trading_client(),
                 self.mm_data.alpaca,
                 output_path,
             )

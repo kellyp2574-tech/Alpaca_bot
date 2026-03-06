@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any
 
@@ -64,8 +64,9 @@ def generate_liquidity_ranking(
         logger.info("Fetching recent daily bars from Alpaca...")
         
         # Calculate date range (last 5 calendar days to ensure we get last trading day)
-        today = datetime.now().date()
-        start_date = today - timedelta(days=5)
+        # Use timezone-aware datetimes for Alpaca API
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=5)
         
         # Fetch bars in batches (Alpaca limits to ~100 symbols per request)
         batch_size = 100
@@ -78,8 +79,8 @@ def generate_liquidity_ranking(
             try:
                 bars = alpaca_data.get_bars(
                     batch,
-                    start=start_date,
-                    end=today,
+                    start=start_dt,
+                    end=end_dt,
                     timeframe='1Day',
                 )
                 
