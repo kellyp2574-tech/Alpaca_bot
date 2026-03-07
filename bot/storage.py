@@ -68,7 +68,8 @@ class PositionState:
 class PendingEntryState:
     symbol: str
     client_order_id: str
-    submitted_ts: float        # epoch seconds
+    submitted_ts: float        # epoch seconds (wall clock for logs)
+    submitted_ts_mono: float = 0.0  # monotonic seconds (for latency calculations)
     attempts: int = 1
     stop_pct: float = 0.0      # needed to open PositionState on adoption
     intended_qty: float = 0.0      # intended qty at submission
@@ -82,6 +83,7 @@ def pending_entry_to_dict(p: PendingEntryState) -> Dict[str, Any]:
         "symbol": p.symbol,
         "client_order_id": p.client_order_id,
         "submitted_ts": p.submitted_ts,
+        "submitted_ts_mono": p.submitted_ts_mono,
         "attempts": p.attempts,
         "stop_pct": p.stop_pct,
         "intended_qty": p.intended_qty,
@@ -96,6 +98,7 @@ def pending_entry_from_dict(payload: Dict[str, Any]) -> PendingEntryState:
         symbol=payload["symbol"],
         client_order_id=payload["client_order_id"],
         submitted_ts=float(payload["submitted_ts"]),
+        submitted_ts_mono=float(payload.get("submitted_ts_mono", 0.0)),
         attempts=int(payload.get("attempts", 1)),
         stop_pct=float(payload.get("stop_pct", 0.0)),
         intended_qty=float(payload.get("intended_qty", 0.0)),

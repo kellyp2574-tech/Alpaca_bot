@@ -105,6 +105,7 @@ class FunnelMetrics:
 @dataclass
 class EntryOrderMetric:
     symbol: str = ""
+    client_order_id: str = ""  # Unique identifier for lifecycle tracking
     signal_ts: str = ""
     submit_ts: str = ""
     intended_shares: float = 0.0
@@ -119,7 +120,7 @@ class EntryOrderMetric:
     fill_pct: float = 0.0
     time_to_first_fill_s: float = 0.0
     time_to_full_fill_s: float = 0.0
-    status: str = ""  # filled / partial / canceled / expired / rejected
+    status: str = ""  # filled / partial / canceled / expired / rejected / unknown
     cancel_reason: str = ""  # time / price / manual / broker / other
     is_fractional: bool = False
     tif: str = ""  # IOC / DAY
@@ -506,6 +507,7 @@ class SessionMonitor:
         avg_fill_price: float,
         status: str,
         *,
+        client_order_id: str = "",
         signal_ts: str = "",
         submit_ts: str = "",
         time_to_first_fill_s: float = 0.0,
@@ -522,6 +524,7 @@ class SessionMonitor:
 
         metric = EntryOrderMetric(
             symbol=symbol,
+            client_order_id=client_order_id,
             signal_ts=signal_ts,
             submit_ts=submit_ts or datetime.now(MARKET_TZ).isoformat(),
             intended_shares=intended_qty,
@@ -543,9 +546,10 @@ class SessionMonitor:
         )
         self.entry_orders.append(metric)
 
-        # Update dashboard
-        self._daily_entries_attempted += 1
-        self.dashboard.entries_attempted = self._daily_entries_attempted
+        # Update dashboard (only for new entries, not updates)
+        if status != "unknown":  # Don't count unknown/pending as attempted yet
+            self._daily_entries_attempted += 1
+            self.dashboard.entries_attempted = self._daily_entries_attempted
         if status == "filled":
             self.dashboard.entries_filled += 1
             self.dashboard.trades_opened += 1
@@ -559,6 +563,78 @@ class SessionMonitor:
         self._daily_slippage_dollars += abs(slip_dollars)
         self._daily_gross_notional += filled_notional
         self._last_activity_ts = time.monotonic()
+
+    def update_entry_order(
+        self,
+        client_order_id: str,
+        *,
+        filled_qty: float = None,
+        avg_fill_price: float = None,
+        status: str = None,
+        time_to_first_fill_s: float = None,
+        time_to_full_fill_s: float = None,
+        cancel_reason: str = None,
+    ) -> bool:
+        """
+        Update an existing entry order record by client_order_id.
+        Returns True if found and updated, False otherwise.
+        """
+        for metric in self.entry_orders:
+            if metric.client_order_id == client_order_id:
+                # Update fields if provided
+                if filled_qty is not None:
+                    old_filled = metric.filled_shares
+                    metric.filled_shares = filled_qty
+                    metric.filled_notional = filled_qty * metric.avg_fill_price if metric.avg_fill_price > 0 else 0.0
+                    metric.fill_pct = (filled_qty / metric.intended_shares * 100) if metric.intended_shares > 0 else 0.0
+                    
+                if avg_fill_price is not None:
+                    metric.avg_fill_price = avg_fill_price
+                    metric.filled_notional = metric.filled_shares * avg_fill_price
+                    metric.slippage_dollars = (avg_fill_price - metric.intended_price) * metric.filled_shares if metric.filled_shares > 0 else 0.0
+                    metric.slippage_bps = ((avg_fill_price - metric.intended_price) / metric.intended_price * 10000) if metric.intended_price > 0 and metric.filled_shares > 0 else 0.0
+                    
+                old_status = metric.status
+                if status is not None:
+                    metric.status = status
+                    
+                if time_to_first_fill_s is not None:
+                    metric.time_to_first_fill_s = time_to_first_fill_s
+                    
+                if time_to_full_fill_s is not None:
+                    metric.time_to_full_fill_s = time_to_full_fill_s
+                    
+                if cancel_reason is not None:
+                    metric.cancel_reason = cancel_reason
+                
+                # Update dashboard counters based on status change
+                if status is not None and status != old_status:
+                    # Remove old status count
+                    if old_status == "unknown":
+                        # Now it's resolved, count as attempted
+                        self._daily_entries_attempted += 1
+                        self.dashboard.entries_attempted = self._daily_entries_attempted
+                    elif old_status == "filled":
+                        self.dashboard.entries_filled -= 1
+                        self.dashboard.trades_opened -= 1
+                    elif old_status == "partial":
+                        self.dashboard.partial_fills -= 1
+                        self.dashboard.trades_opened -= 1
+                    elif old_status in ("canceled", "unfilled", "expired"):
+                        self.dashboard.canceled_entries -= 1
+                    
+                    # Add new status count
+                    if status == "filled":
+                        self.dashboard.entries_filled += 1
+                        self.dashboard.trades_opened += 1
+                    elif status == "partial":
+                        self.dashboard.partial_fills += 1
+                        self.dashboard.trades_opened += 1
+                    elif status in ("canceled", "unfilled", "expired"):
+                        self.dashboard.canceled_entries += 1
+                
+                return True
+        return False
 
     def compute_entry_aggregates(self) -> EntryAggregateMetrics:
         agg = EntryAggregateMetrics()

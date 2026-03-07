@@ -534,9 +534,25 @@ class EntryLoop:
                 self.risk_manager.on_deploy(deployed_amount)
                 
                 # Record stats
+                submitted_ts_mono = getattr(pending, "submitted_ts_mono", 0.0)
+                latency = time.monotonic() - submitted_ts_mono if submitted_ts_mono > 0 else 0.0
                 self.stats.record_entry(
-                    fill.status, 0.0, pending.intended_price, fill.avg_price
+                    fill.status, latency, pending.intended_price, fill.avg_price
                 )
+                
+                # Update monitoring entry order record
+                try:
+                    monitor = get_session_monitor()
+                    monitor.update_entry_order(
+                        client_order_id=client_order_id,
+                        filled_qty=fill.filled_qty,
+                        avg_fill_price=fill.avg_price,
+                        status="filled",
+                        time_to_first_fill_s=latency,
+                        time_to_full_fill_s=latency,
+                    )
+                except Exception:
+                    pass
                 
                 # Clear pending entry
                 self.ctx.state_store.clear_pending_entry(client_order_id)
@@ -561,9 +577,24 @@ class EntryLoop:
                 deployed_amount = float(fill.filled_qty) * float(fill.avg_price)
                 self.risk_manager.on_deploy(deployed_amount)
 
+                submitted_ts_mono = getattr(pending, "submitted_ts_mono", 0.0)
+                latency = time.monotonic() - submitted_ts_mono if submitted_ts_mono > 0 else 0.0
                 self.stats.record_entry(
-                    fill.status, 0.0, pending.intended_price, fill.avg_price
+                    fill.status, latency, pending.intended_price, fill.avg_price
                 )
+
+                # Update monitoring entry order record
+                try:
+                    monitor = get_session_monitor()
+                    monitor.update_entry_order(
+                        client_order_id=client_order_id,
+                        filled_qty=fill.filled_qty,
+                        avg_fill_price=fill.avg_price,
+                        status="partial",
+                        time_to_first_fill_s=latency,
+                    )
+                except Exception:
+                    pass
 
                 self.ctx.state_store.clear_pending_entry(client_order_id)
                 self._done_today_symbols.add(symbol)
@@ -571,6 +602,20 @@ class EntryLoop:
             elif fill.status in {"canceled", "expired", "rejected"}:
                 # Order failed - clear and mark done
                 logger.info(f"RECONCILED FAILED ENTRY {symbol}: {fill.status}")
+                
+                # Update monitoring entry order record
+                try:
+                    monitor = get_session_monitor()
+                    submitted_ts_mono = getattr(pending, "submitted_ts_mono", 0.0)
+                    age = time.monotonic() - submitted_ts_mono if submitted_ts_mono > 0 else 0.0
+                    monitor.update_entry_order(
+                        client_order_id=client_order_id,
+                        status=fill.status,
+                        time_to_first_fill_s=age,
+                    )
+                except Exception:
+                    pass
+                
                 self.ctx.state_store.clear_pending_entry(client_order_id)
                 self._done_today_symbols.add(symbol)
                 
@@ -606,11 +651,17 @@ class EntryLoop:
                 if pending is None:
                     continue
 
-                submitted_ts = getattr(pending, "submitted_ts", None)
-                if submitted_ts is None:
-                    continue
-
-                age_seconds = time.time() - float(submitted_ts)
+                submitted_ts_mono = getattr(pending, "submitted_ts_mono", None)
+                if submitted_ts_mono is None or submitted_ts_mono == 0.0:
+                    # Fallback for old pending entries without mono timestamp
+                    submitted_ts = getattr(pending, "submitted_ts", None)
+                    if submitted_ts is None:
+                        continue
+                    # Best-effort: use wall clock (will be slightly inaccurate)
+                    age_seconds = time.time() - float(submitted_ts)
+                else:
+                    # Correct: use monotonic clock
+                    age_seconds = time.monotonic() - float(submitted_ts_mono)
 
                 # Use actual submitted order limit if available from broker
                 try:
@@ -654,18 +705,11 @@ class EntryLoop:
                         original_limit,
                         cancel_reason,
                     )
-                    # Record canceled entry to monitoring
+                    # Update existing entry order record in monitoring
                     try:
                         monitor = get_session_monitor()
-                        intended_qty = getattr(pending, "intended_qty", 0.0)
-                        intended_price = getattr(pending, "intended_price", 0.0)
-                        monitor.record_entry_order(
-                            symbol=symbol,
-                            intended_qty=intended_qty,
-                            intended_price=intended_price,
-                            submitted_limit=original_limit,
-                            filled_qty=0.0,
-                            avg_fill_price=0.0,
+                        monitor.update_entry_order(
+                            client_order_id=client_order_id,
                             status="canceled",
                             cancel_reason=cancel_reason,
                             time_to_first_fill_s=age_seconds,
@@ -848,10 +892,14 @@ class EntryLoop:
         logger.debug(f"Entry attempt {attempt} for {decision.symbol}")
         
         # Record pending entry BEFORE submitting
+        submit_ts_wall = time.time()
+        submit_ts_mono = time.monotonic()
+        
         pending_state = PendingEntryState(
             symbol=decision.symbol,
             client_order_id=_entry_client_id(decision.symbol, attempt),
-            submitted_ts=time.time(),
+            submitted_ts=submit_ts_wall,
+            submitted_ts_mono=submit_ts_mono,
             attempts=attempt,
             intended_qty=decision.qty,
             intended_price=decision.entry_price,
@@ -873,22 +921,25 @@ class EntryLoop:
             deployed_amount = 0.0  # No actual deployment for unfilled/rejected orders
         self.risk_manager.on_deploy(deployed_amount)
 
-        # Record entry stats
-        submit_mono = time.monotonic()
-        latency = submit_mono - pending_state.submitted_ts if pending_state.submitted_ts else 0.0
+        # Record entry stats (use monotonic clock for latency)
+        now_mono = time.monotonic()
+        latency = now_mono - submit_ts_mono
         self.stats.record_entry(
             fill.status, latency, decision.entry_price, fill.avg_price
         )
 
-        # Record entry order to monitoring system
+        # Record entry order to monitoring system (one record per client_order_id)
         try:
             monitor = get_session_monitor()
             is_fractional = (decision.qty % 1) != 0
             cancel_reason = ""
             if fill.status == "unfilled":
                 cancel_reason = "liquidity"
+            
+            # Record initial entry order
             monitor.record_entry_order(
                 symbol=decision.symbol,
+                client_order_id=pending_state.client_order_id,
                 intended_qty=decision.qty,
                 intended_price=decision.entry_price,
                 submitted_limit=decision.entry_price * (1 + getattr(self.ctx.cfg, 'exec_slippage_buy_pct', 0.001)),
