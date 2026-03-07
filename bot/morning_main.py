@@ -498,9 +498,8 @@ class EntryLoop:
         """Reconcile pending entries (DAY orders that returned unknown status)."""
         pending_entries = self.ctx.state_store.load_pending_entries()
         
-        for pending in pending_entries:
+        for client_order_id, pending in pending_entries.items():
             symbol = pending.symbol
-            client_order_id = pending.client_order_id
             
             # Skip if already in positions (filled and reconciled)
             if symbol in self.positions.positions:
@@ -555,6 +554,14 @@ class EntryLoop:
                     pending.stop_pct,
                     entry_order_id=fill.order_id,
                     entry_client_order_id=client_order_id,
+                )
+
+                # Record deployment and stats for partial fill
+                deployed_amount = float(fill.filled_qty) * float(fill.avg_price)
+                self.risk_manager.on_deploy(deployed_amount)
+
+                self.stats.record_entry(
+                    fill.status, 0.0, pending.intended_price, fill.avg_price
                 )
 
                 self.ctx.state_store.clear_pending_entry(client_order_id)
