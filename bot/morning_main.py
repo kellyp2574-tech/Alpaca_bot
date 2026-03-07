@@ -542,10 +542,21 @@ class EntryLoop:
                 self.ctx.state_store.clear_pending_entry(client_order_id)
                 
             elif fill.status == "partial":
-                # Partial fill - mark as done for today
+                # Partial fill - open position with partial shares
                 logger.warning(
-                    f"RECONCILED PARTIAL ENTRY {symbol} {fill.filled_qty} @ {fill.avg_price:.2f} - marking done"
+                    f"RECONCILED PARTIAL ENTRY {symbol} {fill.filled_qty} @ {fill.avg_price:.2f} "
+                    f"- opening partial position and marking done"
                 )
+
+                self.positions.open_position(
+                    symbol,
+                    fill.filled_qty,
+                    fill.avg_price,
+                    pending.stop_pct,
+                    entry_order_id=fill.order_id,
+                    entry_client_order_id=client_order_id,
+                )
+
                 self.ctx.state_store.clear_pending_entry(client_order_id)
                 self._done_today_symbols.add(symbol)
                 
@@ -558,34 +569,85 @@ class EntryLoop:
             # else: status is still "unknown" - keep pending for next cycle
 
     def _cancel_stale_entry_orders(self) -> None:
-        """Cancel any remaining entry orders to prevent hanging."""
+        """Cancel resting entry orders only when stale by time or price."""
         try:
-            if hasattr(self.ctx.execution, 'client') and self.ctx.execution.client:
-                # Get all open orders
-                orders = self.ctx.execution.client.get_orders()
-                watchlist_symbols = set(self.ctx.watch_symbols())
-                
-                for order in orders:
-                    symbol = getattr(order, 'symbol', None)
-                    order_status = getattr(order, 'status', None)
-                    client_order_id = getattr(order, 'client_order_id', None)
-                    
-                    # Cancel entry orders that are still open
-                    if (symbol in watchlist_symbols and
-                            client_order_id and client_order_id.startswith("ENTRY:") and
-                            order_status in {'new', 'partially_filled', 'submitted', 'accepted'}):
-                        
-                        try:
-                            self.ctx.execution.client.cancel_order(order.id)
-                            logger.info(f"Cancelled stale entry order {order.id} for {symbol}")
-                            
-                            # Clear pending entry state
-                            if client_order_id:
-                                self.ctx.state_store.clear_pending_entry(client_order_id)
-                                
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel stale entry order {order.id}: {e}")
-                            
+            if not (hasattr(self.ctx.execution, "client") and self.ctx.execution.client):
+                return
+
+            pending_entries = self.ctx.state_store.load_pending_entries()
+            if not pending_entries:
+                return
+
+            orders = self.ctx.execution.client.get_orders()
+            watchlist_symbols = set(self.ctx.watch_symbols())
+
+            for order in orders:
+                symbol = getattr(order, "symbol", None)
+                order_status = str(getattr(order, "status", "")).lower()
+                client_order_id = getattr(order, "client_order_id", None)
+
+                if not (
+                    symbol in watchlist_symbols
+                    and client_order_id
+                    and client_order_id.startswith("ENTRY:")
+                    and order_status in {"new", "partially_filled", "submitted", "accepted"}
+                ):
+                    continue
+
+                pending = pending_entries.get(client_order_id)
+                if pending is None:
+                    continue
+
+                submitted_ts = getattr(pending, "submitted_ts", None)
+                if submitted_ts is None:
+                    continue
+
+                age_seconds = time.time() - float(submitted_ts)
+
+                # Use actual submitted order limit if available from broker
+                try:
+                    original_limit = float(getattr(order, "limit_price", 0.0) or 0.0)
+                except Exception:
+                    original_limit = 0.0
+
+                if original_limit <= 0:
+                    # Fallback to intended price if needed
+                    original_limit = float(getattr(pending, "intended_price", 0.0) or 0.0)
+
+                latest_price = None
+                quote = self.latest_quotes.get(symbol)
+                if quote is not None:
+                    ask = getattr(quote, "ask_price", None)
+                    bid = getattr(quote, "bid_price", None)
+                    if ask and ask > 0:
+                        latest_price = float(ask)
+                    elif bid and bid > 0:
+                        latest_price = float(bid)
+
+                price_trigger = (
+                    latest_price is not None
+                    and original_limit > 0
+                    and latest_price >= original_limit * 1.01
+                )
+                time_trigger = age_seconds >= 60.0
+
+                if not (price_trigger or time_trigger):
+                    continue
+
+                try:
+                    self.ctx.execution.client.cancel_order(order.id)
+                    logger.info(
+                        "Cancelled stale entry order %s for %s (age=%.1fs, latest=%.2f, limit=%.2f, reason=%s)",
+                        order.id,
+                        symbol,
+                        age_seconds,
+                        latest_price if latest_price is not None else -1.0,
+                        original_limit,
+                        "price" if price_trigger else "time",
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to cancel stale entry order {order.id}: {e}")
+
         except Exception as e:
             logger.warning(f"Error cancelling stale entry orders: {e}")
 
@@ -807,15 +869,24 @@ class EntryLoop:
                 f"(deployed=${deployed_amount:,.2f})"
             )
         elif fill.status == "partial":
-            # Mark symbol as done for today to prevent re-entries
+            # Clear pending entry and open position with partial fill
+            self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
+
+            self.positions.open_position(
+                decision.symbol,
+                fill.filled_qty,
+                fill.avg_price,
+                (decision.entry_price - decision.stop_price) / decision.entry_price,
+                entry_order_id=fill.order_id,
+                entry_client_order_id=pending_state.client_order_id,
+            )
+
+            self._done_today_symbols.add(decision.symbol)
+
             logger.warning(
                 f"PARTIAL ENTRY {decision.symbol} {fill.filled_qty}/{decision.qty} @ {fill.avg_price:.2f} "
-                f"(deployed=${deployed_amount:,.2f}) - marking done for today"
+                f"(deployed=${deployed_amount:,.2f}) - opened partial position and marked done for today"
             )
-            # Clear pending entry - partial fills are considered "done for today"
-            self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
-            # Add to done_today_symbols to prevent re-entries
-            self._done_today_symbols.add(decision.symbol)
         elif fill.status == "unfilled":
             # For IOC entries, unfilled means no liquidity - mark as done for today
             logger.info(f"IOC ENTRY {decision.symbol} unfilled - no liquidity, marking done for today (deployed=$0.00)")
