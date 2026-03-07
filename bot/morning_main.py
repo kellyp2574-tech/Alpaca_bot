@@ -16,6 +16,7 @@ from .data_alpaca import Quote
 from .data_sources import DataStack
 from .execution import ExecutionClient, ExecutionConfig, FillResult
 from .indicators import VWAPState, atr_1m
+from .monitoring import get_session_monitor
 from .position_manager import PositionManager, initial_stop_pct, _entry_client_id
 from .risk_manager import RiskManager
 from .state_manager import StateStore
@@ -643,6 +644,7 @@ class EntryLoop:
 
                 try:
                     self.ctx.execution.client.cancel_order(order.id)
+                    cancel_reason = "price" if price_trigger else "time"
                     logger.info(
                         "Cancelled stale entry order %s for %s (age=%.1fs, latest=%.2f, limit=%.2f, reason=%s)",
                         order.id,
@@ -650,8 +652,26 @@ class EntryLoop:
                         age_seconds,
                         latest_price if latest_price is not None else -1.0,
                         original_limit,
-                        "price" if price_trigger else "time",
+                        cancel_reason,
                     )
+                    # Record canceled entry to monitoring
+                    try:
+                        monitor = get_session_monitor()
+                        intended_qty = getattr(pending, "intended_qty", 0.0)
+                        intended_price = getattr(pending, "intended_price", 0.0)
+                        monitor.record_entry_order(
+                            symbol=symbol,
+                            intended_qty=intended_qty,
+                            intended_price=intended_price,
+                            submitted_limit=original_limit,
+                            filled_qty=0.0,
+                            avg_fill_price=0.0,
+                            status="canceled",
+                            cancel_reason=cancel_reason,
+                            time_to_first_fill_s=age_seconds,
+                        )
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.warning(f"Failed to cancel stale entry order {order.id}: {e}")
 
@@ -701,7 +721,7 @@ class EntryLoop:
                 
                 self._allocations_calculated = True
                 
-                logger.info(
+                logger.debug(
                     "Dynamic allocations calculated: %d positions, $%.0f total deploy",
                     len(self._position_allocations),
                     deploy_dollars,
@@ -712,7 +732,7 @@ class EntryLoop:
                 for sym, amt in sorted_allocs[:5]:
                     cand = next((c for c in self.ctx.watchlist if c.symbol == sym), None)
                     liq = cand.liq_5m_dollar if cand else 0
-                    logger.info(f"  {sym}: ${amt:.0f} (liq=${liq:,.0f})")
+                    logger.debug(f"  {sym}: ${amt:.0f} (liq=${liq:,.0f})")
         
         for candidate in self.ctx.watchlist:
             symbol = candidate.symbol
@@ -772,7 +792,7 @@ class EntryLoop:
                 continue
             
             if allowed_amount < target_notional_per_position:
-                logger.info(f"Daily cap limited {symbol}: target=${target_notional_per_position:.2f}, allowed=${allowed_amount:.2f}")
+                logger.debug(f"Daily cap limited {symbol}: target=${target_notional_per_position:.2f}, allowed=${allowed_amount:.2f}")
             
             target_notional_per_position = allowed_amount
             
@@ -789,7 +809,7 @@ class EntryLoop:
                 max_qty_vol_cap = max_notional_vol_cap / effective_entry_price
                 qty = min(qty, max_qty_vol_cap)
                 
-                logger.info("%s sizing: target=$%.0f, %.1f%%vol_cap=$%.0f, qty=%.0f shares", 
+                logger.debug("%s sizing: target=$%.0f, %.1f%%vol_cap=$%.0f, qty=%.0f shares", 
                            symbol, target_notional_per_position, vol_cap_pct*100, max_notional_vol_cap, qty)
             
             # Check if fractional trading is allowed
@@ -800,7 +820,7 @@ class EntryLoop:
                 qty = math.floor(qty)
             
             if qty < 1:
-                logger.info("%s position too small: qty=%.0f < 1", symbol, qty)
+                logger.debug("%s position too small: qty=%.0f < 1", symbol, qty)
                 continue
 
             # Calculate stop price
@@ -825,7 +845,7 @@ class EntryLoop:
         attempt = self._symbol_attempts.get(decision.symbol, 0) + 1
         self._symbol_attempts[decision.symbol] = attempt
         
-        logger.info(f"Entry attempt {attempt} for {decision.symbol}")
+        logger.debug(f"Entry attempt {attempt} for {decision.symbol}")
         
         # Record pending entry BEFORE submitting
         pending_state = PendingEntryState(
@@ -854,10 +874,37 @@ class EntryLoop:
         self.risk_manager.on_deploy(deployed_amount)
 
         # Record entry stats
-        latency = 0.0  # Would need to track submit time for real latency
+        submit_mono = time.monotonic()
+        latency = submit_mono - pending_state.submitted_ts if pending_state.submitted_ts else 0.0
         self.stats.record_entry(
             fill.status, latency, decision.entry_price, fill.avg_price
         )
+
+        # Record entry order to monitoring system
+        try:
+            monitor = get_session_monitor()
+            is_fractional = (decision.qty % 1) != 0
+            cancel_reason = ""
+            if fill.status == "unfilled":
+                cancel_reason = "liquidity"
+            monitor.record_entry_order(
+                symbol=decision.symbol,
+                intended_qty=decision.qty,
+                intended_price=decision.entry_price,
+                submitted_limit=decision.entry_price * (1 + getattr(self.ctx.cfg, 'exec_slippage_buy_pct', 0.001)),
+                filled_qty=fill.filled_qty,
+                avg_fill_price=fill.avg_price,
+                status=fill.status,
+                signal_ts=datetime.now(MARKET_TZ).isoformat(),
+                submit_ts=datetime.now(MARKET_TZ).isoformat(),
+                time_to_first_fill_s=latency,
+                time_to_full_fill_s=latency if fill.status == "filled" else 0.0,
+                cancel_reason=cancel_reason,
+                is_fractional=is_fractional,
+                tif="DAY" if is_fractional else "IOC",
+            )
+        except Exception:
+            pass
 
         if fill.status in {"filled", "dry_run"}:
             # Clear pending entry on success
@@ -896,14 +943,14 @@ class EntryLoop:
             )
         elif fill.status == "unfilled":
             # For IOC entries, unfilled means no liquidity - mark as done for today
-            logger.info(f"IOC ENTRY {decision.symbol} unfilled - no liquidity, marking done for today (deployed=$0.00)")
+            logger.debug(f"IOC ENTRY {decision.symbol} unfilled - no liquidity, marking done for today (deployed=$0.00)")
             # Clear pending entry
             self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
             # Add to done_today_symbols to prevent re-entries
             self._done_today_symbols.add(decision.symbol)
         elif fill.status == "unknown":
             # DAY orders (fractional shares) may return unknown - keep pending for reconciliation
-            logger.info(f"ENTRY {decision.symbol} status unknown (likely DAY order) - keeping pending for reconciliation")
+            logger.debug(f"ENTRY {decision.symbol} status unknown (likely DAY order) - keeping pending for reconciliation")
             # DO NOT clear pending entry - let reconciliation handle it
             # DO NOT mark as done_today - allow reconciliation to complete
         else:

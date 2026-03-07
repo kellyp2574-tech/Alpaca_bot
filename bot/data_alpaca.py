@@ -33,6 +33,7 @@ except (
 load_dotenv()  # loads ALPACA_* variables from .env if present
 
 from .clock import MARKET_TZ, market_now
+from .monitoring import get_session_monitor
 
 # TimeFrame mapping for alpaca-py compatibility
 _TIMEFRAME_MAP = {
@@ -262,8 +263,25 @@ class AlpacaDataAdapter:
         # Use provided feed or fall back to instance default
         feed_to_use = self._parse_feed(feed) if feed else self.feed
         
-        request = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=feed_to_use)
-        response = self._historical.get_stock_latest_quote(request)
+        import time as _time
+        _t0 = _time.monotonic()
+        try:
+            request = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=feed_to_use)
+            response = self._historical.get_stock_latest_quote(request)
+        except Exception:
+            try:
+                get_session_monitor().record_api_call(False)
+            except Exception:
+                pass
+            raise
+        _latency_ms = (_time.monotonic() - _t0) * 1000
+        try:
+            mon = get_session_monitor()
+            mon.record_api_call(True)
+            mon.record_refresh_latency(quote_ms=_latency_ms)
+        except Exception:
+            pass
+        
         quotes: Dict[str, Quote] = {}
         for symbol in symbols:
             try:
@@ -297,8 +315,19 @@ class AlpacaDataAdapter:
         out: Dict[str, Snapshot] = {}
 
         for batch in chunk(symbols, 200):
-            req = StockSnapshotRequest(symbol_or_symbols=batch, feed=feed_to_use)
-            resp = self._historical.get_stock_snapshot(req)
+            try:
+                req = StockSnapshotRequest(symbol_or_symbols=batch, feed=feed_to_use)
+                resp = self._historical.get_stock_snapshot(req)
+                try:
+                    get_session_monitor().record_api_call(True)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    get_session_monitor().record_api_call(False)
+                except Exception:
+                    pass
+                raise
 
             # alpaca-py returns a mapping-like object: resp[symbol] -> snapshot
             for sym in batch:

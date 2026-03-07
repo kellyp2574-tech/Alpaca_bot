@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from .morning_main import SessionStats
 
 from .clock import market_now
+from .monitoring import get_session_monitor
 from .morning_config import Config
 from .execution import ExecutionClient, FillResult
 from .state_manager import StateStore
@@ -209,7 +210,7 @@ class PositionManager:
         ):
             state.stop_price = max(state.stop_price, state.entry_price)
             state.breakeven_set = True
-            logger.info("%s stop moved to breakeven", symbol)
+            logger.debug("%s stop moved to breakeven", symbol)
 
     def _update_trail(self, state: PositionState) -> None:
         entry = state.entry_price
@@ -220,7 +221,7 @@ class PositionManager:
         ):
             state.trail_active = True
             state.trail_pct = self.cfg.trail_pct
-            logger.info("%s trail activated at %.2f%%", state.symbol, state.trail_pct * 100)
+            logger.debug("%s trail activated at %.2f%%", state.symbol, state.trail_pct * 100)
 
         if state.trail_active:
             trail_pct = state.trail_pct if state.trail_pct else self.cfg.trail_pct
@@ -267,7 +268,7 @@ class PositionManager:
                 logger.info("All exits reconciled successfully")
                 return 0
             
-            logger.info(f"Waiting for {pending_count} exits to reconcile...")
+            logger.debug(f"Waiting for {pending_count} exits to reconcile...")
             time.sleep(2.0)  # Check every 2 seconds
         
         remaining_pending = sum(1 for state in self.positions.values() if state.exit_pending)
@@ -293,7 +294,7 @@ class PositionManager:
         # Prefer order_id lookup; fall back to client_order_id search
         fill: Optional[FillResult] = None
         if state.exit_order_id:
-            logger.info(
+            logger.debug(
                 "Time-based reconcile exit for %s via order_id %s (age %.0fs)",
                 symbol, state.exit_order_id, age,
             )
@@ -305,7 +306,7 @@ class PositionManager:
                 logger.exception("Time-based reconcile poll failed for %s", symbol)
                 return
         elif state.exit_client_order_id:
-            logger.info(
+            logger.debug(
                 "Time-based reconcile exit for %s via client_order_id %s (order_id lost)",
                 symbol, state.exit_client_order_id,
             )
@@ -342,7 +343,7 @@ class PositionManager:
         # Prefer order_id lookup; fall back to client_order_id search
         fill: Optional[FillResult] = None
         if state.exit_order_id:
-            logger.info(
+            logger.debug(
                 "Reconciling exit for %s via order_id %s (age %.0fs)",
                 symbol, state.exit_order_id, age,
             )
@@ -354,7 +355,7 @@ class PositionManager:
                 logger.exception("Reconcile poll failed for %s", symbol)
                 return
         elif state.exit_client_order_id:
-            logger.info(
+            logger.debug(
                 "Reconciling exit for %s via client_order_id %s (order_id lost)",
                 symbol, state.exit_client_order_id,
             )
@@ -464,6 +465,36 @@ class PositionManager:
                 decision_price=decision_price,
                 fill_price=price,
             )
+        
+        # Record exit to monitoring system
+        try:
+            monitor = get_session_monitor()
+            is_force = state.exit_reason in (
+                "hard_exit", "emergency_hard_exit", "emergency_market_close",
+                "integrated_emergency_close", "emergency_exit_failed_no_client",
+            )
+            latency_exit = (
+                time.monotonic() - state.exit_submitted_ts
+                if state.exit_submitted_ts else 0.0
+            )
+            entry_ts = state.entry_time.isoformat() if state.entry_time else ""
+            monitor.record_exit_order(
+                symbol=symbol,
+                intended_price=decision_price,
+                avg_exit_price=price,
+                status=fill.status,
+                entry_ts=entry_ts,
+                exit_signal_ts=now.isoformat(),
+                exit_submit_ts=now.isoformat(),
+                planned_reason=state.exit_reason,
+                actual_reason=state.exit_reason,
+                time_to_fill_s=latency_exit,
+                force_flat=is_force,
+                force_flat_reason=state.exit_reason if is_force else "",
+            )
+        except Exception:
+            pass
+        
         self.positions.pop(symbol, None)
         self._persist()
 
@@ -520,7 +551,7 @@ class PositionManager:
                     aggressiveness = aggressiveness_factors[min(attempt - 1, len(aggressiveness_factors) - 1)]
                     new_price = max(state.exit_price or current_price, 0.0) * aggressiveness
                     current_price = new_price if new_price > 0 else current_price
-                    logger.info(
+                    logger.debug(
                         "Partial exit for %s left %.4f shares; retrying with price %.2f",
                         symbol,
                         state.qty,
@@ -540,7 +571,7 @@ class PositionManager:
                     aggressiveness_factors = [0.995, 0.99, 0.985]
                     aggressiveness = aggressiveness_factors[min(attempt - 1, len(aggressiveness_factors) - 1)]
                     current_price = price * aggressiveness
-                    logger.info(f"Retry {attempt}: price {price:.2f} -> {current_price:.2f} (factor {aggressiveness})")
+                    logger.debug(f"Retry {attempt}: price {price:.2f} -> {current_price:.2f} (factor {aggressiveness})")
                     continue  # Next iteration with new price
                 else:
                     logger.error(f"IOC exit failed after {attempt} attempts for {symbol} - escalating to broker close_position")

@@ -5,6 +5,7 @@ Wraps the morning momentum position manager to add trade reporting
 import logging
 from typing import Optional
 from bot.trade_reporter import log_trade_with_reporting
+from bot.monitoring import get_session_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,17 @@ class ReportingPositionManager:
         position = self.original_pm.positions.get(symbol)
         exit_qty = 0
         entry_price = 0
+        entry_time_str = ""
+        gap_at_entry = 0.0
+        peak_price = 0.0
+        stop_price = 0.0
         
         if position:
             exit_qty = position.qty
             entry_price = position.entry_price
+            entry_time_str = position.entry_time.isoformat() if position.entry_time else ""
+            peak_price = getattr(position, 'peak_price', entry_price)
+            stop_price = getattr(position, 'stop_price', 0.0)
         
         # Call original method
         result = self.original_pm.exit_position(symbol, price, timestamp, reason=reason)
@@ -75,14 +83,41 @@ class ReportingPositionManager:
                 )
             except Exception:
                 logger.exception("Reporting failed for %s SELL; continuing without reporting", symbol)
+            
+            # Record trade outcome to monitoring system
+            try:
+                monitor = get_session_monitor()
+                mfe = ((peak_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+                mae = ((stop_price - entry_price) / entry_price * 100) if entry_price > 0 and stop_price > 0 else 0.0
+                monitor.record_trade_outcome(
+                    symbol=symbol,
+                    entry_time=entry_time_str,
+                    exit_time=timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+                    entry_price=entry_price,
+                    exit_price=price,
+                    qty=exit_qty,
+                    exit_reason=reason,
+                    max_favorable_excursion=mfe,
+                    max_adverse_excursion=mae,
+                )
+            except Exception:
+                logger.exception("Monitoring trade outcome failed for %s; continuing", symbol)
         
         return result
     
     def force_exit_all(self, prices, *, reason=""):
         """Force exit all positions with trade reporting"""
-        # Log all exits before calling original
+        # Capture position state before exits for monitoring
+        pre_exit_positions = {}
         for symbol, position in self.original_pm.positions.items():
             if not position.exit_pending and symbol in prices:
+                pre_exit_positions[symbol] = {
+                    "qty": position.qty,
+                    "entry_price": position.entry_price,
+                    "entry_time": position.entry_time.isoformat() if position.entry_time else "",
+                    "peak_price": getattr(position, 'peak_price', position.entry_price),
+                    "stop_price": getattr(position, 'stop_price', 0.0),
+                }
                 try:
                     log_trade_with_reporting(
                         symbol=symbol,
@@ -96,7 +131,34 @@ class ReportingPositionManager:
                     logger.exception("Reporting failed for %s force exit; continuing", symbol)
         
         # Call original method
-        return self.original_pm.force_exit_all(prices, reason=reason)
+        result = self.original_pm.force_exit_all(prices, reason=reason)
+        
+        # Record trade outcomes to monitoring
+        try:
+            monitor = get_session_monitor()
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            now_str = datetime.now(ZoneInfo("America/New_York")).isoformat()
+            for symbol, info in pre_exit_positions.items():
+                entry_price = info["entry_price"]
+                exit_price = prices.get(symbol, entry_price)
+                mfe = ((info["peak_price"] - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+                mae = ((info["stop_price"] - entry_price) / entry_price * 100) if entry_price > 0 and info["stop_price"] > 0 else 0.0
+                monitor.record_trade_outcome(
+                    symbol=symbol,
+                    entry_time=info["entry_time"],
+                    exit_time=now_str,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    qty=info["qty"],
+                    exit_reason=reason,
+                    max_favorable_excursion=mfe,
+                    max_adverse_excursion=mae,
+                )
+        except Exception:
+            logger.exception("Monitoring trade outcomes failed during force exit; continuing")
+        
+        return result
 
 
 def create_reporting_position_manager(original_pm, strategy_name="morning_momentum"):

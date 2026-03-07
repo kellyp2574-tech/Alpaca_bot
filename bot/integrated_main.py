@@ -15,6 +15,8 @@ from bot import config as ma_config
 from bot import alpaca_client as broker
 from bot.trade_reporter import get_trade_reporter
 from bot.reporting_position_manager import create_reporting_position_manager
+from bot.monitoring import get_session_monitor
+from bot.monitor_reports import print_live_summary, save_eod_report, append_trade_ledger_csv
 
 # Import morning momentum components (now local)
 from bot.morning_config import Config as MMConfig
@@ -98,7 +100,101 @@ class IntegratedBot:
         self.mm_stage2_result = None
         self.mm_stage3_result = None
         self.mm_stages_completed = set()  # Track which stages have been run
+        
+        # Initialize monitoring system
+        try:
+            self.monitor = get_session_monitor()
+            logger.info("SessionMonitor initialized")
+        except Exception as e:
+            logger.exception("SessionMonitor init failed; disabling monitoring. Error=%s", e)
+            self.monitor = None
+        
+        self._last_live_summary_ts = 0.0  # monotonic seconds
+        self._last_account_update_ts = 0.0
     
+    def _update_monitoring(self) -> None:
+        """Periodic monitoring update: account refresh, risk snapshot, live summary, alerts."""
+        if not self.monitor:
+            return
+        try:
+            now_mono = time.monotonic()
+            
+            # Update account every 60 seconds
+            if now_mono - self._last_account_update_ts >= 60:
+                try:
+                    equity = broker.get_equity()
+                    cash = broker.get_cash()
+                    self.monitor.update_account(equity, cash)
+                    
+                    # Update market status
+                    try:
+                        clock = broker.get_clock()
+                        self.monitor.update_market_status(clock.is_open)
+                    except Exception:
+                        pass
+                    
+                    # Update risk exposure from positions
+                    positions = {}
+                    if self.mm_positions is not None:
+                        positions = self.mm_positions.positions
+                    pending_notional = 0.0
+                    try:
+                        pending = self.mm_state_store.load_pending_entries()
+                        for pe in pending.values():
+                            pending_notional += getattr(pe, 'intended_qty', 0) * getattr(pe, 'intended_price', 0)
+                    except Exception:
+                        pass
+                    self.monitor.update_risk_exposure(
+                        positions, equity, cash,
+                        pending_notional=pending_notional,
+                    )
+                    self._last_account_update_ts = now_mono
+                except Exception as e:
+                    logger.debug(f"Monitoring account update failed: {e}")
+            
+            # Print live summary every 5 minutes
+            if now_mono - self._last_live_summary_ts >= 300:
+                self.monitor.check_alerts()
+                print_live_summary(self.monitor)
+                self._last_live_summary_ts = now_mono
+                
+        except Exception as e:
+            logger.debug(f"Monitoring update error: {e}")
+    
+    def _generate_eod_monitoring_report(self) -> None:
+        """Generate end-of-day monitoring reports (all 4 layers)."""
+        if not self.monitor:
+            return
+        try:
+            self.monitor.record_session_stop()
+            
+            # Final account update
+            try:
+                equity = broker.get_equity()
+                cash = broker.get_cash()
+                self.monitor.update_account(equity, cash)
+            except Exception:
+                pass
+            
+            # Final alert check
+            self.monitor.check_alerts()
+            
+            # Layer 1: Final live summary to console
+            print_live_summary(self.monitor)
+            
+            # Layer 2: Full EOD report
+            save_eod_report(self.monitor)
+            
+            # Layer 3: Trade ledger CSV
+            append_trade_ledger_csv(self.monitor)
+            
+            # Layer 4: Rolling stats JSON
+            self.monitor.update_rolling_stats()
+            
+            logger.info("All monitoring reports generated successfully")
+        except Exception as e:
+            logger.exception("Failed to generate EOD monitoring reports: %s", e)
+
     def _check_orphaned_broker_positions(self):
         """Check for and log any unexpected positions in broker account."""
         try:
@@ -126,6 +222,8 @@ class IntegratedBot:
                 qty = float(getattr(pos, "qty", 0) or 0)
                 if symbol and abs(qty) > 0 and symbol not in known_symbols:
                     logger.warning(f"⚠️ ORPHANED POSITION DETECTED: {symbol} qty={qty} - not tracked by bot")
+                    if self.monitor:
+                        self.monitor.record_broker_event("position_mismatch")
         except Exception as e:
             logger.error(f"Failed to check orphaned positions: {e}")
         
@@ -134,6 +232,19 @@ class IntegratedBot:
         logger.info("=" * 60)
         logger.info("INTEGRATED BOT START" + (" [DRY RUN]" if self.dry_run else ""))
         logger.info("=" * 60)
+        
+        # Record session start for monitoring
+        if self.monitor:
+            try:
+                equity = broker.get_equity()
+                cash = broker.get_cash()
+                self.monitor.record_session_start(
+                    equity, cash,
+                    strategy_modules=["morning_momentum"],
+                )
+            except Exception as e:
+                logger.warning(f"Could not fetch account info for monitoring: {e}")
+                self.monitor.record_session_start(0.0, 0.0, strategy_modules=["morning_momentum"])
         
         try:
             # Check if market is open (but allow morning momentum to start at 8:30)
@@ -194,7 +305,7 @@ class IntegratedBot:
 
             # If clock check failed, be extra cautious before 9:30 AM
             if self.clock_check_failed and current_time < datetime.strptime("09:30", "%H:%M").time():
-                logger.info("Clock check failed - waiting until 9:30 AM to ensure market is open")
+                logger.debug("Clock check failed - waiting until 9:30 AM to ensure market is open")
                 time.sleep(60)
                 continue
             
@@ -233,7 +344,7 @@ class IntegratedBot:
                         wait_time = now.replace(hour=universe_build.hour, minute=universe_build.minute, second=0, microsecond=0)
                         wait_seconds = (wait_time - now).total_seconds()
                         if wait_seconds > 0:
-                            logger.info(f"Waiting for universe build at {self.mm_config.universe_build_time} ({wait_seconds/60:.1f} minutes)")
+                            logger.debug(f"Waiting for universe build at {self.mm_config.universe_build_time} ({wait_seconds/60:.1f} minutes)")
                             time.sleep(min(wait_seconds, 60))  # Check every minute
                             continue
                     
@@ -258,6 +369,9 @@ class IntegratedBot:
                     time.sleep(30)  # Prevent tight loop after supervision returns
                     continue
             
+            # Periodic monitoring update
+            self._update_monitoring()
+            
             # Check for any orphaned broker positions after emergency flatten
             self._check_orphaned_broker_positions()
             
@@ -267,6 +381,9 @@ class IntegratedBot:
                 positions_closed = self._all_positions_closed()
                 
                 if positions_closed:
+                    # Generate EOD monitoring report before shutdown
+                    self._generate_eod_monitoring_report()
+                    
                     logger.info("All positions closed - waiting for 4:05 PM to generate liquidity ranking")
                     
                     # Sleep until 4:05 PM for liquidity ranking generation
@@ -301,7 +418,7 @@ class IntegratedBot:
                         logger.warning("Liquidity ranking complete - shutting down with positions potentially open")
                         break
                     else:
-                        logger.info("Positions still open - checking again in 5 minutes")
+                        logger.debug("Positions still open - checking again in 5 minutes")
                         time.sleep(300)  # 5 minutes
     
     def _supervise_mm_positions_until_hard_exit(self, now):
@@ -320,7 +437,7 @@ class IntegratedBot:
                 mm_positions = self.mm_positions.positions
 
             if not mm_positions:
-                logger.info("No MM positions to supervise - waiting for hard exit")
+                logger.debug("No MM positions to supervise - waiting for hard exit")
                 # Sleep until hard exit time
                 hard_exit_dt = now.replace(
                     hour=int(self.mm_config.hard_exit.split(':')[0]),
@@ -329,11 +446,11 @@ class IntegratedBot:
                 )
                 wait_seconds = (hard_exit_dt - now).total_seconds()
                 if wait_seconds > 0:
-                    logger.info(f"Waiting for hard exit at {hard_exit_time} ({wait_seconds/60:.1f} minutes)")
+                    logger.debug(f"Waiting for hard exit at {hard_exit_time} ({wait_seconds/60:.1f} minutes)")
                     time.sleep(min(wait_seconds, 300))  # Cap at 5 minutes, will re-evaluate
                 return
             
-            logger.info(f"Supervising {len(mm_positions)} MM positions until hard exit at {hard_exit_time}")
+            logger.debug(f"Supervising {len(mm_positions)} MM positions until hard exit at {hard_exit_time}")
             
             # Check exits periodically (every 30 seconds)
             while now.time() < hard_exit_time:
@@ -344,10 +461,10 @@ class IntegratedBot:
                     else:
                         current_positions = self.mm_state_store.load_positions()
                         if not current_positions:
-                            logger.info("All MM positions closed - waiting for hard exit")
+                            logger.debug("All MM positions closed - waiting for hard exit")
                             break
                     if not current_positions:
-                        logger.info("All MM positions closed - waiting for hard exit")
+                        logger.debug("All MM positions closed - waiting for hard exit")
                         break
                     
                     # Get current quotes for exit price checks (batched)
@@ -701,6 +818,21 @@ class IntegratedBot:
                 self.mm_stage1_result = result1.candidates
                 self.mm_stages_completed.add(1)
                 logger.info(f"Stage 1 complete: {len(self.mm_stage1_result)} candidates cached")
+                
+                # Record funnel metrics from Stage 1 ledger
+                if self.monitor:
+                    ledger = result1.ledger
+                    drop_reasons = {}
+                    for drop in ledger.drops:
+                        drop_reasons[drop.reason] = drop_reasons.get(drop.reason, 0) + 1
+                    self.monitor.record_funnel(
+                        starting_universe=ledger.seed_total,
+                        valid_data=ledger.seed_selected,
+                        pass_all=ledger.validated,
+                        final_ranked=ledger.final,
+                        drop_reasons=drop_reasons,
+                    )
+                
                 # Return to loop - don't block waiting for next stage
                 return "in_progress"  # Stage 1 done, more stages pending
             
@@ -822,6 +954,12 @@ class IntegratedBot:
             logger.info(f"Watchlist: {len(self.mm_watchlist)} symbols")
             logger.info(f"Subscribe: {len(self.mm_subscribe_symbols)} symbols")
             logger.info(f"Stages completed: {sorted(self.mm_stages_completed)}")
+            
+            # Update funnel metrics with final numbers
+            if self.monitor:
+                self.monitor.funnel.final_ranked_candidates = len(candidates)
+                self.monitor.funnel.selected_for_sizing = len(self.mm_watchlist)
+                self.monitor.dashboard.candidates_found = len(candidates)
             
             # Use final cached values
             watchlist = self.mm_watchlist
