@@ -51,6 +51,12 @@ class PositionState:
     entry_order_id: Optional[str] = None
     entry_client_order_id: Optional[str] = None
 
+    # Entry metadata for trade outcome recording
+    gap_at_entry: float = 0.0  # Gap % at entry time
+    first_5min_volume: float = 0.0  # Dollar volume in first 5 minutes
+    fill_pct: float = 100.0  # Fill percentage (100 = full fill, <100 = partial)
+    entry_slippage_bps: float = 0.0  # Entry slippage in basis points
+
     spread_bad_count: int = 0
     exit_pending: bool = False           # True while an exit order is in flight
     exit_order_id: Optional[str] = None

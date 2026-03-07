@@ -22,7 +22,8 @@ class ReportingPositionManager:
         return getattr(self.original_pm, name)
     
     def open_position(self, symbol, qty, price, stop_pct, *,
-                     entry_time=None, entry_order_id=None, entry_client_order_id=None):
+                     entry_time=None, entry_order_id=None, entry_client_order_id=None,
+                     gap_at_entry=0.0, first_5min_volume=0.0, fill_pct=100.0, entry_slippage_bps=0.0):
         """Open position with trade reporting"""
         # Call original method
         result = self.original_pm.open_position(
@@ -30,6 +31,10 @@ class ReportingPositionManager:
             entry_time=entry_time,
             entry_order_id=entry_order_id,
             entry_client_order_id=entry_client_order_id,
+            gap_at_entry=gap_at_entry,
+            first_5min_volume=first_5min_volume,
+            fill_pct=fill_pct,
+            entry_slippage_bps=entry_slippage_bps,
         )
         
         # Log trade to reporting system
@@ -57,6 +62,9 @@ class ReportingPositionManager:
         entry_price = 0
         entry_time_str = ""
         gap_at_entry = 0.0
+        first_5min_volume = 0.0
+        fill_pct = 100.0
+        entry_slippage_bps = 0.0
         peak_price = 0.0
         stop_price = 0.0
         
@@ -64,6 +72,10 @@ class ReportingPositionManager:
             exit_qty = position.qty
             entry_price = position.entry_price
             entry_time_str = position.entry_time.isoformat() if position.entry_time else ""
+            gap_at_entry = getattr(position, 'gap_at_entry', 0.0)
+            first_5min_volume = getattr(position, 'first_5min_volume', 0.0)
+            fill_pct = getattr(position, 'fill_pct', 100.0)
+            entry_slippage_bps = getattr(position, 'entry_slippage_bps', 0.0)
             peak_price = getattr(position, 'peak_price', entry_price)
             stop_price = getattr(position, 'stop_price', 0.0)
         
@@ -97,8 +109,12 @@ class ReportingPositionManager:
                     exit_price=price,
                     qty=exit_qty,
                     exit_reason=reason,
+                    gap_at_entry=gap_at_entry,
+                    first_5min_volume=first_5min_volume,
                     max_favorable_excursion=mfe,
                     max_adverse_excursion=mae,
+                    fill_pct=fill_pct,
+                    entry_slippage_bps=entry_slippage_bps,
                 )
             except Exception:
                 logger.exception("Monitoring trade outcome failed for %s; continuing", symbol)
@@ -115,6 +131,10 @@ class ReportingPositionManager:
                     "qty": position.qty,
                     "entry_price": position.entry_price,
                     "entry_time": position.entry_time.isoformat() if position.entry_time else "",
+                    "gap_at_entry": getattr(position, 'gap_at_entry', 0.0),
+                    "first_5min_volume": getattr(position, 'first_5min_volume', 0.0),
+                    "fill_pct": getattr(position, 'fill_pct', 100.0),
+                    "entry_slippage_bps": getattr(position, 'entry_slippage_bps', 0.0),
                     "peak_price": getattr(position, 'peak_price', position.entry_price),
                     "stop_price": getattr(position, 'stop_price', 0.0),
                 }
@@ -152,8 +172,12 @@ class ReportingPositionManager:
                     exit_price=exit_price,
                     qty=info["qty"],
                     exit_reason=reason,
+                    gap_at_entry=info["gap_at_entry"],
+                    first_5min_volume=info["first_5min_volume"],
                     max_favorable_excursion=mfe,
                     max_adverse_excursion=mae,
+                    fill_pct=info["fill_pct"],
+                    entry_slippage_bps=info["entry_slippage_bps"],
                 )
         except Exception:
             logger.exception("Monitoring trade outcomes failed during force exit; continuing")

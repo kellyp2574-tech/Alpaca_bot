@@ -1183,8 +1183,13 @@ class SessionMonitor:
 
         # Update all-time cumulative
         at = self._rolling_stats.get("all_time", self._empty_tally())
+        at["period_label"] = "all_time"
         at["cumulative_realized_pnl"] = sum(d.get("cumulative_realized_pnl", 0) for d in history)
+        at["cumulative_unrealized_pnl"] = history[-1].get("cumulative_unrealized_pnl", 0) if history else 0.0
+        at["cumulative_net_return"] = sum(d.get("cumulative_net_return", 0) for d in history)
+        at["cumulative_deployed_dollars"] = sum(d.get("cumulative_deployed_dollars", 0) for d in history)
         at["cumulative_gross_traded_notional"] = sum(d.get("cumulative_gross_traded_notional", 0) for d in history)
+        at["cumulative_fees"] = sum(d.get("cumulative_fees", 0) for d in history)
         at["cumulative_slippage_dollars"] = sum(d.get("cumulative_slippage_dollars", 0) for d in history)
         at["cumulative_entries_attempted"] = sum(d.get("cumulative_entries_attempted", 0) for d in history)
         at["cumulative_entries_filled"] = sum(d.get("cumulative_entries_filled", 0) for d in history)
@@ -1192,11 +1197,45 @@ class SessionMonitor:
         at["cumulative_canceled_entries"] = sum(d.get("cumulative_canceled_entries", 0) for d in history)
         at["cumulative_force_flat_exits"] = sum(d.get("cumulative_force_flat_exits", 0) for d in history)
 
+        # Compute weighted averages and aggregates
         total_filled = at["cumulative_entries_filled"] + at["cumulative_partial_fills"]
+        total_notional = at["cumulative_gross_traded_notional"]
+        
+        # Average daily return
+        daily_returns = [d.get("cumulative_net_return", 0) for d in history if d.get("cumulative_net_return", 0) != 0]
+        if daily_returns:
+            at["cumulative_avg_daily_return"] = statistics.mean(daily_returns)
+        
+        # Weighted average slippage bps
+        slippage_bps_values = [(d.get("cumulative_slippage_bps_avg", 0), d.get("cumulative_gross_traded_notional", 0)) for d in history]
+        total_weighted_slippage = sum(bps * notional for bps, notional in slippage_bps_values)
+        if total_notional > 0:
+            at["cumulative_slippage_bps_avg"] = total_weighted_slippage / total_notional
+        
+        # Weighted average win rate
+        win_rate_values = [(d.get("cumulative_win_rate", 0), d.get("cumulative_entries_filled", 0) + d.get("cumulative_partial_fills", 0)) for d in history]
+        total_weighted_wr = sum(wr * fills for wr, fills in win_rate_values)
         if total_filled > 0:
-            daily_returns = [d.get("cumulative_net_return", 0) for d in history if d.get("cumulative_net_return", 0) != 0]
-            if daily_returns:
-                at["cumulative_avg_daily_return"] = statistics.mean(daily_returns)
+            at["cumulative_win_rate"] = total_weighted_wr / total_filled
+        
+        # Weighted average expectancy
+        expectancy_values = [(d.get("cumulative_expectancy", 0), d.get("cumulative_entries_filled", 0) + d.get("cumulative_partial_fills", 0)) for d in history]
+        total_weighted_exp = sum(exp * fills for exp, fills in expectancy_values)
+        if total_filled > 0:
+            at["cumulative_expectancy"] = total_weighted_exp / total_filled
+            at["cumulative_avg_trade_return"] = total_weighted_exp / total_filled
+        
+        # Weighted average profit factor
+        pf_values = [(d.get("cumulative_profit_factor", 0), d.get("cumulative_entries_filled", 0) + d.get("cumulative_partial_fills", 0)) for d in history if d.get("cumulative_profit_factor", 0) < 999.0]
+        total_weighted_pf = sum(pf * fills for pf, fills in pf_values)
+        total_pf_fills = sum(fills for _, fills in pf_values)
+        if total_pf_fills > 0:
+            at["cumulative_profit_factor"] = total_weighted_pf / total_pf_fills
+        
+        # Max drawdown across all days
+        drawdowns = [d.get("cumulative_max_drawdown", 0) for d in history]
+        if drawdowns:
+            at["cumulative_max_drawdown"] = max(drawdowns)
 
         # Compute rolling windows
         self._rolling_stats["all_time"] = at
@@ -1217,22 +1256,61 @@ class SessionMonitor:
         tally["period_label"] = f"rolling_{days}d"
         if not window:
             return tally
+        
+        # Sum additive fields
         for key in [
-            "cumulative_realized_pnl", "cumulative_gross_traded_notional",
+            "cumulative_realized_pnl", "cumulative_deployed_dollars",
+            "cumulative_gross_traded_notional", "cumulative_fees",
             "cumulative_slippage_dollars", "cumulative_entries_attempted",
             "cumulative_entries_filled", "cumulative_partial_fills",
             "cumulative_canceled_entries", "cumulative_force_flat_exits",
         ]:
             tally[key] = sum(d.get(key, 0) for d in window)
-        rets = [d.get("cumulative_net_return", 0) for d in window]
+        
+        # Latest unrealized P&L
+        tally["cumulative_unrealized_pnl"] = window[-1].get("cumulative_unrealized_pnl", 0) if window else 0.0
+        
+        # Net return (sum of daily returns)
+        tally["cumulative_net_return"] = sum(d.get("cumulative_net_return", 0) for d in window)
+        
+        # Average daily return
+        rets = [d.get("cumulative_net_return", 0) for d in window if d.get("cumulative_net_return", 0) != 0]
         if rets:
             tally["cumulative_avg_daily_return"] = statistics.mean(rets)
-        win_rates = [d.get("cumulative_win_rate", 0) for d in window if d.get("cumulative_entries_filled", 0) > 0]
-        if win_rates:
-            tally["cumulative_win_rate"] = statistics.mean(win_rates)
+        
+        # Weighted average slippage bps
+        total_notional = tally["cumulative_gross_traded_notional"]
+        slippage_bps_values = [(d.get("cumulative_slippage_bps_avg", 0), d.get("cumulative_gross_traded_notional", 0)) for d in window]
+        total_weighted_slippage = sum(bps * notional for bps, notional in slippage_bps_values)
+        if total_notional > 0:
+            tally["cumulative_slippage_bps_avg"] = total_weighted_slippage / total_notional
+        
+        # Weighted average win rate
+        total_filled = tally["cumulative_entries_filled"] + tally["cumulative_partial_fills"]
+        win_rate_values = [(d.get("cumulative_win_rate", 0), d.get("cumulative_entries_filled", 0) + d.get("cumulative_partial_fills", 0)) for d in window]
+        total_weighted_wr = sum(wr * fills for wr, fills in win_rate_values)
+        if total_filled > 0:
+            tally["cumulative_win_rate"] = total_weighted_wr / total_filled
+        
+        # Weighted average expectancy
+        expectancy_values = [(d.get("cumulative_expectancy", 0), d.get("cumulative_entries_filled", 0) + d.get("cumulative_partial_fills", 0)) for d in window]
+        total_weighted_exp = sum(exp * fills for exp, fills in expectancy_values)
+        if total_filled > 0:
+            tally["cumulative_expectancy"] = total_weighted_exp / total_filled
+            tally["cumulative_avg_trade_return"] = total_weighted_exp / total_filled
+        
+        # Weighted average profit factor
+        pf_values = [(d.get("cumulative_profit_factor", 0), d.get("cumulative_entries_filled", 0) + d.get("cumulative_partial_fills", 0)) for d in window if d.get("cumulative_profit_factor", 0) < 999.0]
+        total_weighted_pf = sum(pf * fills for pf, fills in pf_values)
+        total_pf_fills = sum(fills for _, fills in pf_values)
+        if total_pf_fills > 0:
+            tally["cumulative_profit_factor"] = total_weighted_pf / total_pf_fills
+        
+        # Max drawdown in window
         dds = [d.get("cumulative_max_drawdown", 0) for d in window]
         if dds:
             tally["cumulative_max_drawdown"] = max(dds)
+        
         return tally
 
     def _compute_mtd(self, history: List[Dict]) -> Dict[str, Any]:

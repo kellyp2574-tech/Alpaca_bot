@@ -961,6 +961,12 @@ class EntryLoop:
             # Clear pending entry on success
             self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
             
+            # Calculate entry metadata for trade outcome recording
+            cand = next((c for c in self.ctx.watchlist if c.symbol == decision.symbol), None)
+            gap_at_entry = cand.gap_pct if cand else 0.0  # Store as decimal for drift classifier
+            first_5min_vol = cand.liq_5m_dollar if cand else 0.0
+            entry_slippage_bps = ((fill.avg_price - decision.entry_price) / decision.entry_price * 10000) if decision.entry_price > 0 else 0.0
+            
             self.positions.open_position(
                 decision.symbol,
                 fill.filled_qty,
@@ -968,6 +974,10 @@ class EntryLoop:
                 (decision.entry_price - decision.stop_price) / decision.entry_price,
                 entry_order_id=fill.order_id,
                 entry_client_order_id=pending_state.client_order_id,
+                gap_at_entry=gap_at_entry,
+                first_5min_volume=first_5min_vol,
+                fill_pct=100.0,
+                entry_slippage_bps=entry_slippage_bps,
             )
             logger.info(
                 f"ENTRY {decision.symbol} qty={fill.filled_qty} @ {fill.avg_price:.2f} "
@@ -977,6 +987,13 @@ class EntryLoop:
             # Clear pending entry and open position with partial fill
             self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
 
+            # Calculate entry metadata for trade outcome recording
+            cand = next((c for c in self.ctx.watchlist if c.symbol == decision.symbol), None)
+            gap_at_entry = cand.gap_pct if cand else 0.0  # Store as decimal for drift classifier
+            first_5min_vol = cand.liq_5m_dollar if cand else 0.0
+            fill_pct_val = (fill.filled_qty / decision.qty * 100) if decision.qty > 0 else 0.0
+            entry_slippage_bps = ((fill.avg_price - decision.entry_price) / decision.entry_price * 10000) if decision.entry_price > 0 else 0.0
+
             self.positions.open_position(
                 decision.symbol,
                 fill.filled_qty,
@@ -984,6 +1001,10 @@ class EntryLoop:
                 (decision.entry_price - decision.stop_price) / decision.entry_price,
                 entry_order_id=fill.order_id,
                 entry_client_order_id=pending_state.client_order_id,
+                gap_at_entry=gap_at_entry,
+                first_5min_volume=first_5min_vol,
+                fill_pct=fill_pct_val,
+                entry_slippage_bps=entry_slippage_bps,
             )
 
             self._done_today_symbols.add(decision.symbol)

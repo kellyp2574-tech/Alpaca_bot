@@ -146,6 +146,10 @@ class PositionManager:
         entry_time: Optional[datetime] = None,
         entry_order_id: Optional[str] = None,
         entry_client_order_id: Optional[str] = None,
+        gap_at_entry: float = 0.0,
+        first_5min_volume: float = 0.0,
+        fill_pct: float = 100.0,
+        entry_slippage_bps: float = 0.0,
     ) -> PositionState:
         entry_time = entry_time or market_now()
         stop_price = entry_price * (1 - stop_pct)
@@ -159,6 +163,10 @@ class PositionManager:
             r_stop_pct=stop_pct,
             entry_order_id=entry_order_id,
             entry_client_order_id=entry_client_order_id,
+            gap_at_entry=gap_at_entry,
+            first_5min_volume=first_5min_volume,
+            fill_pct=fill_pct,
+            entry_slippage_bps=entry_slippage_bps,
         )
         self.positions[symbol] = state
         logger.info(
