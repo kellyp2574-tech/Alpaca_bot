@@ -581,6 +581,10 @@ class SessionMonitor:
         """
         for metric in self.entry_orders:
             if metric.client_order_id == client_order_id:
+                # Capture old values for daily accumulator adjustments
+                old_notional = metric.filled_notional
+                old_slip = abs(metric.slippage_dollars)
+                
                 # Update fields if provided
                 if filled_qty is not None:
                     old_filled = metric.filled_shares
@@ -606,6 +610,13 @@ class SessionMonitor:
                     
                 if cancel_reason is not None:
                     metric.cancel_reason = cancel_reason
+                
+                # Adjust daily accumulators for reconciled fills
+                # (prevents undercounting when unknown orders later become filled)
+                delta_notional = metric.filled_notional - old_notional
+                delta_slip = abs(metric.slippage_dollars) - old_slip
+                self._daily_gross_notional += delta_notional
+                self._daily_slippage_dollars += delta_slip
                 
                 # Update dashboard counters based on status change
                 if status is not None and status != old_status:
