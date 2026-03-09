@@ -52,21 +52,21 @@ def live_console_summary(monitor: Optional[SessionMonitor] = None) -> str:
         fill_rate = (d.entries_filled + d.partial_fills) / d.entries_attempted * 100
 
     lines = [
-        f"{'═' * 60}",
+        f"{'=' * 60}",
         f"  LIVE DASHBOARD  {d.date}  {datetime.now(MARKET_TZ).strftime('%H:%M:%S')}",
-        f"{'═' * 60}",
+        f"{'=' * 60}",
         f"  Equity: ${d.account_equity_current:,.2f}  (start: ${d.account_equity_start:,.2f})",
         f"  Cash:   ${d.cash_current:,.2f}  |  Deployed: {r.pct_deployed:.1f}%",
         f"  P&L:    realized ${d.realized_pnl_today:+,.2f}  |  unrealized ${d.unrealized_pnl_current:+,.2f}  |  total ${d.total_pnl_today:+,.2f}",
-        f"{'─' * 60}",
-        f"  Scanned: {d.symbols_scanned}  →  Candidates: {d.candidates_found}  →  Sized: {m.funnel.selected_for_sizing}",
+        f"{'-' * 60}",
+        f"  Scanned: {d.symbols_scanned}  ->  Candidates: {d.candidates_found}  ->  Sized: {m.funnel.selected_for_sizing}",
         f"  Entries: {d.entries_attempted} attempted  |  {d.entries_filled} filled  |  {d.partial_fills} partial  |  {d.canceled_entries} canceled",
         f"  Fill rate: {fill_rate:.0f}%  |  Avg slippage: {entry_agg.avg_slippage_bps:.1f}bps",
-        f"{'─' * 60}",
+        f"{'-' * 60}",
         f"  Positions: {d.current_open_positions} open  |  {d.trades_closed} closed today  |  {d.forced_exits} force-flat",
         f"  Win rate: {trade_agg.win_rate:.0f}%  |  Expectancy: {trade_agg.expectancy_pct:+.2f}%  |  PF: {_fmt_pf(trade_agg.profit_factor)}",
         f"  Drawdown: {r.intraday_drawdown_pct:.2%} (max today: {r.max_intraday_drawdown:.2%})",
-        f"{'─' * 60}",
+        f"{'-' * 60}",
         f"  Data errors: API fail={m.data_integrity.api_failure_count}  timeout={m.data_integrity.api_timeout_count}  stale={m.data_integrity.symbols_stale_quotes}",
         f"  Broker: reject={m.broker_integrity.rejected_orders}  mismatch={m.broker_integrity.position_mismatches}  orphan={m.broker_integrity.orphan_fills}",
     ]
@@ -74,12 +74,12 @@ def live_console_summary(monitor: Optional[SessionMonitor] = None) -> str:
     # Active alerts
     recent_alerts = m.alerts[-3:] if m.alerts else []
     if recent_alerts:
-        lines.append(f"{'─' * 60}")
+        lines.append(f"{'-' * 60}")
         lines.append("  ALERTS:")
         for a in recent_alerts:
             lines.append(f"    [{a.severity}] {a.category}: {a.message}")
 
-    lines.append(f"{'═' * 60}")
+    lines.append(f"{'=' * 60}")
     return "\n".join(lines)
 
 
@@ -107,14 +107,14 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
 
     lines = []
 
-    # ── Header ──
+    # -- Header --
     lines.append("=" * 80)
-    lines.append(f"  END-OF-DAY REPORT  —  {d.date}")
+    lines.append(f"  END-OF-DAY REPORT  --  {d.date}")
     lines.append(f"  Generated: {datetime.now(MARKET_TZ).strftime('%Y-%m-%d %H:%M:%S ET')}")
     lines.append("=" * 80)
 
-    # ── Section 1: Daily Dashboard ──
-    lines.append("\n┌─ 1. SESSION SUMMARY ─────────────────────────────────────────┐")
+    # -- Section 1: Daily Dashboard --
+    lines.append("\n+- 1. SESSION SUMMARY -------------------------------------+")
     lines.append(f"  Date:           {d.date}")
     lines.append(f"  Bot start:      {d.bot_start_time}")
     lines.append(f"  Bot stop:       {d.bot_stop_time}")
@@ -136,10 +136,10 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  Canceled entries:  {d.canceled_entries}")
     lines.append(f"  Forced exits:      {d.forced_exits}")
     lines.append(f"  Open positions:    {d.current_open_positions}")
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 2: Funnel ──
-    lines.append("\n┌─ 2. CANDIDATE FUNNEL ────────────────────────────────────────┐")
+    # -- Section 2: Funnel --
+    lines.append("\n+- 2. CANDIDATE FUNNEL ------------------------------------+")
     lines.append(f"  Starting universe:      {f.total_starting_universe}")
     lines.append(f"  With valid data:        {f.symbols_with_valid_data}")
     lines.append(f"  Pass price filter:      {f.passing_price_filter}")
@@ -149,20 +149,20 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  Pass ALL filters:       {f.passing_all_filters}")
     lines.append(f"  Final ranked:           {f.final_ranked_candidates}")
     lines.append(f"  Selected for sizing:    {f.selected_for_sizing}")
-    lines.append(f"  ─── Skipped reasons ───")
+    lines.append(f"  --- Skipped reasons ---")
     lines.append(f"  Capital constraints:    {f.skipped_capital_constraints}")
     lines.append(f"  Volume cap:             {f.skipped_volume_cap}")
     lines.append(f"  Day lockout:            {f.skipped_day_lockout}")
     lines.append(f"  Missing prev close:     {f.skipped_missing_prev_close}")
     lines.append(f"  Stale minute bars:      {f.skipped_stale_minute_bars}")
     if f.drop_reasons:
-        lines.append(f"  ─── Drop breakdown ───")
+        lines.append(f"  --- Drop breakdown ---")
         for reason, count in sorted(f.drop_reasons.items(), key=lambda x: -x[1])[:10]:
             lines.append(f"  {reason:<30s} {count:>6d}")
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 3: Entry Execution Quality ──
-    lines.append("\n┌─ 3. ENTRY EXECUTION QUALITY ─────────────────────────────────┐")
+    # -- Section 3: Entry Execution Quality --
+    lines.append("\n+- 3. ENTRY EXECUTION QUALITY -----------------------------+")
     lines.append(f"  Avg slippage:       {entry_agg.avg_slippage_bps:+.1f} bps")
     lines.append(f"  Median slippage:    {entry_agg.median_slippage_bps:+.1f} bps")
     lines.append(f"  95th pct slippage:  {entry_agg.p95_slippage_bps:+.1f} bps")
@@ -176,7 +176,7 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  % canceled by 60s:  {entry_agg.pct_canceled_60s:.1f}%")
     lines.append(f"  % canceled by +1%:  {entry_agg.pct_canceled_1pct:.1f}%")
     if m.entry_orders:
-        lines.append(f"  ─── Per-order detail (last 10) ───")
+        lines.append(f"  --- Per-order detail (last 10) ---")
         lines.append(f"  {'Symbol':<6} {'Status':<10} {'Intended':>9} {'Filled':>9} {'Slip bps':>9} {'Fill%':>6} {'TIF':<4}")
         for o in m.entry_orders[-10:]:
             lines.append(
@@ -184,18 +184,18 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
                 f"${o.intended_notional:>8,.0f} ${o.filled_notional:>8,.0f} "
                 f"{o.slippage_bps:>+8.1f} {o.fill_pct:>5.0f}% {o.tif:<4}"
             )
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 4: Exit Execution Quality ──
-    lines.append("\n┌─ 4. EXIT EXECUTION QUALITY ──────────────────────────────────┐")
+    # -- Section 4: Exit Execution Quality --
+    lines.append("\n+- 4. EXIT EXECUTION QUALITY ------------------------------+")
     lines.append(f"  Avg slippage:       {exit_agg.avg_slippage_bps:+.1f} bps")
     lines.append(f"  Median slippage:    {exit_agg.median_slippage_bps:+.1f} bps")
     lines.append(f"  95th pct slippage:  {exit_agg.p95_slippage_bps:+.1f} bps")
     lines.append(f"  % force-flat:       {exit_agg.pct_force_flat:.1f}%")
     lines.append(f"  % partial before done: {exit_agg.pct_partial_before_completion:.1f}%")
-    lines.append(f"  Avg signal→exit:    {exit_agg.avg_signal_to_exit_delay_s:.2f}s")
+    lines.append(f"  Avg signal->exit:    {exit_agg.avg_signal_to_exit_delay_s:.2f}s")
     if m.exit_orders:
-        lines.append(f"  ─── Per-exit detail (last 10) ───")
+        lines.append(f"  --- Per-exit detail (last 10) ---")
         lines.append(f"  {'Symbol':<6} {'Reason':<18} {'Intended':>9} {'Filled':>9} {'Slip bps':>9} {'FF':>3}")
         for o in m.exit_orders[-10:]:
             ff_flag = "YES" if o.force_flat else ""
@@ -204,10 +204,10 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
                 f"${o.intended_exit_price:>8.2f} ${o.avg_exit_price:>8.2f} "
                 f"{o.exit_slippage_bps:>+8.1f} {ff_flag:>3}"
             )
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 5: Trade Outcome Stats ──
-    lines.append("\n┌─ 5. TRADE OUTCOME STATS ─────────────────────────────────────┐")
+    # -- Section 5: Trade Outcome Stats --
+    lines.append("\n+- 5. TRADE OUTCOME STATS ---------------------------------+")
     lines.append(f"  Win rate:           {trade_agg.win_rate:.1f}%")
     lines.append(f"  Loss rate:          {trade_agg.loss_rate:.1f}%")
     lines.append(f"  Avg win %:          {trade_agg.avg_win_pct:+.2f}%")
@@ -221,7 +221,7 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  Avg return (full):  {trade_agg.avg_return_full_fills:+.2f}%")
     lines.append(f"  Avg return (partial):{trade_agg.avg_return_partial_fills:+.2f}%")
     if m.trade_outcomes:
-        lines.append(f"  ─── Per-trade detail (last 10) ───")
+        lines.append(f"  --- Per-trade detail (last 10) ---")
         lines.append(f"  {'Symbol':<6} {'P&L $':>9} {'Ret %':>7} {'Hold':>8} {'Exit Reason':<18} {'Fill%':>6}")
         for t in m.trade_outcomes[-10:]:
             lines.append(
@@ -229,11 +229,11 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
                 f"{t.gross_return_pct:>+6.2f}% {_fmt_duration(t.holding_time_s):>8} "
                 f"{t.exit_reason:<18} {t.fill_pct:>5.0f}%"
             )
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 6: Running Tallies ──
+    # -- Section 6: Running Tallies --
     rolling = m.get_rolling_stats()
-    lines.append("\n┌─ 6. RUNNING TALLIES ─────────────────────────────────────────┐")
+    lines.append("\n+- 6. RUNNING TALLIES -------------------------------------+")
     lines.append(f"  {'Period':<14} {'P&L':>10} {'Entries':>8} {'Filled':>8} {'WinRate':>8} {'DD':>8} {'Slip$':>8}")
     for period_key in ["all_time", "mtd", "weekly", "rolling_20d", "rolling_50d"]:
         t = rolling.get(period_key, {})
@@ -249,10 +249,10 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
             f"{t.get('cumulative_max_drawdown', 0):>7.2f}% "
             f"${t.get('cumulative_slippage_dollars', 0):>7,.0f}"
         )
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 7: Risk & Exposure ──
-    lines.append("\n┌─ 7. RISK & EXPOSURE ─────────────────────────────────────────┐")
+    # -- Section 7: Risk & Exposure --
+    lines.append("\n+- 7. RISK & EXPOSURE -------------------------------------+")
     lines.append(f"  Cash:               ${r.current_cash:,.2f}")
     lines.append(f"  Equity:             ${r.current_equity:,.2f}")
     lines.append(f"  Deployed:           ${r.total_deployed:,.2f} ({r.pct_deployed:.1f}%)")
@@ -267,14 +267,14 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  Intraday DD:        {r.intraday_drawdown_pct:.2%}")
     lines.append(f"  Max intraday DD:    {r.max_intraday_drawdown:.2%}")
     lines.append(f"  Pending notional:   ${r.pending_order_notional:,.2f}")
-    lines.append(f"  ─── Daily risk summary ───")
+    lines.append(f"  --- Daily risk summary ---")
     lines.append(f"  Max deployed today: ${r.max_capital_deployed_today:,.2f}")
     lines.append(f"  Max positions:      {r.max_simultaneous_positions}")
     lines.append(f"  Max single exposure:${r.largest_single_exposure:,.2f}")
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 8: Data Integrity ──
-    lines.append("\n┌─ 8. DATA INTEGRITY ──────────────────────────────────────────┐")
+    # -- Section 8: Data Integrity --
+    lines.append("\n+- 8. DATA INTEGRITY --------------------------------------+")
     lines.append(f"  Missing prev close: {di.symbols_missing_prev_close}")
     lines.append(f"  Missing open:       {di.symbols_missing_open}")
     lines.append(f"  Stale quotes:       {di.symbols_stale_quotes}")
@@ -288,10 +288,10 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  Quote latency:      {di.quote_refresh_latency_ms:.0f}ms")
     lines.append(f"  Bar latency:        {di.bar_refresh_latency_ms:.0f}ms")
     lines.append(f"  Last good update:   {di.last_good_update_ts or 'N/A'}")
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 9: Broker Integrity ──
-    lines.append("\n┌─ 9. BROKER / ORDER INTEGRITY ────────────────────────────────┐")
+    # -- Section 9: Broker Integrity --
+    lines.append("\n+- 9. BROKER / ORDER INTEGRITY ----------------------------+")
     lines.append(f"  Rejected orders:    {bi.rejected_orders}")
     lines.append(f"  Canceled orders:    {bi.canceled_orders}")
     lines.append(f"  Expired orders:     {bi.expired_orders}")
@@ -303,27 +303,27 @@ def generate_eod_report(monitor: Optional[SessionMonitor] = None) -> str:
     lines.append(f"  Position mismatches:{bi.position_mismatches}")
     lines.append(f"  Cash mismatches:    {bi.cash_mismatches}")
     lines.append(f"  Bot recoveries:     {bi.bot_recoveries}")
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 10: Drift Diagnostics ──
+    # -- Section 10: Drift Diagnostics --
     drift = m.drift
-    lines.append("\n┌─ 10. STRATEGY DRIFT DIAGNOSTICS ─────────────────────────────┐")
+    lines.append("\n+- 10. STRATEGY DRIFT DIAGNOSTICS -------------------------+")
     _append_drift_table(lines, "Returns by Day of Week", drift.returns_by_day_of_week)
     _append_drift_table(lines, "Returns by Gap Bucket", drift.returns_by_gap_bucket)
     _append_drift_table(lines, "Returns by Slippage Bucket", drift.returns_by_slippage_bucket)
     _append_drift_table(lines, "Returns by Fill Type", drift.returns_by_partial_vs_full)
     _append_drift_table(lines, "Returns by Entry Time", drift.returns_by_entry_time_bucket)
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
-    # ── Section 11: Alerts ──
-    lines.append("\n┌─ 11. ALERTS ─────────────────────────────────────────────────┐")
+    # -- Section 11: Alerts --
+    lines.append("\n+- 11. ALERTS ---------------------------------------------+")
     if m.alerts:
         for a in m.alerts:
             ts = a.timestamp[:19] if len(a.timestamp) > 19 else a.timestamp
             lines.append(f"  [{a.severity:8s}] {ts} {a.category}: {a.message}")
     else:
         lines.append("  No alerts triggered this session.")
-    lines.append("└─────────────────────────────────────────────────────────────┘")
+    lines.append("+----------------------------------------------------------+")
 
     lines.append("\n" + "=" * 80)
     return "\n".join(lines)
@@ -485,7 +485,7 @@ def _append_drift_table(lines: List[str], title: str, data: Dict[str, List[float
     if not data:
         lines.append(f"  {title}: No data")
         return
-    lines.append(f"  ─── {title} ───")
+    lines.append(f"  --- {title} ---")
     lines.append(f"  {'Bucket':<18} {'N':>5} {'Avg%':>7} {'Med%':>7} {'WinR':>6}")
     for bucket, returns in sorted(data.items()):
         if not returns:

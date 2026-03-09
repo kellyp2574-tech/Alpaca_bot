@@ -3,8 +3,8 @@ Alpaca Trading Client Wrapper — Orders, positions, account.
 """
 import logging
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, GetAssetsRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, AssetStatus, AssetClass
 from bot.config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
 
 logger = logging.getLogger("bot.alpaca")
@@ -12,6 +12,19 @@ logger = logging.getLogger("bot.alpaca")
 
 def get_trading_client():
     return TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+
+
+def get_all_assets():
+    """Get all assets from Alpaca. Wrapper for universe building."""
+    from alpaca.trading.requests import GetAssetsRequest
+    from alpaca.trading.enums import AssetStatus, AssetClass
+    
+    client = get_trading_client()
+    request = GetAssetsRequest(
+        status=AssetStatus.ACTIVE,
+        asset_class=AssetClass.US_EQUITY,
+    )
+    return client.get_all_assets(request)
 
 
 def get_account():
