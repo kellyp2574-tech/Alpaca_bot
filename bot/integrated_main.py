@@ -101,6 +101,13 @@ class IntegratedBot:
         self.mm_stage3_result = None
         self.mm_stages_completed = set()  # Track which stages have been run
         
+        # Per-stage filter counts for audit trail
+        self.mm_filter_counts = {}   # stage_name -> FilterCounts
+        self.mm_near_misses = []     # NearMiss list from final stage
+        
+        # One-shot latch: prevent repeated hard-exit/flatten spam
+        self.mm_hard_exit_done = False
+        
         # Initialize monitoring system
         try:
             self.monitor = get_session_monitor()
@@ -423,11 +430,16 @@ class IntegratedBot:
     
     def _supervise_mm_positions_until_hard_exit(self, now):
         """Supervise MM positions until hard exit time, regardless of EntryLoop status."""
+        # One-shot latch: once hard exit has been executed, never run again
+        if self.mm_hard_exit_done:
+            return
+        
         hard_exit_time = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
         
         if now.time() >= hard_exit_time:
             logger.info("Hard exit time reached - forcing MM positions flat")
             self._force_mm_positions_flat()
+            self.mm_hard_exit_done = True
             return
         
         # Check if we have any MM positions to supervise
@@ -531,6 +543,7 @@ class IntegratedBot:
                 self._force_mm_positions_flat()
             else:
                 logger.warning("MM supervisor: no active position manager, skipping force flat")
+            self.mm_hard_exit_done = True
             
         except Exception as e:
             logger.error(f"Critical error in MM position supervision: {e}")
@@ -539,6 +552,7 @@ class IntegratedBot:
                 self._force_mm_positions_flat()
             else:
                 logger.warning("MM supervisor: no active position manager, skipping emergency flatten")
+            self.mm_hard_exit_done = True
     
     def _force_mm_positions_flat(self):
         """Force all MM positions flat immediately."""
@@ -754,6 +768,65 @@ class IntegratedBot:
         except Exception as e:
             logger.error(f"Critical error in emergency MM flatten: {e}")
 
+    def _write_candidate_audit(self, now, candidates) -> None:
+        """Always write candidate audit JSON, even when candidates=0."""
+        import json
+        from dataclasses import asdict
+        try:
+            reports_dir = Path(__file__).resolve().parents[1] / "state" / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            
+            date_str = now.date().isoformat()
+            audit_path = reports_dir / f"mm_candidate_audit_{date_str}.json"
+            
+            # Build per-stage filter breakdown
+            filter_stages = {}
+            for stage_name, fc in self.mm_filter_counts.items():
+                filter_stages[stage_name] = asdict(fc)
+            
+            # Build near-miss list
+            near_miss_list = []
+            for nm in self.mm_near_misses[:25]:
+                near_miss_list.append({
+                    "symbol": nm.symbol,
+                    "reason": nm.reason,
+                    "detail": nm.detail,
+                })
+            
+            # Build candidate summary
+            candidate_list = []
+            for c in (candidates or [])[:50]:
+                candidate_list.append({
+                    "symbol": c.symbol,
+                    "price": round(c.price, 4),
+                    "prev_close": round(c.prev_close, 4),
+                    "gap_pct": round(c.gap_pct, 4),
+                })
+            
+            audit = {
+                "date": date_str,
+                "freeze_time": self.mm_config.candidate_freeze,
+                "stages_completed": sorted(self.mm_stages_completed),
+                "candidates_found": len(candidates) if candidates else 0,
+                "filter_counts_by_stage": filter_stages,
+                "near_misses": near_miss_list,
+                "candidates": candidate_list,
+                "config_snapshot": {
+                    "min_gap_pct": self.mm_config.min_gap_pct,
+                    "max_gap_pct": self.mm_config.max_gap_pct,
+                    "min_price": self.mm_config.min_price,
+                    "max_price": self.mm_config.max_price,
+                    "min_dollar_volume": self.mm_config.min_dollar_volume,
+                },
+            }
+            
+            with open(audit_path, "w") as f:
+                json.dump(audit, f, indent=2)
+            
+            logger.info(f"Candidate audit written to {audit_path}")
+        except Exception as e:
+            logger.error(f"Failed to write candidate audit: {e}")
+
     def run_morning_momentum(self, now) -> str:
         """Run morning momentum strategy with staged timeline.
         
@@ -781,6 +854,8 @@ class IntegratedBot:
                 self.mm_stage3_result = None
                 self.mm_stages_completed = set()
                 self.mm_candidates_date = today
+                self.mm_filter_counts = {}
+                self.mm_near_misses = []
             
             # Determine current stage based on time
             current_time = now.time()
@@ -788,6 +863,7 @@ class IntegratedBot:
             stage2_time = datetime.strptime(self.mm_config.first_refinement, "%H:%M").time()
             stage3_time = datetime.strptime(self.mm_config.second_refinement, "%H:%M").time()
             freeze_time = datetime.strptime(self.mm_config.candidate_freeze, "%H:%M").time()
+            post_open_retry_time = datetime.strptime("09:35", "%H:%M").time()
             
             # Stage 1: 8:30-8:40 broad filter (run once)
             if current_time >= stage1_time and 1 not in self.mm_stages_completed:
@@ -817,6 +893,8 @@ class IntegratedBot:
                 )
                 self.mm_stage1_result = result1.candidates
                 self.mm_stages_completed.add(1)
+                self.mm_filter_counts["stage1"] = result1.filter_counts
+                self.mm_near_misses = result1.near_misses
                 logger.info(f"Stage 1 complete: {len(self.mm_stage1_result)} candidates cached")
                 
                 # Record funnel metrics from Stage 1 ledger
@@ -862,6 +940,8 @@ class IntegratedBot:
                     )
                     self.mm_stage1_result = result1.candidates
                     self.mm_stages_completed.add(1)
+                    self.mm_filter_counts["stage1"] = result1.filter_counts
+                    self.mm_near_misses = result1.near_misses
                 
                 logger.info("Running Stage 2: First IEX refinement at %s", current_time.strftime('%H:%M'))
                 result2 = stage2_first_iex_refinement(
@@ -871,6 +951,8 @@ class IntegratedBot:
                 )
                 self.mm_stage2_result = result2.candidates
                 self.mm_stages_completed.add(2)
+                self.mm_filter_counts["stage2"] = result2.filter_counts
+                self.mm_near_misses = result2.near_misses
                 logger.info(f"Stage 2 complete: {len(self.mm_stage2_result)} candidates cached")
                 # Return to loop - don't block waiting for next stage
                 return "in_progress"  # Stage 2 done, more stages pending
@@ -901,6 +983,7 @@ class IntegratedBot:
                         )
                         self.mm_stage1_result = result1.candidates
                         self.mm_stages_completed.add(1)
+                        self.mm_filter_counts["stage1"] = result1.filter_counts
                     
                     result2 = stage2_first_iex_refinement(
                         self.mm_config,
@@ -909,6 +992,7 @@ class IntegratedBot:
                     )
                     self.mm_stage2_result = result2.candidates
                     self.mm_stages_completed.add(2)
+                    self.mm_filter_counts["stage2"] = result2.filter_counts
                 
                 logger.info("Running Stage 3: Second IEX refinement at %s", current_time.strftime('%H:%M'))
                 result3 = stage3_second_iex_refinement(
@@ -918,6 +1002,8 @@ class IntegratedBot:
                 )
                 self.mm_stage3_result = result3.candidates
                 self.mm_stages_completed.add(3)
+                self.mm_filter_counts["stage3"] = result3.filter_counts
+                self.mm_near_misses = result3.near_misses
                 logger.info(f"Stage 3 complete: {len(self.mm_stage3_result)} candidates cached")
                 # Return to loop - don't block waiting for freeze
                 return "in_progress"  # Stage 3 done, waiting for freeze
@@ -938,8 +1024,49 @@ class IntegratedBot:
                 logger.error("No stages completed - cannot proceed")
                 return "failed"
             
+            # ── Stage 4: Post-open retry ──────────────────────────────────
+            # If pre-open freeze yielded 0 candidates AND we're past 09:35,
+            # re-run Stage 3 with live post-open data. This catches days where
+            # pre-open gaps weren't visible but post-open momentum exists.
+            if not candidates and 4 not in self.mm_stages_completed:
+                if current_time < post_open_retry_time:
+                    logger.info(
+                        "Zero candidates at freeze; waiting for post-open retry at 09:35 "
+                        "(returning to loop)"
+                    )
+                    return "in_progress"
+                
+                logger.warning(
+                    "Zero candidates after pre-open freeze — running Stage 4 post-open retry at %s",
+                    current_time.strftime('%H:%M'),
+                )
+                
+                # Determine best input list for retry
+                retry_input = (
+                    self.mm_stage2_result
+                    or self.mm_stage1_result
+                    or []
+                )
+                if retry_input:
+                    result4 = stage3_second_iex_refinement(
+                        self.mm_config,
+                        self.mm_data.alpaca,
+                        retry_input,
+                    )
+                    candidates = result4.candidates
+                    self.mm_filter_counts["stage4_post_open"] = result4.filter_counts
+                    self.mm_near_misses = result4.near_misses
+                    logger.info(f"Stage 4 post-open retry: {len(candidates)} candidates found")
+                else:
+                    logger.warning("No stage 1/2 pool available for post-open retry")
+                
+                self.mm_stages_completed.add(4)
+            
+            # ── Always write candidate audit file ─────────────────────────
+            self._write_candidate_audit(now, candidates)
+            
             if not candidates:
-                logger.warning("No morning momentum candidates found")
+                logger.warning("No morning momentum candidates found (all stages exhausted)")
                 return "completed"  # No candidates but not an error
             
             logger.info("Candidates frozen at %s", self.mm_config.candidate_freeze)
