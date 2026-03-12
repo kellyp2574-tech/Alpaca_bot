@@ -93,6 +93,7 @@ class Snapshot:
     latest_quote: Optional[SnapshotQuote]
     daily_bar: Optional[SnapshotBar]
     prev_daily_bar: Optional[SnapshotBar]
+    minute_bar: Optional[SnapshotBar] = None
 
 
 class AlpacaDataAdapter:
@@ -313,6 +314,20 @@ class AlpacaDataAdapter:
                 yield seq[i:i+n]
 
         out: Dict[str, Snapshot] = {}
+        
+        # Aggregate normalization counters
+        _n_raw = 0
+        _n_has_lt = 0
+        _n_has_lq = 0
+        _n_has_db = 0
+        _n_has_pdb = 0
+        _n_has_mb = 0
+        _n_lt_ok = 0
+        _n_lq_ok = 0
+        _n_db_ok = 0
+        _n_pdb_ok = 0
+        _n_mb_ok = 0
+        _diag_logged = 0  # how many raw snapshots we've dumped so far
 
         for batch in chunk(symbols, 200):
             try:
@@ -336,62 +351,140 @@ class AlpacaDataAdapter:
                 except Exception:
                     logger.warning("Snapshot missing for %s", sym)
                     continue
+                
+                _n_raw += 1
+                
+                # ── Diagnostic: dump first 3 raw snapshots ────────────
+                if _diag_logged < 3:
+                    _diag_logged += 1
+                    try:
+                        logger.info(
+                            "SNAPSHOT DIAG [%s] type=%s repr=%.500s",
+                            sym, type(s).__name__, repr(s),
+                        )
+                        for attr_name in ("prev_daily_bar", "daily_bar", "latest_trade",
+                                          "latest_quote", "minute_bar"):
+                            raw_attr = getattr(s, attr_name, "MISSING_ATTR")
+                            if raw_attr == "MISSING_ATTR" and isinstance(s, dict):
+                                raw_attr = s.get(attr_name, "MISSING_KEY")
+                            logger.info(
+                                "  DIAG %s.%s type=%s repr=%.300s",
+                                sym, attr_name,
+                                type(raw_attr).__name__ if raw_attr not in ("MISSING_ATTR", "MISSING_KEY") else "N/A",
+                                repr(raw_attr),
+                            )
+                    except Exception as diag_err:
+                        logger.warning("SNAPSHOT DIAG error for %s: %s", sym, diag_err)
 
-                # latest trade
-                lt = getattr(s, "latest_trade", None)
+                # ── Helper: extract sub-object supporting both attr and dict ──
+                def _sub(parent, *names):
+                    """Get a sub-object from parent trying attr access then dict access."""
+                    if parent is None:
+                        return None
+                    for n in names:
+                        v = getattr(parent, n, None)
+                        if v is not None:
+                            return v
+                    if isinstance(parent, dict):
+                        for n in names:
+                            v = parent.get(n)
+                            if v is not None:
+                                return v
+                    return None
+                
+                def _num(obj, *names):
+                    """Extract a numeric value from obj trying multiple attr/key names."""
+                    if obj is None:
+                        return None
+                    for n in names:
+                        v = getattr(obj, n, None)
+                        if v is not None:
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                continue
+                    if isinstance(obj, dict):
+                        for n in names:
+                            v = obj.get(n)
+                            if v is not None:
+                                try:
+                                    return float(v)
+                                except (TypeError, ValueError):
+                                    continue
+                    return None
+
+                # ── latest trade ──
+                lt = _sub(s, "latest_trade", "latestTrade")
                 latest_trade = None
                 if lt is not None:
-                    p = getattr(lt, "price", None)
-                    if p is None:
-                        p = getattr(lt, "p", None)
+                    _n_has_lt += 1
+                    p = _num(lt, "price", "p")
                     if p is not None:
-                        latest_trade = SnapshotTrade(p=float(p))
+                        latest_trade = SnapshotTrade(p=p)
+                        _n_lt_ok += 1
 
-                # latest quote
-                lq = getattr(s, "latest_quote", None)
+                # ── latest quote ──
+                lq = _sub(s, "latest_quote", "latestQuote")
                 latest_quote = None
                 if lq is not None:
-                    bp = getattr(lq, "bid_price", None)
-                    ap = getattr(lq, "ask_price", None)
-                    if bp is None:
-                        bp = getattr(lq, "bp", None)
-                    if ap is None:
-                        ap = getattr(lq, "ap", None)
+                    _n_has_lq += 1
+                    bp = _num(lq, "bid_price", "bp", "bidPrice")
+                    ap = _num(lq, "ask_price", "ap", "askPrice")
                     if bp is not None and ap is not None:
-                        latest_quote = SnapshotQuote(bp=float(bp), ap=float(ap))
+                        latest_quote = SnapshotQuote(bp=bp, ap=ap)
+                        _n_lq_ok += 1
 
-                # daily + prev daily bars
-                db = getattr(s, "daily_bar", None)
-                pdb = getattr(s, "prev_daily_bar", None)
-
+                # ── daily bar ──
+                db = _sub(s, "daily_bar", "dailyBar")
                 daily_bar = None
                 if db is not None:
-                    c = getattr(db, "close", None)
-                    v = getattr(db, "volume", None)
-                    if c is None:
-                        c = getattr(db, "c", None)
-                    if v is None:
-                        v = getattr(db, "v", None)
+                    _n_has_db += 1
+                    c = _num(db, "close", "c")
+                    v = _num(db, "volume", "v") or 0
                     if c is not None:
-                        daily_bar = SnapshotBar(c=float(c), v=float(v or 0))
+                        daily_bar = SnapshotBar(c=c, v=v)
+                        _n_db_ok += 1
 
+                # ── prev daily bar ──
+                pdb = _sub(s, "prev_daily_bar", "prevDailyBar", "previous_daily_bar")
                 prev_daily_bar = None
                 if pdb is not None:
-                    c = getattr(pdb, "close", None)
-                    v = getattr(pdb, "volume", None)
-                    if c is None:
-                        c = getattr(pdb, "c", None)
-                    if v is None:
-                        v = getattr(pdb, "v", None)
+                    _n_has_pdb += 1
+                    c = _num(pdb, "close", "c")
+                    v = _num(pdb, "volume", "v") or 0
                     if c is not None:
-                        prev_daily_bar = SnapshotBar(c=float(c), v=float(v or 0))
+                        prev_daily_bar = SnapshotBar(c=c, v=v)
+                        _n_pdb_ok += 1
+
+                # ── minute bar ──
+                mb = _sub(s, "minute_bar", "minuteBar")
+                minute_bar = None
+                if mb is not None:
+                    _n_has_mb += 1
+                    c = _num(mb, "close", "c")
+                    v = _num(mb, "volume", "v") or 0
+                    if c is not None:
+                        minute_bar = SnapshotBar(c=c, v=v)
+                        _n_mb_ok += 1
 
                 out[sym] = Snapshot(
                     latest_trade=latest_trade,
                     latest_quote=latest_quote,
                     daily_bar=daily_bar,
                     prev_daily_bar=prev_daily_bar,
+                    minute_bar=minute_bar,
                 )
+
+        # ── Log aggregate normalization results ──
+        logger.info(
+            "Snapshot normalization: raw=%d | "
+            "lt(has=%d ok=%d) lq(has=%d ok=%d) "
+            "db(has=%d ok=%d) pdb(has=%d ok=%d) mb(has=%d ok=%d)",
+            _n_raw,
+            _n_has_lt, _n_lt_ok, _n_has_lq, _n_lq_ok,
+            _n_has_db, _n_db_ok, _n_has_pdb, _n_pdb_ok,
+            _n_has_mb, _n_mb_ok,
+        )
 
         return out
 

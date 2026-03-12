@@ -89,6 +89,14 @@ def _build_candidates_from_snapshots(
     # Collect near-miss gap data for audit (symbols closest to passing gap filter)
     _gap_rejects: List[Tuple[str, float, str]] = []  # (symbol, gap_pct, reason)
     
+    # Per-source diagnostic counters
+    _pc_from_pdb = 0   # prev_close from prev_daily_bar
+    _pc_from_db = 0    # prev_close from daily_bar (fallback)
+    _price_from_quote = 0
+    _price_from_trade = 0
+    _price_from_minute = 0
+    _price_from_daily = 0
+    
     logger.info(f"{stage_name}: Snapshot coverage {len(snapshots)}/{len(seed_symbols)} symbols")
     
     for sym in seed_symbols:
@@ -98,34 +106,81 @@ def _build_candidates_from_snapshots(
             continue
         fc.has_snapshot += 1
         
-        # Get prev close from Alpaca snapshot.prev_daily_bar (no Massive dependency)
+        # ── Extract prev_close ──
+        # Primary: prev_daily_bar.c  Fallback: daily_bar.c
         prev_close = 0.0
         if snap.prev_daily_bar is not None:
             prev_close = _safe_float(snap.prev_daily_bar.c)
+            if prev_close > 0:
+                _pc_from_pdb += 1
+        if prev_close <= 0 and snap.daily_bar is not None:
+            prev_close = _safe_float(snap.daily_bar.c)
+            if prev_close > 0:
+                _pc_from_db += 1
         
         if prev_close <= 0:
-            drops.append(Drop(sym, stage_name, "no_prev_close_from_snapshot", {}))
+            drops.append(Drop(sym, stage_name, "no_prev_close_from_snapshot", {
+                "pdb": repr(snap.prev_daily_bar),
+                "db": repr(snap.daily_bar),
+            }))
             continue
         fc.has_prev_close += 1
         
-        # Get current price (prefer quote mid)
-        lq = getattr(snap, "latest_quote", None)
-        lt = getattr(snap, "latest_trade", None)
-        
+        # ── Extract current price ──
+        # Priority: quote mid > latest trade > minute bar close > daily bar close
         price_now = 0.0
+        price_source = ""
+        
+        lq = snap.latest_quote
+        lt = snap.latest_trade
+        mb = getattr(snap, "minute_bar", None)
+        
+        # 1) Quote mid
         if lq is not None:
-            bp = _safe_float(getattr(lq, "bp", 0) or getattr(lq, "bid_price", 0))
-            ap = _safe_float(getattr(lq, "ap", 0) or getattr(lq, "ask_price", 0))
+            bp = _safe_float(lq.bp)
+            ap = _safe_float(lq.ap)
             if bp > 0 and ap > 0:
                 price_now = (bp + ap) / 2.0
+                price_source = "quote_mid"
         
+        # 2) Latest trade
         if price_now <= 0 and lt is not None:
-            price_now = _safe_float(getattr(lt, "p", 0) or getattr(lt, "price", 0))
+            p = _safe_float(lt.p)
+            if p > 0:
+                price_now = p
+                price_source = "latest_trade"
+        
+        # 3) Minute bar close
+        if price_now <= 0 and mb is not None:
+            c = _safe_float(mb.c)
+            if c > 0:
+                price_now = c
+                price_source = "minute_bar"
+        
+        # 4) Daily bar close (last resort)
+        if price_now <= 0 and snap.daily_bar is not None:
+            c = _safe_float(snap.daily_bar.c)
+            if c > 0:
+                price_now = c
+                price_source = "daily_bar"
         
         if price_now <= 0:
-            drops.append(Drop(sym, stage_name, "no_price", {}))
+            drops.append(Drop(sym, stage_name, "no_price", {
+                "lq": repr(lq), "lt": repr(lt),
+                "mb": repr(mb), "db": repr(snap.daily_bar),
+            }))
             continue
         fc.has_price += 1
+        
+        # Track source
+        if price_source == "quote_mid":
+            _price_from_quote += 1
+        elif price_source == "latest_trade":
+            _price_from_trade += 1
+        elif price_source == "minute_bar":
+            _price_from_minute += 1
+        elif price_source == "daily_bar":
+            _price_from_daily += 1
         
         # Exclusion filter
         if sym in cfg.excluded_symbols:
@@ -187,6 +242,11 @@ def _build_candidates_from_snapshots(
         f"scanned={fc.loaded_symbols} → snapshot={fc.has_snapshot} → prev_close={fc.has_prev_close} → "
         f"price={fc.has_price} → not_excluded={fc.not_excluded} → price_range={fc.passed_price_range} → "
         f"gap={fc.passed_gap} → final={fc.final_candidates}"
+    )
+    logger.info(
+        f"{stage_name} sources: prev_close(pdb={_pc_from_pdb} db={_pc_from_db}) "
+        f"price(quote={_price_from_quote} trade={_price_from_trade} "
+        f"minute={_price_from_minute} daily={_price_from_daily})"
     )
     
     return out, fc, near_misses
