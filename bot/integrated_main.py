@@ -228,7 +228,7 @@ class IntegratedBot:
                 symbol = getattr(pos, "symbol", None)
                 qty = float(getattr(pos, "qty", 0) or 0)
                 if symbol and abs(qty) > 0 and symbol not in known_symbols:
-                    logger.warning(f"⚠️ ORPHANED POSITION DETECTED: {symbol} qty={qty} - not tracked by bot")
+                    logger.warning(f"WARNING: ORPHANED POSITION DETECTED: {symbol} qty={qty} - not tracked by bot")
                     if self.monitor:
                         self.monitor.record_broker_event("position_mismatch")
         except Exception as e:
@@ -1037,7 +1037,7 @@ class IntegratedBot:
                     return "in_progress"
                 
                 logger.warning(
-                    "Zero candidates after pre-open freeze — running Stage 4 post-open retry at %s",
+                    "Zero candidates after pre-open freeze -- running Stage 4 post-open retry at %s",
                     current_time.strftime('%H:%M'),
                 )
                 

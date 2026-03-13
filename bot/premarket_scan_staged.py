@@ -239,9 +239,9 @@ def _build_candidates_from_snapshots(
     # Log per-filter summary
     logger.info(
         f"{stage_name} filter pipeline: "
-        f"scanned={fc.loaded_symbols} → snapshot={fc.has_snapshot} → prev_close={fc.has_prev_close} → "
-        f"price={fc.has_price} → not_excluded={fc.not_excluded} → price_range={fc.passed_price_range} → "
-        f"gap={fc.passed_gap} → final={fc.final_candidates}"
+        f"scanned={fc.loaded_symbols} -> snapshot={fc.has_snapshot} -> prev_close={fc.has_prev_close} -> "
+        f"price={fc.has_price} -> not_excluded={fc.not_excluded} -> price_range={fc.passed_price_range} -> "
+        f"gap={fc.passed_gap} -> final={fc.final_candidates}"
     )
     logger.info(
         f"{stage_name} sources: prev_close(pdb={_pc_from_pdb} db={_pc_from_db}) "

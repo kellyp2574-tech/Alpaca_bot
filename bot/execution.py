@@ -200,12 +200,30 @@ class ExecutionClient:
             logger.warning("Failed to check fractionable status for %s, returning None", symbol)
             return None
 
+    def get_order_status(self, order_id: str) -> Optional[FillResult]:
+        """Single-shot order status check by broker order_id.
+
+        Returns:
+            FillResult  -- order found; status reflects its state
+            None        -- transient error; caller should retry later
+        """
+        if self.dry_run or self.client is None:
+            return None
+        try:
+            order = self.client.get_order_by_id(order_id)
+            return self._order_to_fill_result(order)
+        except Exception as exc:
+            if _is_not_found(exc):
+                return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
+            logger.warning("Transient error polling order_id %s: %s", order_id, exc)
+            return None
+
     def find_order_by_client_id(self, client_order_id: str) -> Optional[FillResult]:
         """Search for an order by deterministic client_order_id. Used for crash recovery.
 
         Returns:
-            FillResult  — order found; status reflects its state
-            None        — transient error; caller should apply grace window
+            FillResult  -- order found; status reflects its state
+            None        -- transient error; caller should apply grace window
         """
         if self.dry_run or self.client is None:
             return None
@@ -250,7 +268,7 @@ class ExecutionClient:
                 original_qty = qty
                 qty = math.floor(qty)
                 logger.info(
-                    "%s not fractionable: %.2f shares → %d shares",
+                    "%s not fractionable: %.2f shares -> %d shares",
                     symbol, original_qty, qty
                 )
                 if qty <= 0:
