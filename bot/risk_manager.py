@@ -81,6 +81,10 @@ class RiskManager:
         self.realized_r_total += realized_r
         self._persist()
 
+    def persist_state(self) -> None:
+        """Public interface to save current risk state."""
+        self._persist()
+
     def _persist(self) -> None:
         if self.state_store:
             self.state_store.save_risk_state(self.to_dict())

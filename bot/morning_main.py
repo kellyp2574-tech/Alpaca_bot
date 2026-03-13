@@ -262,6 +262,16 @@ class EntryLoop:
         
         # Track attempt counts per symbol for audit trail
         self._symbol_attempts: Dict[str, int] = {}
+        
+        # Bar arrival tracking for diagnostics
+        self._bars_received_total = 0
+        self._bars_received_by_symbol: Dict[str, int] = {}
+        self._first_bar_symbols: set[str] = set()
+        self._last_bar_summary_ts = 0.0
+        
+        # Entry evaluation tracking for diagnostics
+        self._last_entry_diag_ts = 0.0
+        self._entry_skip_reasons: Dict[str, int] = {}
 
     def run(self) -> None:
         """Run the entry loop until entry cutoff."""
@@ -289,11 +299,28 @@ class EntryLoop:
         self._last_entry_cancel_check = 0.0
         self._last_pending_reconcile = 0.0
 
+        # ── Wait for entry window to open (accumulate bars while waiting) ──
+        _wait_logged = False
+        while market_now() < entry_window.start:
+            if not _wait_logged:
+                mins = (entry_window.start - market_now()).total_seconds() / 60.0
+                logger.info(
+                    "Entry window not open yet (starts %s, %.1f min away); "
+                    "accumulating bars while waiting...",
+                    entry_window.start.strftime("%H:%M"), mins,
+                )
+                _wait_logged = True
+            # Keep draining the bar queue so history builds up
+            self._process_stream_bars()
+            time.sleep(1.0)
+        
+        logger.info("Entry window now open — starting entry evaluation loop")
+
         try:
             while True:
                 now = market_now()
-                if not entry_window.contains(now):
-                    logger.info("Entry window closed")
+                if now >= entry_window.end:
+                    logger.info("Entry window closed (past %s)", entry_window.end.strftime("%H:%M"))
                     break
 
                 # Process any new bars
@@ -475,6 +502,7 @@ class EntryLoop:
 
     def _process_stream_bars(self) -> None:
         """Process any new bars from the stream."""
+        bars_this_call = 0
         while True:
             bar = self.alpaca.next_bar(timeout=0.1)
             if bar is None:
@@ -487,6 +515,28 @@ class EntryLoop:
 
             # Update position manager with new bar
             self.positions.on_bar(symbol, bar)
+            
+            # ── Bar arrival diagnostics ──
+            bars_this_call += 1
+            self._bars_received_total += 1
+            self._bars_received_by_symbol[symbol] = self._bars_received_by_symbol.get(symbol, 0) + 1
+            
+            if symbol not in self._first_bar_symbols:
+                self._first_bar_symbols.add(symbol)
+                logger.info(
+                    "FIRST BAR %s: c=%.2f v=%d ts=%s (symbols_with_bars=%d)",
+                    symbol, bar.c, bar.v, bar.timestamp, len(self._first_bar_symbols),
+                )
+        
+        # Periodic bar summary (every 60s)
+        now_mono = time.monotonic()
+        if self._bars_received_total > 0 and now_mono - self._last_bar_summary_ts >= 60.0:
+            self._last_bar_summary_ts = now_mono
+            syms_with_5plus = sum(1 for s, cnt in self._bars_received_by_symbol.items() if cnt >= 5)
+            logger.info(
+                "BAR SUMMARY: total=%d symbols_any=%d symbols_5plus=%d",
+                self._bars_received_total, len(self._bars_received_by_symbol), syms_with_5plus,
+            )
 
     def _refresh_quotes(self) -> None:
         """Refresh latest quotes for all symbols using IEX feed."""
@@ -765,44 +815,57 @@ class EntryLoop:
                 
                 self._allocations_calculated = True
                 
-                logger.debug(
-                    "Dynamic allocations calculated: %d positions, $%.0f total deploy",
+                logger.info(
+                    "ALLOCATIONS: %d positions sized, $%.0f total deploy, cash=$%.0f",
                     len(self._position_allocations),
                     deploy_dollars,
+                    actual_cash,
                 )
                 
-                # Log top 5 allocations
+                # Log top allocations at INFO so they're always visible
                 sorted_allocs = sorted(self._position_allocations.items(), key=lambda x: x[1], reverse=True)
                 for sym, amt in sorted_allocs[:5]:
                     cand = next((c for c in self.ctx.watchlist if c.symbol == sym), None)
                     liq = cand.liq_5m_dollar if cand else 0
-                    logger.debug(f"  {sym}: ${amt:.0f} (liq=${liq:,.0f})")
+                    logger.info(f"  ALLOC {sym}: ${amt:.0f} (liq_5m=${liq:,.0f})")
+                if not self._position_allocations:
+                    logger.warning("ALLOCATIONS: zero positions allocated — check liquidity/volume constraints")
+        
+        # ── Per-cycle skip reason tracking ──
+        _skip = {"has_position": 0, "done_today": 0, "few_bars": 0, "few_rth_bars": 0,
+                 "low_5m_vol": 0, "no_breakout": 0, "risk_block": 0, "no_alloc": 0,
+                 "not_allocated_yet": 0, "evaluated": 0}
         
         for candidate in self.ctx.watchlist:
             symbol = candidate.symbol
             
             # Skip if we already have a position
             if self.positions.has_position(symbol):
+                _skip["has_position"] += 1
                 continue
             
             # Skip if symbol is "done for today"
             if symbol in self._done_today_symbols:
+                _skip["done_today"] += 1
                 continue
 
             # Check we have enough bars
             bars = list(self.bar_history.get(symbol, []))
             if len(bars) < 5:
+                _skip["few_bars"] += 1
                 continue
 
             # Check we have RTH bars (regular trading hours)
             rth_bars = [b for b in bars if b.timestamp >= self.market_open_dt]
             if len(rth_bars) < 5:
+                _skip["few_rth_bars"] += 1
                 continue
 
             # First 5-minute dollar volume check
             first_5min_bars = rth_bars[:5]
             dollar_vol_5min = sum(bar.v * bar.c for bar in first_5min_bars)
             if dollar_vol_5min < cfg.min_5min_volume:
+                _skip["low_5m_vol"] += 1
                 continue
 
             # Get entry price (latest quote or last bar close) - BEFORE breakout check
@@ -815,19 +878,26 @@ class EntryLoop:
             # Opening Breakout Filter: use entry_price for consistency
             first_1min_high = rth_bars[0].h
             if cfg.opening_breakout and entry_price <= first_1min_high:
+                _skip["no_breakout"] += 1
                 continue
 
             # Risk check
             open_positions = self.positions.open_count
             can_enter, reason = self.risk_manager.can_enter(open_positions)
             if not can_enter:
+                _skip["risk_block"] += 1
                 continue
             
             # Get allocated amount for this symbol
+            if not self._allocations_calculated:
+                _skip["not_allocated_yet"] += 1
+                continue
             target_notional_per_position = self._position_allocations.get(symbol, 0.0)
             if target_notional_per_position <= 0:
-                # Symbol not allocated (too low volume or filtered out)
+                _skip["no_alloc"] += 1
                 continue
+            
+            _skip["evaluated"] += 1
             
             # Check daily deploy cap
             can_deploy, allowed_amount = self.risk_manager.can_deploy_amount(target_notional_per_position)
@@ -875,6 +945,13 @@ class EntryLoop:
             # Create entry decision and execute
             decision = EntryDecision(symbol, True, "entry_signal", qty, entry_price, stop_price)
             self._execute_entry(decision)
+
+        # ── Periodic entry evaluation summary (every 60s) ──
+        now_mono = time.monotonic()
+        if now_mono - self._last_entry_diag_ts >= 60.0:
+            self._last_entry_diag_ts = now_mono
+            parts = " ".join(f"{k}={v}" for k, v in _skip.items() if v > 0)
+            logger.info("ENTRY EVAL: watchlist=%d | %s", len(self.ctx.watchlist), parts or "no_symbols_checked")
 
     def _execute_entry(self, decision: EntryDecision) -> None:
         """Execute an entry order."""
