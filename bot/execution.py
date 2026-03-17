@@ -211,9 +211,16 @@ class ExecutionClient:
             return None
         try:
             order = self.client.get_order_by_id(order_id)
-            return self._order_to_fill_result(order)
+            raw_status = getattr(order.status, "value", str(order.status))
+            result = self._order_to_fill_result(order)
+            logger.debug(
+                "get_order_status(%s): raw=%s -> mapped=%s  filled=%.4f",
+                order_id, raw_status, result.status, result.filled_qty,
+            )
+            return result
         except Exception as exc:
             if _is_not_found(exc):
+                logger.info("get_order_status(%s): 404 not found -> unfilled", order_id)
                 return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
             logger.warning("Transient error polling order_id %s: %s", order_id, exc)
             return None
@@ -340,26 +347,62 @@ class ExecutionClient:
     def _order_to_fill_result(
         order: Any, *, fallback_price: float = 0.0
     ) -> FillResult:
-        """Map an Alpaca order object to a FillResult with correct terminal status."""
+        """Map an Alpaca order object to a FillResult with correct terminal status.
+
+        Uses getattr(status, 'value', ...) for robust enum-to-string conversion
+        across all Python versions and alpaca-py SDK variants.
+        """
         order_id = str(order.id)
-        status = str(order.status).lower()
+        raw_status = order.status
+        status = getattr(raw_status, "value", str(raw_status)).lower()
         filled_qty = float(order.filled_qty or 0)
         avg_price = float(order.filled_avg_price or fallback_price)
 
+        # ── Terminal: fully filled ──
         if status == "filled":
             return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="filled")
 
-        if status == "partially_filled":
-            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
-
+        # ── Terminal: canceled / expired (IOC auto-cancel, DAY expired, user cancel) ──
         if status in {"canceled", "expired"}:
-            # IOC cancel: if any shares filled, that's a partial; otherwise unfilled
             if filled_qty > 0:
                 return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
             return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
 
+        # ── Terminal: done_for_day (order will receive no more fills this session) ──
+        if status == "done_for_day":
+            if filled_qty > 0:
+                return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="filled")
+            return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
+
+        # ── Terminal: rejected by broker ──
         if status == "rejected":
             return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
 
-        # new, accepted, pending_new, held, done_for_day, etc. — not yet terminal
-        return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="unknown")
+        # ── Terminal: replaced (original order dead, replacement is separate) ──
+        if status == "replaced":
+            if filled_qty > 0:
+                return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
+            return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
+
+        # ── Terminal: suspended / stopped ──
+        if status in {"suspended", "stopped"}:
+            if filled_qty > 0:
+                return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
+            return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unfilled")
+
+        # ── In-flight: still processing ──
+        if status in {"partially_filled", "new", "accepted", "pending_new",
+                       "held", "pending_cancel", "pending_replace",
+                       "accepted_for_bidding", "calculated"}:
+            if status == "partially_filled":
+                return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
+            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="unknown")
+
+        # ── Unrecognized: log the raw value so we can diagnose ──
+        logger.error(
+            "UNRECOGNIZED ORDER STATUS: raw=%r  normalized='%s'  order_id=%s  filled=%.4f",
+            raw_status, status, order_id, filled_qty,
+        )
+        if filled_qty > 0:
+            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
+        return FillResult(order_id=order_id, filled_qty=0.0, avg_price=0.0, status="unknown")

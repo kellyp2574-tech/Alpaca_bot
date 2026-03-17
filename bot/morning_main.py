@@ -600,12 +600,17 @@ class EntryLoop:
         quotes = self.alpaca.get_latest_quotes(symbols, feed=feed)
         self.latest_quotes.update(quotes)
 
-    def _reconcile_pending_entries(self, now: datetime) -> None:
-        """Reconcile pending entries (DAY orders that returned unknown status).
+    # TIF-aware reconciliation timeouts (seconds)
+    _IOC_UNKNOWN_TIMEOUT_S = 15.0     # IOC should resolve in <1s; 15s is very generous
+    _DAY_UNKNOWN_TIMEOUT_S = 120.0    # DAY orders may sit open for a while
+    _STALE_HARD_TIMEOUT_S = 300.0     # Absolute max before forced clear
 
-        Uses order_id-based polling as primary (more reliable), falls back to
-        client_order_id lookup, and ultimately checks broker positions for
-        entries stuck too long.
+    def _reconcile_pending_entries(self, now: datetime) -> None:
+        """Reconcile pending entries into terminal state.
+
+        Uses order_id-based polling as primary, falls back to client_order_id,
+        and applies TIF-aware timeouts with broker position fallback.
+        Unknown status CANNOT persist indefinitely.
         """
         pending_entries = self.ctx.state_store.load_pending_entries()
         if not pending_entries:
@@ -614,8 +619,11 @@ class EntryLoop:
         for client_order_id, pending in list(pending_entries.items()):
             symbol = pending.symbol
             age_s = time.time() - pending.submitted_ts if pending.submitted_ts > 0 else 0.0
+            tif = getattr(pending, "tif", "ioc")
+            unknown_timeout = (self._IOC_UNKNOWN_TIMEOUT_S if tif == "ioc"
+                               else self._DAY_UNKNOWN_TIMEOUT_S)
 
-            # Skip if already in positions (filled and reconciled)
+            # Skip if already in positions (filled and reconciled elsewhere)
             if symbol in self.positions.positions:
                 logger.info("RECONCILE %s: already in positions, clearing pending", symbol)
                 self.ctx.state_store.clear_pending_entry(client_order_id)
@@ -640,51 +648,56 @@ class EntryLoop:
                         symbol, client_order_id, age_s,
                     )
 
-            # -- Ultimate fallback: if pending > 120s, check broker position --
-            if fill is None and age_s > 120:
-                broker_qty = self.ctx.execution._get_broker_qty(symbol)
-                if broker_qty is not None and broker_qty > 0:
-                    logger.warning(
-                        "RECONCILE %s: API lookup failed but broker has %.4f shares "
-                        "(age=%.0fs) -- adopting broker position",
-                        symbol, broker_qty, age_s,
-                    )
-                    fill = FillResult(
-                        order_id=pending.order_id,
-                        filled_qty=broker_qty,
-                        avg_price=pending.intended_price,
-                        status="filled",
-                    )
-
+            # -- Handle complete lookup failure (both returned None) --
             if fill is None:
-                # All lookups failed -- retry next cycle
-                if age_s > 300:
-                    logger.error(
-                        "RECONCILE %s: all lookups failing for %.0fs -- clearing stale pending",
-                        symbol, age_s,
-                    )
-                    self.ctx.state_store.clear_pending_entry(client_order_id)
-                    self._done_today_symbols.add(symbol)
-                continue
+                if age_s > unknown_timeout:
+                    # Past timeout with no API response at all -- check broker
+                    broker_qty = self.ctx.execution._get_broker_qty(symbol)
+                    if broker_qty is not None and broker_qty > 0:
+                        logger.warning(
+                            "RECONCILE %s: API lookup failed but broker has %.4f shares "
+                            "(age=%.0fs, tif=%s) -- adopting",
+                            symbol, broker_qty, age_s, tif,
+                        )
+                        fill = FillResult(
+                            order_id=pending.order_id,
+                            filled_qty=broker_qty,
+                            avg_price=pending.intended_price,
+                            status="filled",
+                        )
+                    elif age_s > self._STALE_HARD_TIMEOUT_S:
+                        logger.error(
+                            "RECONCILE %s: all lookups failing for %.0fs, no broker position "
+                            "-- clearing as lost (tif=%s)",
+                            symbol, age_s, tif,
+                        )
+                        self.ctx.state_store.clear_pending_entry(client_order_id)
+                        self._done_today_symbols.add(symbol)
+                    # else: under hard timeout, retry next cycle
+                if fill is None:
+                    continue
 
-            # -- Handle terminal statuses --
+            # -- Compute latency for monitoring --
             submitted_ts_mono = pending.submitted_ts_mono if pending.submitted_ts_mono > 0 else 0.0
             latency = time.monotonic() - submitted_ts_mono if submitted_ts_mono > 0 else 0.0
 
+            # -- Handle terminal: filled --
             if fill.status in {"filled", "dry_run"}:
                 logger.info(
-                    "RECONCILED ENTRY %s qty=%.4f @ %.2f (age=%.0fs)",
-                    symbol, fill.filled_qty, fill.avg_price, age_s,
+                    "RECONCILED ENTRY %s qty=%.4f @ %.2f (age=%.0fs, tif=%s)",
+                    symbol, fill.filled_qty, fill.avg_price, age_s, tif,
                 )
                 self._adopt_reconciled_entry(
                     symbol, fill, pending, client_order_id, latency,
                 )
+                continue
 
-            elif fill.status == "partial":
+            # -- Handle terminal: partial fill --
+            if fill.status == "partial":
                 if fill.filled_qty > 0:
                     logger.warning(
-                        "RECONCILED PARTIAL ENTRY %s qty=%.4f @ %.2f (age=%.0fs)",
-                        symbol, fill.filled_qty, fill.avg_price, age_s,
+                        "RECONCILED PARTIAL ENTRY %s qty=%.4f @ %.2f (age=%.0fs, tif=%s)",
+                        symbol, fill.filled_qty, fill.avg_price, age_s, tif,
                     )
                     self._adopt_reconciled_entry(
                         symbol, fill, pending, client_order_id, latency,
@@ -697,11 +710,13 @@ class EntryLoop:
                     )
                     self.ctx.state_store.clear_pending_entry(client_order_id)
                     self._done_today_symbols.add(symbol)
+                continue
 
-            elif fill.status in {"unfilled", "canceled", "expired", "rejected"}:
-                # Terminal failure -- check if broker has shares anyway (race condition)
+            # -- Handle terminal: unfilled / canceled / expired / rejected --
+            if fill.status in {"unfilled", "canceled", "expired", "rejected"}:
+                # Check if broker has shares anyway (race condition / status lag)
                 broker_qty = None
-                if fill.status == "unfilled" and age_s > 10:
+                if age_s > 5:
                     broker_qty = self.ctx.execution._get_broker_qty(symbol)
 
                 if broker_qty is not None and broker_qty > 0:
@@ -735,14 +750,57 @@ class EntryLoop:
                     )
                 except Exception:
                     pass
+                continue
 
+            # -- Handle "unknown" -- order still in-flight per broker --
+            # This is where SNXX was stuck forever. Apply TIF-aware timeout.
+            if age_s <= unknown_timeout:
+                # Under timeout: genuinely in-flight, log and retry next cycle
+                logger.info(
+                    "RECONCILE %s: status=%s age=%.0fs (timeout=%.0fs, tif=%s, order_id=%s) -- waiting",
+                    symbol, fill.status, age_s, unknown_timeout, tif, pending.order_id,
+                )
+                continue
+
+            # Past timeout: order should have resolved by now. Check broker.
+            logger.warning(
+                "RECONCILE %s: status=%s PAST TIMEOUT (age=%.0fs > %.0fs, tif=%s) -- checking broker",
+                symbol, fill.status, age_s, unknown_timeout, tif,
+            )
+            broker_qty = self.ctx.execution._get_broker_qty(symbol)
+
+            if broker_qty is not None and broker_qty > 0:
+                logger.warning(
+                    "RECONCILE %s: unknown order but broker has %.4f shares -- adopting as filled",
+                    symbol, broker_qty,
+                )
+                adopted_fill = FillResult(
+                    order_id=fill.order_id or pending.order_id,
+                    filled_qty=broker_qty,
+                    avg_price=fill.avg_price if fill.avg_price > 0 else pending.intended_price,
+                    status="filled",
+                )
+                self._adopt_reconciled_entry(
+                    symbol, adopted_fill, pending, client_order_id, latency,
+                )
             else:
-                # "unknown" -- still in flight, log periodically
-                if age_s > 30:
-                    logger.info(
-                        "RECONCILE %s: still unknown after %.0fs (order_id=%s)",
-                        symbol, age_s, pending.order_id,
+                # No broker position + past timeout = order is dead
+                logger.warning(
+                    "RECONCILE %s: unknown order, no broker position, past %s timeout "
+                    "-- clearing as expired (age=%.0fs)",
+                    symbol, tif.upper(), age_s,
+                )
+                self.ctx.state_store.clear_pending_entry(client_order_id)
+                self._done_today_symbols.add(symbol)
+                try:
+                    monitor = get_session_monitor()
+                    monitor.update_entry_order(
+                        client_order_id=client_order_id,
+                        status="expired",
+                        time_to_first_fill_s=latency,
                     )
+                except Exception:
+                    pass
 
     def _adopt_reconciled_entry(
         self,
@@ -1103,6 +1161,7 @@ class EntryLoop:
         submit_ts_wall = time.time()
         submit_ts_mono = time.monotonic()
         
+        is_fractional = (decision.qty % 1) != 0
         pending_state = PendingEntryState(
             symbol=decision.symbol,
             client_order_id=_entry_client_id(decision.symbol, attempt),
@@ -1112,6 +1171,7 @@ class EntryLoop:
             intended_qty=decision.qty,
             intended_price=decision.entry_price,
             stop_pct=(decision.entry_price - decision.stop_price) / decision.entry_price,
+            tif="day" if is_fractional else "ioc",
         )
         self.ctx.state_store.save_pending_entry(pending_state)
         
@@ -1276,43 +1336,141 @@ def _reconcile_pending_entries(
     state_store: StateStore,
     positions: PositionManager,
 ) -> None:
-    """Reconcile any pending entry orders from previous session."""
+    """Reconcile pending entry orders at startup.
+
+    This runs once at the beginning of each session.  It must resolve every
+    pending entry into a terminal state -- filled (adopt position), or
+    cleared.  Nothing is "retained for follow-up" across sessions.
+
+    Resolution priority:
+      1. Purge ancient entries (prior calendar day, or no order_id + age > 60s)
+      2. Poll by order_id (primary)
+      3. Poll by client_order_id (fallback)
+      4. Check broker position for the symbol (ultimate fallback)
+      5. If still unknown, treat as lost/expired and clear
+    """
     pending = state_store.load_pending_entries()
     if not pending:
         return
 
-    logger.info(f"Reconciling {len(pending)} pending entries")
+    now_epoch = time.time()
+    today_date = datetime.now(MARKET_TZ).date()
+
+    logger.info("STARTUP RECONCILE: %d pending entries to resolve", len(pending))
     cleared_ids = []
-    unresolved = []
-    for client_order_id, pending_state in pending.items():
-        fill = execution.find_order_by_client_id(client_order_id)
-        if fill is None:
-            logger.warning(f"Pending entry {client_order_id} transient lookup failure; keeping for retry")
-            unresolved.append(client_order_id)
+
+    for client_order_id, ps in list(pending.items()):
+        symbol = ps.symbol
+        age_s = now_epoch - ps.submitted_ts if ps.submitted_ts > 0 else 999999
+
+        # ── Step 1: Purge stale entries that cannot possibly be resolved ──
+        # Prior calendar day
+        from datetime import date as _date_type
+        entry_date = datetime.fromtimestamp(ps.submitted_ts, tz=MARKET_TZ).date() if ps.submitted_ts > 0 else None
+        if entry_date is not None and entry_date < today_date:
+            logger.warning(
+                "STARTUP PURGE %s (%s): from prior session %s (age=%.0fs) -- clearing",
+                symbol, client_order_id, entry_date.isoformat(), age_s,
+            )
+            cleared_ids.append(client_order_id)
             continue
 
-        if fill.status in {"filled", "dry_run"}:
-            positions.open_position(
-                pending_state.symbol,
-                fill.filled_qty,
-                fill.avg_price,
-                pending_state.stop_pct,
-                entry_order_id=fill.order_id,
-                entry_client_order_id=client_order_id,
+        # No order_id and old enough that it will never resolve by order lookup
+        if ps.order_id is None and age_s > 60:
+            logger.warning(
+                "STARTUP PURGE %s (%s): no order_id and age=%.0fs -- clearing",
+                symbol, client_order_id, age_s,
             )
-            logger.info(f"Recovered position {pending_state.symbol}")
             cleared_ids.append(client_order_id)
-        elif fill.status in {"partial", "unknown"}:
-            logger.warning(f"Pending entry {client_order_id} status {fill.status}; retaining for follow-up")
-            unresolved.append(client_order_id)
-        else:
-            logger.warning(f"Pending entry {client_order_id} status: {fill.status}; clearing")
+            continue
+
+        # ── Step 2: Try order_id lookup (most reliable) ──
+        fill = None
+        if ps.order_id:
+            fill = execution.get_order_status(ps.order_id)
+            if fill is not None:
+                logger.info(
+                    "STARTUP RECONCILE %s: order_id %s -> status=%s filled=%.4f",
+                    symbol, ps.order_id, fill.status, fill.filled_qty,
+                )
+
+        # ── Step 3: Fallback to client_order_id lookup ──
+        if fill is None:
+            fill = execution.find_order_by_client_id(client_order_id)
+            if fill is not None:
+                logger.info(
+                    "STARTUP RECONCILE %s: client_id %s -> status=%s filled=%.4f",
+                    symbol, client_order_id, fill.status, fill.filled_qty,
+                )
+            else:
+                logger.warning(
+                    "STARTUP RECONCILE %s: both order lookups returned None (transient error)",
+                    symbol,
+                )
+
+        # ── Step 4: Handle terminal statuses from lookup ──
+        if fill is not None and fill.status in {"filled", "dry_run"}:
+            if fill.filled_qty > 0 and symbol not in positions.positions:
+                positions.open_position(
+                    ps.symbol,
+                    fill.filled_qty,
+                    fill.avg_price,
+                    ps.stop_pct,
+                    entry_order_id=fill.order_id,
+                    entry_client_order_id=client_order_id,
+                )
+                logger.info("STARTUP RECONCILE %s: recovered position qty=%.4f @ %.2f",
+                            symbol, fill.filled_qty, fill.avg_price)
             cleared_ids.append(client_order_id)
+            continue
 
-    for client_order_id in cleared_ids:
-        state_store.clear_pending_entry(client_order_id)
+        if fill is not None and fill.status == "partial" and fill.filled_qty > 0:
+            if symbol not in positions.positions:
+                positions.open_position(
+                    ps.symbol,
+                    fill.filled_qty,
+                    fill.avg_price,
+                    ps.stop_pct,
+                    entry_order_id=fill.order_id,
+                    entry_client_order_id=client_order_id,
+                )
+                logger.info("STARTUP RECONCILE %s: recovered partial position qty=%.4f @ %.2f",
+                            symbol, fill.filled_qty, fill.avg_price)
+            cleared_ids.append(client_order_id)
+            continue
 
-    if cleared_ids:
-        logger.info(f"Cleared {len(cleared_ids)} reconciled pending entries")
-    if unresolved:
-        logger.info(f"{len(unresolved)} pending entries retained for retry")
+        if fill is not None and fill.status in {"unfilled", "canceled", "expired", "rejected"}:
+            logger.info("STARTUP RECONCILE %s: order %s -- clearing", symbol, fill.status)
+            cleared_ids.append(client_order_id)
+            continue
+
+        # ── Step 5: Unknown / lookup failed -- check broker position as last resort ──
+        broker_qty = execution._get_broker_qty(symbol)
+        if broker_qty is not None and broker_qty > 0:
+            logger.warning(
+                "STARTUP RECONCILE %s: order unresolved but broker has %.4f shares -- adopting",
+                symbol, broker_qty,
+            )
+            if symbol not in positions.positions:
+                positions.open_position(
+                    ps.symbol,
+                    broker_qty,
+                    ps.intended_price,
+                    ps.stop_pct,
+                    entry_order_id=ps.order_id,
+                    entry_client_order_id=client_order_id,
+                )
+            cleared_ids.append(client_order_id)
+            continue
+
+        # ── Step 6: No broker position, no resolvable order -- clear as lost ──
+        logger.warning(
+            "STARTUP RECONCILE %s: unresolvable (status=%s, broker_qty=%s, age=%.0fs) -- clearing as lost",
+            symbol, fill.status if fill else "no_response", broker_qty, age_s,
+        )
+        cleared_ids.append(client_order_id)
+
+    for cid in cleared_ids:
+        state_store.clear_pending_entry(cid)
+
+    logger.info("STARTUP RECONCILE: cleared %d / %d pending entries", len(cleared_ids), len(pending))

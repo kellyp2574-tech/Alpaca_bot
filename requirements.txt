@@ -1,5 +1,18 @@
-yfinance>=0.2.31
-pandas>=2.0.0
+# Core trading
 alpaca-py>=0.21.0
 python-dotenv>=1.0.0
+
+# Market data
+yfinance>=0.2.31
 massive>=1.0.0
+
+# Required by alpaca-py for live streaming (StockDataStream)
+websockets>=12.0
+
+# Data / utilities
+pandas>=2.0.0
+numpy>=1.24.0
+pydantic>=2.0.0
+requests>=2.28.0
+msgpack>=1.0.0
+sseclient-py>=1.7.0

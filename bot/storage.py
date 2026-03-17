@@ -83,6 +83,7 @@ class PendingEntryState:
     cancel_requested_ts: float = 0.0   # epoch seconds of last cancel attempt (0 = never)
     cancel_attempts: int = 0           # number of cancel attempts made
     order_id: Optional[str] = None     # broker order_id for direct polling fallback
+    tif: str = "ioc"                   # time-in-force: "ioc" or "day"
 
 
 def pending_entry_to_dict(p: PendingEntryState) -> Dict[str, Any]:
@@ -98,6 +99,7 @@ def pending_entry_to_dict(p: PendingEntryState) -> Dict[str, Any]:
         "cancel_requested_ts": p.cancel_requested_ts,
         "cancel_attempts": p.cancel_attempts,
         "order_id": p.order_id,
+        "tif": p.tif,
     }
 
 
@@ -114,6 +116,7 @@ def pending_entry_from_dict(payload: Dict[str, Any]) -> PendingEntryState:
         cancel_requested_ts=float(payload.get("cancel_requested_ts", 0.0)),
         cancel_attempts=int(payload.get("cancel_attempts", 0)),
         order_id=payload.get("order_id"),
+        tif=payload.get("tif", "ioc"),
     )
 
 

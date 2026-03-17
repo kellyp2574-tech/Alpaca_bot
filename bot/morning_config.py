@@ -34,7 +34,7 @@ class Config:
     min_dollar_volume: float = 10_000_000  # $10M ADV floor (20-day average daily volume)
     min_5min_volume: float = 250_000  # $250K first 5-min dollar volume (enforced in EntryLoop)
     min_gap_pct: float = 0.05  # 5% min gap
-    max_gap_pct: float = 0.25  # 25% max gap
+    max_gap_pct: float = 0.25  # 25% max gap (filters stock splits / fake gaps)
     opening_breakout: bool = True  # Enter only if price > first 1-min bar high
     max_seed_universe: int = 4000  # Max symbols from Massive snapshot (8:30 AM universe build)
     first_filter_pool_size: int = 800  # Max after delayed_sip broad filter (8:30-8:40)
