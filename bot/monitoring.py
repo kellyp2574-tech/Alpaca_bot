@@ -547,7 +547,7 @@ class SessionMonitor:
         self.entry_orders.append(metric)
 
         # Update dashboard (only for new entries, not updates)
-        if status != "unknown":  # Don't count unknown/pending as attempted yet
+        if status not in {"unknown", "live"}:  # Don't count in-flight/pending as attempted yet
             self._daily_entries_attempted += 1
             self.dashboard.entries_attempted = self._daily_entries_attempted
         if status == "filled":
@@ -621,7 +621,7 @@ class SessionMonitor:
                 # Update dashboard counters based on status change
                 if status is not None and status != old_status:
                     # Remove old status count
-                    if old_status == "unknown":
+                    if old_status in {"unknown", "live"}:
                         # Now it's resolved, count as attempted
                         self._daily_entries_attempted += 1
                         self.dashboard.entries_attempted = self._daily_entries_attempted

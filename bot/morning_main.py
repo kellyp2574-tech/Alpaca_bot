@@ -601,7 +601,7 @@ class EntryLoop:
         self.latest_quotes.update(quotes)
 
     # TIF-aware reconciliation timeouts (seconds)
-    _IOC_UNKNOWN_TIMEOUT_S = 15.0     # IOC should resolve in <1s; 15s is very generous
+    _IOC_UNKNOWN_TIMEOUT_S = 7.0      # IOC should resolve in <1s; 7s is generous
     _DAY_UNKNOWN_TIMEOUT_S = 120.0    # DAY orders may sit open for a while
     _STALE_HARD_TIMEOUT_S = 300.0     # Absolute max before forced clear
 
@@ -752,27 +752,28 @@ class EntryLoop:
                     pass
                 continue
 
-            # -- Handle "unknown" -- order still in-flight per broker --
-            # This is where SNXX was stuck forever. Apply TIF-aware timeout.
+            # -- Handle "live" / "unknown" -- not yet terminal --
+            # "live" = broker confirms order exists and is processing
+            # "unknown" = couldn't determine truth (API error, unrecognized status)
             if age_s <= unknown_timeout:
-                # Under timeout: genuinely in-flight, log and retry next cycle
+                # Under timeout: log and retry next cycle
                 logger.info(
-                    "RECONCILE %s: status=%s age=%.0fs (timeout=%.0fs, tif=%s, order_id=%s) -- waiting",
+                    "RECONCILE %s: status=%s age=%.0fs (timeout=%.0fs, tif=%s, order_id=%s)",
                     symbol, fill.status, age_s, unknown_timeout, tif, pending.order_id,
                 )
                 continue
 
             # Past timeout: order should have resolved by now. Check broker.
             logger.warning(
-                "RECONCILE %s: status=%s PAST TIMEOUT (age=%.0fs > %.0fs, tif=%s) -- checking broker",
-                symbol, fill.status, age_s, unknown_timeout, tif,
+                "RECONCILE %s: status=%s PAST %s TIMEOUT (age=%.0fs > %.0fs) -- checking broker position",
+                symbol, fill.status, tif.upper(), age_s, unknown_timeout,
             )
             broker_qty = self.ctx.execution._get_broker_qty(symbol)
 
             if broker_qty is not None and broker_qty > 0:
                 logger.warning(
-                    "RECONCILE %s: unknown order but broker has %.4f shares -- adopting as filled",
-                    symbol, broker_qty,
+                    "RECONCILE %s: %s order but broker has %.4f shares -- adopting as filled",
+                    symbol, fill.status, broker_qty,
                 )
                 adopted_fill = FillResult(
                     order_id=fill.order_id or pending.order_id,
@@ -786,9 +787,9 @@ class EntryLoop:
             else:
                 # No broker position + past timeout = order is dead
                 logger.warning(
-                    "RECONCILE %s: unknown order, no broker position, past %s timeout "
+                    "RECONCILE %s: %s order, no broker position, past %s timeout "
                     "-- clearing as expired (age=%.0fs)",
-                    symbol, tif.upper(), age_s,
+                    symbol, fill.status, tif.upper(), age_s,
                 )
                 self.ctx.state_store.clear_pending_entry(client_order_id)
                 self._done_today_symbols.add(symbol)
@@ -1021,16 +1022,26 @@ class EntryLoop:
                     logger.warning("ALLOCATIONS: zero positions allocated -- check liquidity/volume constraints")
         
         # ── Per-cycle skip reason tracking ──
-        _skip = {"has_position": 0, "done_today": 0, "few_bars": 0, "few_rth_bars": 0,
-                 "low_5m_vol": 0, "no_breakout": 0, "risk_block": 0, "no_alloc": 0,
-                 "not_allocated_yet": 0, "evaluated": 0}
-        
+        _skip = {"has_position": 0, "pending_entry": 0, "done_today": 0, "few_bars": 0,
+                 "few_rth_bars": 0, "low_5m_vol": 0, "no_breakout": 0, "risk_block": 0,
+                 "no_alloc": 0, "not_allocated_yet": 0, "evaluated": 0}
+
+        # Pre-load pending symbols once per cycle (avoids per-symbol disk reads)
+        _pending_symbols = set()
+        for _cid, _ps in self.ctx.state_store.load_pending_entries().items():
+            _pending_symbols.add(_ps.symbol)
+
         for candidate in self.ctx.watchlist:
             symbol = candidate.symbol
             
             # Skip if we already have a position
             if self.positions.has_position(symbol):
                 _skip["has_position"] += 1
+                continue
+
+            # Skip if symbol has a pending entry being reconciled
+            if symbol in _pending_symbols:
+                _skip["pending_entry"] += 1
                 continue
             
             # Skip if symbol is "done for today"
@@ -1148,7 +1159,7 @@ class EntryLoop:
         pending_entries = self.ctx.state_store.load_pending_entries()
         for client_id, pending in pending_entries.items():
             if pending.symbol == decision.symbol:
-                logger.warning(f"Skipping entry for {decision.symbol} - pending entry already exists: {client_id}")
+                logger.debug(f"Skipping entry for {decision.symbol} - pending entry already exists: {client_id}")
                 return
         
         # Calculate attempt number from persistent tracking
@@ -1288,15 +1299,15 @@ class EntryLoop:
             self.ctx.state_store.clear_pending_entry(pending_state.client_order_id)
             # Add to done_today_symbols to prevent re-entries
             self._done_today_symbols.add(decision.symbol)
-        elif fill.status == "unknown":
-            # DAY orders (fractional shares) may return unknown - keep pending for reconciliation
-            # Store broker order_id for direct polling fallback
+        elif fill.status in {"live", "unknown"}:
+            # Order still in-flight (live) or status indeterminate (unknown)
+            # Keep pending for reconciliation loop to resolve
             if fill.order_id:
                 pending_state.order_id = fill.order_id
                 self.ctx.state_store.save_pending_entry(pending_state)
             logger.info(
-                "PENDING ENTRY %s: status=unknown order_id=%s - will reconcile on next tick",
-                decision.symbol, fill.order_id,
+                "PENDING ENTRY %s: status=%s order_id=%s tif=%s - will reconcile on next tick",
+                decision.symbol, fill.status, fill.order_id, pending_state.tif,
             )
             # DO NOT clear pending entry - let reconciliation handle it
             # DO NOT mark as done_today - allow reconciliation to complete

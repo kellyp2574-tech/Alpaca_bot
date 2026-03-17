@@ -44,7 +44,7 @@ class FillResult:
     order_id: Optional[str]
     filled_qty: float
     avg_price: float
-    status: str  # 'filled', 'partial', 'unfilled', 'unknown', 'dry_run'
+    status: str  # 'filled', 'partial', 'unfilled', 'live', 'unknown', 'dry_run'
 
 
 @dataclass
@@ -54,7 +54,7 @@ class ExecutionConfig:
     min_price: float = 0.01
     fill_poll_interval_s: float = 0.1   # seconds between fill status polls
     fill_poll_max_s: float = 2.0        # total time to poll before giving up (slow reconcile)
-    quick_poll_max_s: float = 1.0       # fast first-pass poll window right after submit
+    quick_poll_max_s: float = 2.5       # fast first-pass poll window right after submit
 
 
 class ExecutionClient:
@@ -330,7 +330,7 @@ class ExecutionClient:
                 time.sleep(self.cfg.fill_poll_interval_s)
                 continue
             result = self._order_to_fill_result(order, fallback_price=fallback_price)
-            if result.status != "unknown":
+            if result.status not in {"unknown", "live"}:
                 return result
             time.sleep(self.cfg.fill_poll_interval_s)
 
@@ -339,7 +339,7 @@ class ExecutionClient:
             order = self.client.get_order_by_id(order_id)
             filled_qty = float(order.filled_qty or 0)
             avg_price = float(order.filled_avg_price or fallback_price)
-            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="unknown")
+            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="live")
         except Exception:
             return FillResult(order_id=order_id, filled_qty=0.0, avg_price=fallback_price, status="unknown")
 
@@ -396,7 +396,7 @@ class ExecutionClient:
                        "accepted_for_bidding", "calculated"}:
             if status == "partially_filled":
                 return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="partial")
-            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="unknown")
+            return FillResult(order_id=order_id, filled_qty=filled_qty, avg_price=avg_price, status="live")
 
         # ── Unrecognized: log the raw value so we can diagnose ──
         logger.error(
