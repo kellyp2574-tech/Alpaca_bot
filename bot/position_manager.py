@@ -124,6 +124,10 @@ class PositionManager:
         self.positions: Dict[str, PositionState] = {}
         self.state_store = state_store
         self.stats: Optional[SessionStats] = None
+        # Stores realized exit metadata for positions that were just closed,
+        # so the reporting wrapper can read the actual fill price/qty/reason.
+        # Populated by _record_fill() and broker-flat handlers before pop.
+        self._realized_exits: Dict[str, dict] = {}
 
     def load_states(self, states: Dict[str, PositionState]) -> None:
         self.positions = dict(states)
@@ -433,14 +437,14 @@ class PositionManager:
             state.exit_client_order_id = None
             state.exit_submitted_ts = None
             self._persist()
-        elif fill.status == "unknown":
-            logger.warning("%s exit order still unknown after reconcile", symbol)
+        elif fill.status in {"unknown", "live"}:
+            logger.warning("%s exit order still %s after reconcile", symbol, fill.status)
             if self.stats is not None:
                 self.stats.record_exit(
-                    status="unknown", latency=0.0,
+                    status=fill.status, latency=0.0,
                     decision_price=0.0, fill_price=0.0,
                 )
-            # Leave pending; will retry next bar
+            # Leave pending; will retry next bar / time-based reconcile
 
     def _record_fill(
         self, symbol: str, state: PositionState, fill: FillResult, now: datetime
@@ -503,6 +507,23 @@ class PositionManager:
         except Exception:
             pass
         
+        # Store realized exit metadata for reporting wrapper to read
+        self._realized_exits[symbol] = {
+            "exit_price": price,
+            "exit_qty": fill.filled_qty,
+            "exit_reason": state.exit_reason,
+            "exit_time": now,
+            "entry_price": state.entry_price,
+            "entry_time": state.entry_time,
+            "realized_r": state.realized_r,
+            "gap_at_entry": getattr(state, "gap_at_entry", 0.0),
+            "first_5min_volume": getattr(state, "first_5min_volume", 0.0),
+            "fill_pct": getattr(state, "fill_pct", 100.0),
+            "entry_slippage_bps": getattr(state, "entry_slippage_bps", 0.0),
+            "peak_price": getattr(state, "peak_price", state.entry_price),
+            "stop_price": getattr(state, "stop_price", 0.0),
+        }
+
         self.positions.pop(symbol, None)
         self._persist()
 
@@ -525,6 +546,30 @@ class PositionManager:
             logger.debug("Exit already in flight for %s, skipping duplicate", symbol)
             return
 
+        # ── Pre-flight: verify broker actually holds this position ──
+        broker_qty = self.execution._get_broker_qty(symbol)
+        if broker_qty is not None and broker_qty <= 0:
+            logger.warning(
+                "BROKER FLAT %s: broker reports 0 position but local state has qty=%.4f "
+                "-- clearing stale local state (reason=%s)",
+                symbol, state.qty, reason,
+            )
+            self._realized_exits[symbol] = {
+                "exit_price": 0.0,
+                "exit_qty": 0.0,
+                "exit_reason": "broker_flat_before_exit",
+                "exit_time": now,
+                "entry_price": state.entry_price,
+                "entry_time": state.entry_time,
+                "realized_r": 0.0,
+                "reconciled_without_fill": True,
+            }
+            state.exit_pending = False
+            state.exit_reason = "broker_flat_before_exit"
+            self.positions.pop(symbol, None)
+            self._persist()
+            return
+
         # Use iterative retry instead of recursion to prevent stack overflow
         max_attempts = 3
         current_price = price
@@ -543,6 +588,30 @@ class PositionManager:
             fill = self.execution.place_exit(symbol, qty, current_price, client_order_id=client_id)
             state.exit_order_id = fill.order_id
             self._persist()
+
+            # If place_exit returned unfilled with no order (broker confirmed 0),
+            # clear local state immediately -- do not retry or escalate.
+            if fill.status == "unfilled" and fill.order_id is None:
+                logger.warning(
+                    "BROKER FLAT %s: exit skipped by broker (no order submitted) "
+                    "-- clearing stale local state",
+                    symbol,
+                )
+                self._realized_exits[symbol] = {
+                    "exit_price": 0.0,
+                    "exit_qty": 0.0,
+                    "exit_reason": "broker_flat_on_exit",
+                    "exit_time": now,
+                    "entry_price": state.entry_price,
+                    "entry_time": state.entry_time,
+                    "realized_r": 0.0,
+                    "reconciled_without_fill": True,
+                }
+                state.exit_pending = False
+                state.exit_reason = "broker_flat_on_exit"
+                self.positions.pop(symbol, None)
+                self._persist()
+                return
 
             self._apply_fill_result(symbol, state, fill, now)
             
@@ -574,8 +643,6 @@ class PositionManager:
             if fill.status == "unfilled" or (fill.status == "partial" and attempt >= max_attempts):
                 if attempt < max_attempts:
                     logger.warning(f"IOC exit unfilled for {symbol}, attempt {attempt} - retrying with more aggressive price")
-                    # Retry with more aggressive pricing for SELL orders (lower limit = more marketable)
-                    # Use progressive aggressiveness: 0.995, 0.99, 0.985
                     aggressiveness_factors = [0.995, 0.99, 0.985]
                     aggressiveness = aggressiveness_factors[min(attempt - 1, len(aggressiveness_factors) - 1)]
                     current_price = price * aggressiveness
@@ -600,20 +667,37 @@ class PositionManager:
                             logger.info(f"Emergency market close submitted for {symbol}")
                         else:
                             logger.critical(f"Cannot escalate {symbol} - no broker client available")
-                            # Keep position tracked with alarm
                             state.exit_pending = False
                             state.exit_reason = "emergency_exit_failed_no_client"
                             self._persist()
                     except Exception as e:
-                        logger.critical(f"Emergency close_position failed for {symbol}: {e}")
-                        # Keep position tracked with alarm - DO NOT remove from local state
-                        state.exit_pending = False
-                        state.exit_reason = "emergency_exit_failed_exception"
-                        self._persist()
+                        if "position does not exist" in str(e).lower() or "404" in str(e):
+                            logger.warning(
+                                "BROKER FLAT %s: close_position 404 -- clearing stale local state", symbol
+                            )
+                            self._realized_exits[symbol] = {
+                                "exit_price": 0.0,
+                                "exit_qty": 0.0,
+                                "exit_reason": "broker_flat_on_escalation",
+                                "exit_time": now,
+                                "entry_price": state.entry_price,
+                                "entry_time": state.entry_time,
+                                "realized_r": 0.0,
+                                "reconciled_without_fill": True,
+                            }
+                            state.exit_pending = False
+                            state.exit_reason = "broker_flat_on_escalation"
+                            self.positions.pop(symbol, None)
+                            self._persist()
+                        else:
+                            logger.critical(f"Emergency close_position failed for {symbol}: {e}")
+                            state.exit_pending = False
+                            state.exit_reason = "emergency_exit_failed_exception"
+                            self._persist()
                     return
             else:
                 logger.warning(f"Exit {symbol} status {fill.status} - keeping pending for reconcile")
-                return  # Let time-based reconcile handle unknown status
+                return  # Let time-based reconcile handle live/unknown status
 
     def _persist(self) -> None:
         if not self.state_store:

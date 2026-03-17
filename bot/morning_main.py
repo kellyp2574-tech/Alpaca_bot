@@ -21,6 +21,7 @@ from .position_manager import PositionManager, initial_stop_pct, _entry_client_i
 from .risk_manager import RiskManager
 from .state_manager import StateStore
 from .storage import Candidate, PendingEntryState
+from .trade_reporter import log_trade_with_reporting
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,6 @@ class EntryLoop:
         
         # Entry evaluation tracking for diagnostics
         self._last_entry_diag_ts = 0.0
-        self._entry_skip_reasons: Dict[str, int] = {}
 
     def run(self) -> None:
         """Run the entry loop until entry cutoff."""
@@ -540,6 +540,22 @@ class EntryLoop:
 
             # If broker reports zero shares, allow cleanup
             if broker_qty <= 0:
+                # Store synthetic realized-exit record for audit trail
+                realized_exits = getattr(self.positions, '_realized_exits', None)
+                if realized_exits is None:
+                    realized_exits = getattr(self.positions, 'original_pm', self.positions)
+                    realized_exits = getattr(realized_exits, '_realized_exits', None)
+                if realized_exits is not None:
+                    realized_exits[symbol] = {
+                        "exit_price": 0.0,
+                        "exit_qty": 0.0,
+                        "exit_reason": "broker_flat_emergency_flatten",
+                        "exit_time": market_now(),
+                        "entry_price": state.entry_price,
+                        "entry_time": state.entry_time,
+                        "realized_r": 0.0,
+                        "reconciled_without_fill": True,
+                    }
                 state.exit_pending = False
                 state.exit_time = market_now()
                 self.positions.positions.pop(symbol, None)
@@ -547,13 +563,27 @@ class EntryLoop:
         # Persist updated state after emergency actions
         self.positions._persist()
         
-        # Log critical warning about broker reality mismatch
-        if broker_positions:
-            logger.critical(f"EMERGENCY FLATTEN COMPLETED WITH {len(broker_positions)} POSITIONS STILL AT BROKER")
-            logger.critical("SYMBOLS REMAINING AT BROKER: " + ", ".join(f"{sym}:{qty}" for sym, qty in broker_positions.items()))
+        # Refresh broker positions AFTER close attempts for accurate final summary
+        post_close_positions = {}
+        try:
+            if hasattr(self.ctx.execution, 'client') and self.ctx.execution.client:
+                positions_after = self.ctx.execution.client.get_positions()
+                for pos in positions_after:
+                    sym = getattr(pos, 'symbol', None)
+                    qty = float(getattr(pos, 'qty', 0) or 0)
+                    if sym and qty > 0:
+                        post_close_positions[sym] = qty
+        except Exception as e:
+            logger.error(f"Could not refresh broker positions after emergency flatten: {e}")
+            # Fall back to pre-close snapshot if refresh fails
+            post_close_positions = broker_positions
+
+        if post_close_positions:
+            logger.critical(f"EMERGENCY FLATTEN COMPLETED WITH {len(post_close_positions)} POSITIONS STILL AT BROKER")
+            logger.critical("SYMBOLS REMAINING AT BROKER: " + ", ".join(f"{sym}:{qty}" for sym, qty in post_close_positions.items()))
             logger.critical("MANUAL INTERVENTION REQUIRED: Check broker and close positions manually")
         else:
-            logger.info("Emergency flatten completed - no positions found at broker")
+            logger.info("Emergency flatten completed - broker confirms all positions closed")
 
     def _process_stream_bars(self) -> None:
         """Process any new bars from the stream."""
@@ -627,6 +657,10 @@ class EntryLoop:
             if symbol in self.positions.positions:
                 logger.info("RECONCILE %s: already in positions, clearing pending", symbol)
                 self.ctx.state_store.clear_pending_entry(client_order_id)
+                continue
+
+            # Skip very young entries -- _execute_entry may still be processing
+            if age_s < 3.0:
                 continue
 
             # -- Primary: poll by broker order_id (most reliable) --
@@ -962,69 +996,99 @@ class EntryLoop:
         except Exception as e:
             logger.warning(f"Error cancelling stale entry orders: {e}")
 
+    def _compute_allocations(self, cfg, now: datetime) -> None:
+        """Compute position allocations from current bar data and cash."""
+        # Refresh cash
+        try:
+            if hasattr(self.ctx.execution, 'client') and self.ctx.execution.client:
+                account = self.ctx.execution.client.get_account()
+                actual_cash = float(account.cash)
+            else:
+                actual_cash = self.ctx.account_cash
+        except Exception as e:
+            logger.warning(f"Could not refresh cash, using snapshot: {e}")
+            actual_cash = self.ctx.account_cash
+
+        deploy_dollars = actual_cash * cfg.daily_deploy_pct
+
+        # Populate liquidity metrics for all candidates
+        for cand in self.ctx.watchlist:
+            bars = list(self.bar_history.get(cand.symbol, []))
+            rth_bars = [b for b in bars if b.timestamp >= self.market_open_dt]
+            if len(rth_bars) >= 5:
+                first_5min_bars = rth_bars[:5]
+                cand.liq_5m_dollar = sum(bar.v * bar.c for bar in first_5min_bars)
+            else:
+                cand.liq_5m_dollar = 0.0
+
+        self._position_allocations = allocate_positions_dynamic(
+            self.ctx.watchlist,
+            deploy_dollars,
+            max_per_ticker_pct=cfg.max_per_ticker_pct,
+            min_order_dollars=cfg.min_order_dollars,
+            volume_participation_pct=cfg.max_position_pct_of_5min_vol,
+        )
+
+        self._allocations_calculated = True
+
+        logger.info(
+            "ALLOCATIONS: %d positions sized, $%.0f total deploy, cash=$%.0f",
+            len(self._position_allocations),
+            deploy_dollars,
+            actual_cash,
+        )
+
+        # Log top allocations at INFO so they're always visible
+        sorted_allocs = sorted(self._position_allocations.items(), key=lambda x: x[1], reverse=True)
+        for sym, amt in sorted_allocs[:5]:
+            cand = next((c for c in self.ctx.watchlist if c.symbol == sym), None)
+            liq = cand.liq_5m_dollar if cand else 0
+            logger.info(f"  ALLOC {sym}: ${amt:.0f} (liq_5m=${liq:,.0f})")
+        if not self._position_allocations:
+            logger.warning("ALLOCATIONS: zero positions allocated -- check liquidity/volume constraints")
+
     def _check_entries(self, now: datetime) -> None:
         """Check for new entry opportunities."""
         cfg = self.ctx.cfg
         
-        # Calculate dynamic allocations once at entry_start (BEFORE symbol loop)
+        # Calculate dynamic allocations -- deferred until bar data is ready
         if not self._allocations_calculated:
             entry_open_dt = market_datetime(None, cfg.entry_start)
             if now >= entry_open_dt:
-                # Refresh cash
-                try:
-                    if hasattr(self.ctx.execution, 'client') and self.ctx.execution.client:
-                        account = self.ctx.execution.client.get_account()
-                        actual_cash = float(account.cash)
-                    else:
-                        actual_cash = self.ctx.account_cash
-                except Exception as e:
-                    logger.warning(f"Could not refresh cash, using snapshot: {e}")
-                    actual_cash = self.ctx.account_cash
-                
-                # Calculate deploy amount
-                deploy_dollars = actual_cash * cfg.daily_deploy_pct
-                
-                # Populate liquidity metrics for all candidates
-                for cand in self.ctx.watchlist:
-                    bars = list(self.bar_history.get(cand.symbol, []))
-                    rth_bars = [b for b in bars if b.timestamp >= self.market_open_dt]
-                    if len(rth_bars) >= 5:
-                        first_5min_bars = rth_bars[:5]
-                        cand.liq_5m_dollar = sum(bar.v * bar.c for bar in first_5min_bars)
-                    else:
-                        cand.liq_5m_dollar = 0.0
-                
-                # Calculate dynamic allocations
-                self._position_allocations = allocate_positions_dynamic(
-                    self.ctx.watchlist,
-                    deploy_dollars,
-                    max_per_ticker_pct=cfg.max_per_ticker_pct,
-                    min_order_dollars=cfg.min_order_dollars,
-                    volume_participation_pct=cfg.max_position_pct_of_5min_vol,
-                )
-                
-                self._allocations_calculated = True
-                
-                logger.info(
-                    "ALLOCATIONS: %d positions sized, $%.0f total deploy, cash=$%.0f",
-                    len(self._position_allocations),
-                    deploy_dollars,
-                    actual_cash,
-                )
-                
-                # Log top allocations at INFO so they're always visible
-                sorted_allocs = sorted(self._position_allocations.items(), key=lambda x: x[1], reverse=True)
-                for sym, amt in sorted_allocs[:5]:
-                    cand = next((c for c in self.ctx.watchlist if c.symbol == sym), None)
-                    liq = cand.liq_5m_dollar if cand else 0
-                    logger.info(f"  ALLOC {sym}: ${amt:.0f} (liq_5m=${liq:,.0f})")
-                if not self._position_allocations:
-                    logger.warning("ALLOCATIONS: zero positions allocated -- check liquidity/volume constraints")
+                # Check if all watchlist symbols have >= 5 RTH bars
+                bars_ready = all(
+                    len([b for b in self.bar_history.get(c.symbol, [])
+                         if b.timestamp >= self.market_open_dt]) >= 5
+                    for c in self.ctx.watchlist
+                ) if self.ctx.watchlist else False
+                # Hard deadline: 5 minutes after entry start (don't wait forever)
+                hard_deadline = (now - entry_open_dt).total_seconds() >= 300
+                if bars_ready or hard_deadline:
+                    if hard_deadline and not bars_ready:
+                        logger.warning("ALLOCATIONS: computing with incomplete bar data (5min deadline reached)")
+                    self._compute_allocations(cfg, now)
+
+        # One-time recompute: if first allocation was done with incomplete bars,
+        # recalculate once when all symbols have enough data.
+        if (self._allocations_calculated
+                and not getattr(self, "_allocations_recomputed", False)):
+            bars_now_ready = all(
+                len([b for b in self.bar_history.get(c.symbol, [])
+                     if b.timestamp >= self.market_open_dt]) >= 5
+                for c in self.ctx.watchlist
+            ) if self.ctx.watchlist else False
+            if bars_now_ready:
+                self._allocations_recomputed = True
+                # Only recompute if any symbol had liq_5m_dollar == 0 in the first pass
+                any_zero_liq = any(c.liq_5m_dollar <= 0.0 for c in self.ctx.watchlist)
+                if any_zero_liq:
+                    logger.info("ALLOCATIONS: recomputing now that all symbols have 5 RTH bars")
+                    self._compute_allocations(cfg, now)
         
         # ── Per-cycle skip reason tracking ──
         _skip = {"has_position": 0, "pending_entry": 0, "done_today": 0, "few_bars": 0,
                  "few_rth_bars": 0, "low_5m_vol": 0, "no_breakout": 0, "risk_block": 0,
-                 "no_alloc": 0, "not_allocated_yet": 0, "evaluated": 0}
+                 "no_alloc": 0, "not_allocated_yet": 0, "eligible": 0, "evaluated": 0}
 
         # Pre-load pending symbols once per cycle (avoids per-symbol disk reads)
         _pending_symbols = set()
@@ -1066,6 +1130,21 @@ class EntryLoop:
             dollar_vol_5min = sum(bar.v * bar.c for bar in first_5min_bars)
             if dollar_vol_5min < cfg.min_5min_volume:
                 _skip["low_5m_vol"] += 1
+                # Once we have all 5 bars the value is fixed -- permanently exclude
+                if len(rth_bars) >= 5:
+                    self._done_today_symbols.add(symbol)
+                    logger.info(
+                        "ENTRY REJECT %s: cum_5m_vol=$%,.0f < threshold=$%,.0f  "
+                        "rth_bars=%d -- permanently excluded for today",
+                        symbol, dollar_vol_5min, cfg.min_5min_volume, len(rth_bars),
+                    )
+                else:
+                    logger.debug(
+                        "ENTRY REJECT %s: cum_5m_vol=$%,.0f < threshold=$%,.0f  "
+                        "rth_bars=%d  gap=%.1f%%",
+                        symbol, dollar_vol_5min, cfg.min_5min_volume,
+                        len(rth_bars), candidate.gap_pct * 100,
+                    )
                 continue
 
             # Get entry price (latest quote or last bar close) - BEFORE breakout check
@@ -1097,6 +1176,7 @@ class EntryLoop:
                 _skip["no_alloc"] += 1
                 continue
             
+            _skip["eligible"] += 1
             _skip["evaluated"] += 1
             
             # Check daily deploy cap
@@ -1152,6 +1232,25 @@ class EntryLoop:
             self._last_entry_diag_ts = now_mono
             parts = " ".join(f"{k}={v}" for k, v in _skip.items() if v > 0)
             logger.info("ENTRY EVAL: watchlist=%d | %s", len(self.ctx.watchlist), parts or "no_symbols_checked")
+
+            # Surface per-symbol 5m volume diagnostic when it's the dominant gate
+            vol_rejects = _skip["low_5m_vol"]
+            wl_size = len(self.ctx.watchlist)
+            if vol_rejects > 0 and vol_rejects >= wl_size // 2:
+                logger.warning(
+                    "VOLUME GATE blocking %d/%d symbols (threshold=$%,.0f):",
+                    vol_rejects, wl_size, cfg.min_5min_volume,
+                )
+                for cand in self.ctx.watchlist:
+                    sym = cand.symbol
+                    bars = list(self.bar_history.get(sym, []))
+                    rth = [b for b in bars if b.timestamp >= self.market_open_dt]
+                    first5 = rth[:5]
+                    dvol = sum(b.v * b.c for b in first5) if first5 else 0.0
+                    logger.warning(
+                        "  %s: 5m_dvol=$%,.0f  rth_bars=%d  gap=%.1f%%  liq_5m=$%,.0f",
+                        sym, dvol, len(rth), cand.gap_pct * 100, cand.liq_5m_dollar,
+                    )
 
     def _execute_entry(self, decision: EntryDecision) -> None:
         """Execute an entry order."""
@@ -1246,11 +1345,12 @@ class EntryLoop:
             first_5min_vol = cand.liq_5m_dollar if cand else 0.0
             entry_slippage_bps = ((fill.avg_price - decision.entry_price) / decision.entry_price * 10000) if decision.entry_price > 0 else 0.0
             
+            stop_pct = (decision.entry_price - decision.stop_price) / decision.entry_price
             self.positions.open_position(
                 decision.symbol,
                 fill.filled_qty,
                 fill.avg_price,
-                (decision.entry_price - decision.stop_price) / decision.entry_price,
+                stop_pct,
                 entry_order_id=fill.order_id,
                 entry_client_order_id=pending_state.client_order_id,
                 gap_at_entry=gap_at_entry,
@@ -1258,6 +1358,18 @@ class EntryLoop:
                 fill_pct=100.0,
                 entry_slippage_bps=entry_slippage_bps,
             )
+            # Report BUY at the confirmed-fill site (not in open_position)
+            try:
+                log_trade_with_reporting(
+                    symbol=decision.symbol, action="BUY",
+                    quantity=fill.filled_qty, price=fill.avg_price,
+                    strategy="morning_momentum",
+                    order_id=fill.order_id,
+                    client_order_id=pending_state.client_order_id,
+                    notes=f"Entry filled: stop={stop_pct*100:.1f}%",
+                )
+            except Exception:
+                logger.exception("BUY reporting failed for %s; continuing", decision.symbol)
             logger.info(
                 f"ENTRY {decision.symbol} qty={fill.filled_qty} @ {fill.avg_price:.2f} "
                 f"(deployed=${deployed_amount:,.2f})"
@@ -1273,11 +1385,12 @@ class EntryLoop:
             fill_pct_val = (fill.filled_qty / decision.qty * 100) if decision.qty > 0 else 0.0
             entry_slippage_bps = ((fill.avg_price - decision.entry_price) / decision.entry_price * 10000) if decision.entry_price > 0 else 0.0
 
+            stop_pct = (decision.entry_price - decision.stop_price) / decision.entry_price
             self.positions.open_position(
                 decision.symbol,
                 fill.filled_qty,
                 fill.avg_price,
-                (decision.entry_price - decision.stop_price) / decision.entry_price,
+                stop_pct,
                 entry_order_id=fill.order_id,
                 entry_client_order_id=pending_state.client_order_id,
                 gap_at_entry=gap_at_entry,
@@ -1285,6 +1398,18 @@ class EntryLoop:
                 fill_pct=fill_pct_val,
                 entry_slippage_bps=entry_slippage_bps,
             )
+            # Report BUY at the confirmed-fill site (not in open_position)
+            try:
+                log_trade_with_reporting(
+                    symbol=decision.symbol, action="BUY",
+                    quantity=fill.filled_qty, price=fill.avg_price,
+                    strategy="morning_momentum",
+                    order_id=fill.order_id,
+                    client_order_id=pending_state.client_order_id,
+                    notes=f"Partial entry: {fill.filled_qty}/{decision.qty} stop={stop_pct*100:.1f}%",
+                )
+            except Exception:
+                logger.exception("BUY reporting failed for %s; continuing", decision.symbol)
 
             self._done_today_symbols.add(decision.symbol)
 
