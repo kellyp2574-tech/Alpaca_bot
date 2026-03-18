@@ -1,391 +1,196 @@
-# Alpaca Trading Bot - Morning Gap Momentum Strategy
+# 0DTE Options Bot — XSP Iron Condor + XND Directional
 
-Production-ready gap momentum trading bot that trades pre-market gappers during the morning session. Features multi-stage candidate scanning with intelligent data feed selection, smart entry order management, comprehensive monitoring system, and automated liquidity ranking.
+Automated 0DTE options strategy on Alpaca running two independent sleeves: an always-on XSP iron condor and a conditional XND directional play. Both use European-style, cash-settled index options — no early assignment risk.
+
+---
 
 ## Strategy Overview
 
-### Morning Gap Momentum (85% of equity deployed, 8:30 AM - 2:30 PM)
-- **Signal:** Pre-market gap (5-25%) + opening breakout + volume confirmation
-- **Universe:** 4,000 stocks (liquidity-ranked) → $10M+ ADV, $1-$100 price range
-- **Staged Scanning:** Multi-stage refinement (8:30 AM, 9:05 AM, 9:15 AM, 9:25 AM freeze)
-- **Data Feeds:** Delayed SIP for broad filtering, IEX for live refinement and trading
-- **Entry:** Smart limit orders with 60s age / 1% price cancellation logic
-- **Partial Fills:** Converted to positions (not discarded)
-- **Exit:** 5% trailing activation, 1.5% trailing stop, 5% hard stop
-- **Risk:** 25 max concurrent positions, 25 max trades/day, daily R limit -3R
-- **Guarantee:** Hard exit at 2:30 PM under ALL conditions
-- **Post-Market:** Automated liquidity ranking generation at 4:05 PM
+### Sleeve 1: XSP Iron Condor (Every Day)
 
-## Dynamic Position Sizing
+- **Instrument:** XSP 0DTE options (Mini-SPX, European, cash-settled)
+- **Underlying proxy:** SPY price action (XSP settles off its own index calculation)
+- **Structure:** Sell call spread + sell put spread (iron condor) as a single mleg order
+- **Short strikes:** 0.90% OTM from anchor price (SPY at 11:30 AM)
+- **Wing width:** 1.00% (max loss = wing width - credit per contract)
+- **Target credit:** ~$1.30 per contract
+- **Max loss per contract:** ~$3.70 (this is the margin requirement)
+- **Defense trigger:** If SPY moves 1.00% from anchor (using post-anchor max excursion), close all legs immediately
+- **Entry:** 11:30 AM ET
+- **Exit:** Hold to 4:00 PM cash settlement, or defense close if triggered
 
-### Three-Constraint Allocation System
-Each position sized using **minimum of three constraints**:
-1. **Equal-weight base:** `remaining_cash / remaining_positions`
-2. **Concentration cap:** 25% max per ticker
-3. **Volume limit:** 1% of stock's first 5-min dollar volume
+### Sleeve 2: XND Directional (Conditional)
 
-### Allocation Flow (Low → High Liquidity)
-- Candidates sorted by 5-min dollar volume (ascending)
-- Small-cap names processed first, large-cap names last
-- Stocks hitting volume cap leave unused cash for other positions
-- Second pass distributes leftover to high-liquidity names (respecting both caps)
+- **Instrument:** XND 0DTE options (Mini-NDX, European, cash-settled)
+- **Underlying proxy:** QQQ price action (XND strikes are in NDX index points; QQQ × 40 ≈ NDX)
+- **Structure:** Buy a single call or put in the direction of the morning trend
+- **Strike selection:** ATM relative to estimated NDX level (QQQ × 40), not raw QQQ price
+- **Entry:** 10:45 AM ET
+- **Exit:** Hold to 4:00 PM cash settlement
 
-### Example ($10,000 deploy, 10 candidates)
-- Low-liq stock ($50K vol): gets $500 (1% vol cap hit)
-- Mid-liq stock ($200K vol): gets $1,000 (equal-weight)
-- High-liq stock ($1M vol): gets $1,200 (equal-weight + spillover)
-- Leftover distributed to highest liquidity names up to caps
+**Entry filters (all three must be true at 10:30 AM):**
+- Previous day VIX close >= 18
+- QQQ morning range >= 0.40%
+- |QQQ morning directional move| > 0.30%
 
+If QQQ's morning direction is up, buy a call. If down, buy a put.
 
-## Key Features
+---
 
-### 🚀 Production-Grade Reliability
-- **Hard Exit Guarantee:** All positions flat by 2:30 PM regardless of crashes
-- **Supervision System:** Orchestrator monitors positions even if EntryLoop fails
-- **Smart Order Management:** 60s age OR 1% price movement cancellation logic
-- **Partial Fill Handling:** Partial fills converted to positions (not discarded)
-- **DAY Orders:** Fractional share support with async fill reconciliation
-- **Emergency Fallbacks:** Market order escalation, broker position cleanup
+## Sizing
 
-### 🔒 Risk Management
-- **Duplicate Prevention:** Each symbol max one entry attempt per day
-- **Position Sizing:** Dynamic allocation with 25% concentration cap, 1% volume participation
-- **Stop Logic:** 1.5% trailing stop after 5% gain, 5% hard stop, breakeven protection
-- **Time-Based Exits:** Automatic reconciliation, DAY order fill tracking
-
-### 📊 Multi-Stage Candidate Scanning
-- **8:30 AM:** Build 4,000-symbol universe (liquidity-ranked from prior day)
-- **8:30-8:40 AM:** Broad filter using delayed_sip snapshots (batched)
-- **9:05 AM:** First live refinement using IEX snapshots
-- **9:15 AM:** Second IEX refinement (narrow to final watchlist)
-- **9:25 AM:** Freeze candidates, prepare sizing
-- **9:28 AM:** Start IEX live stream
-- **9:30 AM onward:** Trade from IEX live data
-
-### 📈 Comprehensive Monitoring System
-- **Live Dashboard:** Real-time P&L, positions, fill rates, slippage tracking
-- **Entry Quality Metrics:** Slippage, fill rates, time-to-fill, cancellation reasons
-- **Exit Quality Metrics:** Exit slippage, force-flat tracking, partial exits
-- **Trade Outcomes:** Win rate, expectancy, profit factor, MFE/MAE analysis
-- **Risk Exposure:** Drawdown tracking, concentration metrics, capital deployment
-- **4-Layer Reporting:** Live console, EOD report, trade ledger CSV, rolling stats JSON
-- **Automated Alerts:** Data quality, execution quality, risk threshold warnings
-
-### 🔄 Automated Liquidity Ranking
-- **Post-Market Job:** Runs at 4:05 PM after all positions closed
-- **Prior-Day Data:** Fetches last trading day's bars (handles weekends/holidays)
-- **Dollar Volume Ranking:** Calculates prev_close × prev_volume for all symbols
-- **Next-Day Universe:** Top 4,000 most liquid symbols selected for scanning
-- **Resilient Execution:** Runs even if position state has issues
-
-## Project Structure
+### Condor Sizing
 
 ```
-Alpaca_bot/
-├── bot/                           # Trading bot
-│   ├── integrated_main.py         # Main orchestrator (8:30 AM - 4:05 PM)
-│   ├── morning_main.py            # Gap momentum entry logic with smart order management
-│   ├── morning_main_staged.py     # Staged candidate fetching orchestration
-│   ├── premarket_scan_staged.py   # Multi-stage scanning (delayed_sip → IEX)
-│   ├── position_manager.py        # Position management with trailing stops
-│   ├── execution.py               # Order execution with fractional share support
-│   ├── morning_config.py          # Strategy parameters and timeline constants
-│   ├── state_manager.py           # State persistence
-│   ├── risk_manager.py            # Risk controls & daily limits
-│   ├── monitoring.py              # Comprehensive monitoring system (11 sections)
-│   ├── monitor_reports.py         # 4-layer reporting (live, EOD, CSV, JSON)
-│   ├── universe_loader.py         # Alpaca Assets API universe builder
-│   ├── liquidity_ranker.py        # Post-market liquidity ranking (4:05 PM)
-│   ├── data_alpaca.py             # Alpaca data adapter (delayed_sip, IEX feeds)
-│   ├── clock.py                   # Market time utilities
-│   └── storage.py                 # Data structures (Candidate, Position, etc.)
-├── state/                         # Runtime state & logs (gitignored)
-│   ├── universe/                  # Universe and liquidity ranking cache
-│   │   ├── alpaca_assets_us_equity.json
-│   │   └── liquidity_ranking.json
-│   └── reports/                   # Monitoring reports
-│       ├── eod_report_YYYY-MM-DD.txt
-│       ├── trade_ledger.csv
-│       └── rolling_stats.json
-├── .env.example                   # API key template
-├── close_all_positions.py         # Utility to close all positions
-├── test_liquidity_ranker.py       # Manual test for liquidity ranking
-├── .gitignore
-├── requirements.txt
-└── README.md
+contracts = floor(buying_power / max_loss_per_contract)
+max_loss_per_contract = wing_width - credit ≈ $3.70 × 100 = $370
 ```
+
+`buying_power` comes directly from the Alpaca API. Example: $20,000 / $370 = **54 contracts**.
+
+### Directional Sizing
+
+```
+notional = buying_power × equity_risk_pct × leverage_multiplier
+         = buying_power × 0.0125 × 5.0
+qty = floor(notional / (premium_per_contract × 100))
+```
+
+Premium is estimated from a **live option snapshot** (bid/ask mid via Alpaca's option snapshot API). Falls back to prior close price, then a conservative $2.00 if no data is available. For 0DTE options, stale pricing can cause significant over- or under-sizing — the live snapshot mitigates this.
+
+---
+
+## Daily Schedule
+
+| Time (ET) | Activity |
+|-----------|----------|
+| 9:00 AM | Bot starts, pull account info, VIX previous close |
+| 9:30 AM | Market opens, begin tracking SPY/QQQ prices via Alpaca snapshots |
+| 10:30 AM | Morning assessment — evaluate directional filters |
+| 10:45 AM | Directional entry (if qualified) — submit order, poll for fill |
+| 11:30 AM | Condor entry — record anchor, compute strikes, place mleg order, poll for fill |
+| 11:30–4:00 PM | Defense monitoring — check SPY max excursion vs anchor every ~60 s |
+| 4:00 PM | Settlement — compute estimated P&L from proxy underlying prices |
+| 4:15 PM | Log P&L, save daily report, shut down |
+
+---
+
+## Order Lifecycle
+
+Orders go through a clear state machine:
+
+1. **Order submitted** — `entry_order_id` is set, `is_open = False`, `is_filled = False`
+2. **Fill confirmed** — `is_filled = True`, `is_open = True` (position is now live)
+3. **Terminal failure** — if the order is cancelled/rejected/expired, `entry_order_dead = True` and the bot stops polling it
+
+Defense close orders follow the same pattern. If a defense close order terminally fails, the bot retries up to 2 times (strategy level), then escalates to `cancel_all_orders()`. The orchestrator caps total escalation attempts at 3 before logging `MANUAL INTERVENTION REQUIRED`.
+
+---
+
+## Defense Monitoring
+
+After the condor is filled, the bot monitors SPY for a 1.00% move from the anchor price.
+
+**Post-anchor tracking:** The bot maintains separate `spy_post_anchor_high` / `spy_post_anchor_low` fields that track only last-trade prices sampled after the anchor is set. This prevents pre-anchor session extremes (from the daily bar) from falsely triggering defense.
+
+**Max excursion check:** Defense uses `spy_max_move_from_anchor_pct()` which examines the worst post-anchor excursion — catching breaches that occurred between polling intervals even if the current price has recovered.
+
+**Polling limitation:** Defense relies on sampled last-trade prices refreshed every ~30 seconds. A very fast sub-second excursion that fully reverses between refreshes could be missed. True tick-level defense would require a streaming WebSocket connection.
+
+---
+
+## Settlement & P&L
+
+Both sleeves compute estimated P&L at 4:00 PM from proxy underlying prices:
+
+- **Condor:** Uses `tracker.spy_last` as a proxy for XSP settlement. Computes put-spread and call-spread intrinsic values against actual leg strikes. If defense was triggered, uses the actual fill price from the close order.
+- **Directional:** Uses `QQQ × 40` as an NDX proxy. Computes call/put intrinsic value against the strike price.
+
+**Important:** These are *estimates*. XSP settles off a special index settlement value (SET), not literally SPY last trade. XND settles off an NDX-derived value, not exactly QQQ × 40. Reported P&L may differ slightly from the broker's end-of-day statement. For precise accounting, reconcile against broker reports.
+
+---
+
+## Architecture
+
+```
+run.py                      # Entry point
+bot/
+  integrated_main.py        # CondorBot orchestrator — daily schedule, main loop
+  config.py                 # API keys (.env), state paths, logging
+  condor_config.py          # Strategy parameters (strikes, sizing, schedule, filters)
+  options_client.py         # Alpaca options REST API — contracts, mleg orders,
+                            #   single-leg orders, option snapshots, account info
+  market_data.py            # MorningTracker — SPY/QQQ/VIX price tracking,
+                            #   session-wide daily bar stats + post-anchor defense
+  condor_strategy.py        # Iron condor: enter, check_defense, close_defense,
+                            #   check_defense_fill, on_settlement
+  directional_strategy.py   # XND directional: assess_filters, enter, on_settlement
+```
+
+Legacy momentum files (`morning_main.py`, `position_manager.py`, etc.) are preserved in `bot/` but are not used by the condor system.
+
+**Data flow:**
+- SPY/QQQ prices from Alpaca stock snapshots (daily bar high/low + last trade)
+- VIX previous close from yfinance
+- Option contracts from `/v2/options/contracts` (0DTE strike lookup)
+- Live option premium from `/v1beta1/options/snapshots/{symbol}` (directional sizing)
+- Iron condor placed as a single `order_class: "mleg"` order with 4 legs
+- All legs use `position_intent` (`buy_to_open`, `sell_to_open`, etc.)
+
+---
 
 ## Setup
 
 ```bash
-# Install dependencies
+python -m venv .venv
+.venv\Scripts\activate  # Windows
 pip install -r requirements.txt
-
-# Configure API keys
 cp .env.example .env
-# Edit .env with your Alpaca API key and secret
+# Fill in Alpaca keys, set ALPACA_PAPER=true for paper trading
 ```
+
+**Requirements:** Python 3.11+, Alpaca Options Level 3 trading enabled.
 
 ## Usage
 
 ```bash
-# Run gap momentum bot (main production mode)
-python -m bot.integrated_main
-
-# Dry run — show signals without trading
-python -m bot.integrated_main --dry-run
-
-# Close all open positions (cleanup utility)
-python close_all_positions.py
+python run.py               # Live/paper trading
+python run.py --dry-run     # Log signals without submitting orders
 ```
 
-## Daily Schedule
+Start the bot at or before 9:00 AM ET. It will wait for each scheduled event and shut down automatically at 4:15 PM.
 
-| Time | Activity |
-|------|----------|
-| 8:30 AM | Bot starts, build 4,000-symbol universe (liquidity-ranked) |
-| 8:30-8:40 AM | Stage 1: Broad filter using delayed_sip snapshots |
-| 9:05 AM | Stage 2: First live refinement using IEX snapshots |
-| 9:15 AM | Stage 3: Second IEX refinement (narrow to final watchlist) |
-| 9:25 AM | Freeze candidates, prepare sizing |
-| 9:28 AM | Start IEX live stream |
-| 9:30 AM | Market open, collect first 5 bars |
-| 9:40 AM | Entry window opens, dynamic allocation calculated |
-| 9:40-2:30 PM | Active trading with smart order management & trailing stops |
-| 2:30 PM | **Hard exit guarantee** - all positions flat |
-| 2:30-4:05 PM | Position supervision, cleanup, reconciliation |
-| 4:05 PM | Generate liquidity ranking for next day, EOD reports |
-| 4:10 PM | Bot shutdown |
+If started after 9:30 AM, the bot detects the late start and backfills open prices from the Alpaca daily bar. Morning range calculations will still use exchange-reported session extremes.
 
-## Critical Guarantees
-
-### ✅ Hard Exit Guarantee
-- **All positions flat by 2:30 PM** regardless of:
-  - EntryLoop crashes or exceptions
-  - Network connectivity issues
-  - Stream data interruptions
-  - Manual intervention
-
-### ✅ Smart Entry Order Management
-- **60-second age OR 1% price movement** cancellation logic
-- Orders given time to fill before cancellation
-- Prevents premature cancellations on slower executions
-- Cancels if price runs away (>1% above limit)
-
-### ✅ Partial Fill Handling
-- **Partial fills converted to positions** (not discarded)
-- Consistent behavior: immediate execution and reconciliation
-- Proper deployment tracking and stats recording
-- Prevents re-entry attempts on partial fills
-
-### ✅ No Duplicate Entries
-- **Maximum one entry attempt per symbol per day**
-- Failed entries marked "done for today"
-- Persistent attempt tracking with audit trail
-
-### ✅ Fractional Share Support
-- **DAY limit orders** for fractional shares
-- Async fill reconciliation for "unknown" status
-- Auto-floor to whole shares if not fractionable
-
-### ✅ Position Supervision
-- **Orchestrator-level monitoring** continues after EntryLoop
-- Stop loss checks every 30 seconds
-- Broker position reconciliation
-
-## Data Sources
-
-- **Universe:** Alpaca Assets API (master asset catalog)
-- **Liquidity Ranking:** Prior-day bars from Alpaca (dollar volume calculation)
-- **Broad Filtering:** Alpaca delayed_sip feed (15-min delayed, broad coverage)
-- **Live Refinement:** Alpaca IEX feed (free live data)
-- **Market Data:** Alpaca Market Data API (1-min bars, quotes, snapshots)
-- **Execution:** Alpaca Trading API (paper or live)
-
-## Monitoring & Reporting
-
-### 11-Section Monitoring System
-1. **Daily Dashboard:** Top-line metrics (equity, P&L, positions, trades)
-2. **Funnel Metrics:** Candidate pipeline tracking with drop reasons
-3. **Entry Execution Quality:** Slippage, fill rates, time-to-fill, cancellations
-4. **Exit Execution Quality:** Exit slippage, force-flat tracking, partial exits
-5. **Trade Outcomes:** Win rate, expectancy, profit factor, MFE/MAE
-6. **Running Tallies:** Intraday, daily, weekly, MTD, all-time, rolling stats
-7. **Risk & Exposure:** Drawdown, concentration, capital deployment
-8. **Data Integrity:** Missing data, API failures, stale quotes
-9. **Broker Integrity:** Order rejections, position mismatches, reconciliations
-10. **Strategy Drift:** Returns by day-of-week, gap bucket, fill time, etc.
-11. **Alerts:** Automated warnings for data quality, execution, risk thresholds
-
-### 4-Layer Reporting
-1. **Live Console Summary:** Compact dashboard printed every 5 minutes during market hours
-2. **End-of-Day Report:** Comprehensive text report saved to `state/reports/eod_report_YYYY-MM-DD.txt`
-3. **Trade Ledger CSV:** One row per order event in `state/reports/trade_ledger.csv`
-4. **Rolling Stats JSON:** Persistent cumulative stats in `state/reports/rolling_stats.json`
+**Daily reports** are saved to `state/reports/daily_report_YYYY-MM-DD.json`.
 
 ## Configuration
 
-### Gap Momentum Strategy (`bot/morning_config.py`)
+All strategy parameters are in `bot/condor_config.py`:
+
 ```python
-# Universe Filters
-min_price: float = 1.0                      # $1 min price
-max_price: float = 100.0                    # $100 max price
-min_dollar_volume: float = 10_000_000       # $10M ADV floor
-min_5min_volume: float = 250_000            # $250K first 5-min volume
-min_gap_pct: float = 0.05                   # 5% min gap
-max_gap_pct: float = 0.25                   # 25% max gap
-opening_breakout: bool = True               # Price > first 1-min bar high
-max_seed_universe: int = 4000               # 4,000 stocks screened
-max_candidates_monitored: int = 35          # 35 final candidates
+# Condor strikes
+short_strike_pct = 0.009    # 0.90% OTM from anchor
+wing_width_pct = 0.010      # 1.00% wing width
+target_credit = 1.30        # Target net credit per contract
+max_loss_per_contract = 3.70
 
-# Position Sizing
-daily_deploy_pct: float = 0.85              # 85% of equity deployed
-max_per_ticker_pct: float = 0.25            # 25% max per position
-max_position_pct_of_5min_vol: float = 0.01  # 1% of 5-min volume
-min_order_dollars: float = 25.0             # $25 minimum order
+# Defense
+defense_trigger_pct = 0.010 # 1.00% move from anchor triggers close
 
-# Risk Guardrails
-max_concurrent: int = 25                    # Max positions
-max_trades_per_day: int = 25                # Max trades/day
-daily_kill_r: float = -3.0                  # Stop at -3R daily
+# Directional filters
+vix_threshold = 18.0
+morning_range_pct = 0.004   # 0.40%
+morning_direction_pct = 0.003  # 0.30%
 
-# Exit Rules
-take_profit_pct: float = 0.05               # 5% trailing activation
-trail_pct: float = 0.015                    # 1.5% trailing stop
-stop_loss_pct: float = 0.05                 # 5% hard stop
+# Directional sizing
+equity_risk_pct = 0.0125    # 1.25% of cash
+leverage_multiplier = 5.0
 ```
 
-## Production Deployment
+## Known Limitations
 
-```bash
-# Recommended cron schedule (run at 8:25 AM)
-25 8 * * 1-5 cd /path/to/Alpaca_bot && python -m bot.integrated_main
-
-# The bot handles all timing internally:
-# - 8:30 AM: Bot starts, universe build
-# - 8:30-9:25 AM: Multi-stage candidate scanning
-# - 9:40 AM: Entry window opens
-# - 2:30 PM: Hard exit guarantee
-# - 4:05 PM: Liquidity ranking generation
-# - 4:10 PM: Bot shutdown
-```
-
-## Recent Updates (March 2026)
-
-### 🎯 Multi-Stage Candidate Scanning Timeline
-**Problem:** Previous single-stage scanning at 9:00 AM was inefficient and used expensive data feeds unnecessarily.
-
-**Solution:** Implemented 4-stage refinement pipeline with intelligent feed selection:
-- **Stage 1 (8:30 AM):** Broad filter using delayed_sip snapshots (15-min delayed, free)
-- **Stage 2 (9:05 AM):** First live refinement using IEX snapshots (free live data)
-- **Stage 3 (9:15 AM):** Second IEX refinement (narrow to final watchlist)
-- **Stage 4 (9:25 AM):** Freeze candidates, prepare sizing, start stream at 9:28 AM
-
-**Impact:** Reduced API costs, improved candidate quality, better data freshness at entry time.
-
-### 🔄 Automated Liquidity Ranking System
-**Problem:** Universe selection was arbitrary (alphabetical), not based on tradability.
-
-**Solution:** Implemented daily post-market job (4:05 PM) that:
-- Fetches prior-day bars for all tradable symbols
-- Calculates dollar volume (prev_close × prev_volume)
-- Ranks and selects top 4,000 most liquid symbols
-- Handles weekends/holidays by fetching last 5 days and using most recent bar
-- Runs even if position state has issues (resilient execution)
-
-**Impact:** Universe now consists of most liquid, tradable stocks. Better fill rates and tighter spreads.
-
-### 🎯 Smart Entry Order Management
-**Problem:** Previous logic canceled ANY open entry order immediately (too aggressive).
-
-**Solution:** Implemented intelligent cancellation logic:
-- Only cancel if **age >= 60 seconds** OR **price moved >= 1% above limit**
-- Uses submitted_ts from pending state for accurate age tracking
-- Uses broker's actual limit_price (fallback to intended_price)
-- Uses latest quote cache for price movement check
-- Logs cancellation reason (time vs price trigger)
-
-**Impact:** Orders given time to fill (60s window), better fill rates, prevents premature cancellations.
-
-### ✅ Partial Fill Position Handling
-**Problem:** Partial fills were being discarded (marked done, no position opened).
-
-**Solution:** Fixed both immediate execution and reconciliation paths:
-- **Immediate partial fills:** Open position with filled quantity, mark done for day
-- **Reconciled partial fills:** Same behavior, consistent across all code paths
-- Proper deployment tracking (on_deploy called)
-- Proper stats recording (record_entry called)
-
-**Impact:** Partial fills now create real positions, proper risk tracking, no lost capital.
-
-### 🐛 Critical Bug Fixes
-**Reconciliation Iteration Bug:**
-- **Before:** `for pending in pending_entries:` (iterates dict keys, not values)
-- **After:** `for client_order_id, pending in pending_entries.items()`
-- **Impact:** Would have crashed on first reconciliation attempt
-
-**Partial Fill Deployment Tracking:**
-- **Before:** Reconciled partial fills didn't call `on_deploy()` or `record_entry()`
-- **After:** Proper deployment and stats tracking for all partial fills
-- **Impact:** Accurate risk management and reporting
-
-### 📊 Comprehensive Monitoring System
-**Problem:** No visibility into execution quality, slippage, or strategy performance.
-
-**Solution:** Implemented 11-section monitoring system with 4-layer reporting:
-- **11 Monitoring Sections:** Dashboard, funnel, entry quality, exit quality, trade outcomes, tallies, risk, data integrity, broker integrity, drift diagnostics, alerts
-- **Live Console:** Compact dashboard every 5 minutes during market hours
-- **EOD Report:** Full daily summary saved to text file
-- **Trade Ledger CSV:** One row per order event for analysis
-- **Rolling Stats JSON:** Persistent cumulative performance metrics
-
-**Impact:** Full visibility into bot performance, execution quality, and risk metrics.
-
-### 🔧 Logging Optimization
-**Problem:** Excessive INFO-level logging cluttered logs during production.
-
-**Solution:** Downgraded verbose logs to DEBUG level:
-- Position sizing details
-- Volume cap calculations
-- Breakeven/trail activation messages
-- Exit reconciliation details
-- Supervision loop status messages
-
-**Impact:** Cleaner production logs, easier to spot important events and errors.
-
-## Development Notes
-
-- **No margin used** - all trades cash-settled
-- **Fractional shares supported** for precise position sizing
-- **Timezone aware** - all times in market timezone (ET)
-- **Crash resilient** - state persistence and recovery
-- **Production tested** - hard exit guarantees verified
-- **Comprehensive monitoring** - 11-section metrics with 4-layer reporting
-- **Smart order management** - 60s age / 1% price cancellation logic
-- **Liquidity-ranked universe** - Top 4,000 symbols by dollar volume
-
-## Key Algorithms
-
-### Dynamic Position Allocation
-```python
-for each candidate (sorted low → high liquidity):
-    base = remaining_cash / remaining_positions
-    vol_limit = candidate.liq_5m_dollar * 0.01  # 1% of 5-min volume
-    target = min(base, 25% cap, vol_limit)
-    if target >= $25:
-        allocate target
-        remaining_cash -= target
-
-# Second pass: distribute leftover to high-liq names (respecting both caps)
-```
-
-### Entry Reconciliation
-- DAY orders return "unknown" status immediately
-- Reconciliation loop checks order status every cycle
-- Fills detected via `get_order_by_id()` polling
-- Position opened when status changes to "filled"
-
-### Fractional Share Handling
-- Check if asset is fractionable via `is_fractionable()`
-- Auto-floor to whole shares if not fractionable
-- Use DAY time_in_force for fractional quantities
+- **Settlement P&L is estimated.** XSP and XND settle off special index values, not SPY/QQQ last trades. Reported P&L should be reconciled against broker statements.
+- **Defense is polling-based.** Sub-second excursions between ~30 s refresh intervals could be missed. Streaming WebSocket defense is not implemented.
+- **Directional sizing falls back to stale data.** If the live option snapshot is unavailable, sizing uses prior close or a $2.00 fallback, which can be far off for 0DTE.
+- **NDX proxy.** XND strike selection and settlement use QQQ × 40 as an NDX approximation. The actual ratio fluctuates slightly.

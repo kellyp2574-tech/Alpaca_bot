@@ -1,39 +1,57 @@
 """
-Gap Momentum Trading Bot
-Runs from 8:30 AM until all positions are closed (hard exit at 2:30 PM)
+0DTE Options Trading Bot — XSP Iron Condor + XND Directional
+Runs from 9:00 AM until 4:15 PM ET daily.
+
+Two independent sleeves:
+  Sleeve 1: XSP Iron Condor (every day at 11:30 AM)
+  Sleeve 2: XND Directional (conditional, 10:45 AM if filters pass)
 """
-import sys
 import logging
 import os
 import time
+import json
 import argparse
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# Import bot components
-from bot import config as ma_config
-from bot import alpaca_client as broker
-from bot.trade_reporter import get_trade_reporter
-from bot.reporting_position_manager import create_reporting_position_manager
-from bot.monitoring import get_session_monitor
-from bot.monitor_reports import print_live_summary, save_eod_report, append_trade_ledger_csv
-
-# Import morning momentum components (now local)
-from bot.morning_config import Config as MMConfig
-from bot.data_sources import init_data_stack, DataStack
-from bot.execution import ExecutionClient, ExecutionConfig
-from bot.position_manager import PositionManager
-from bot.risk_manager import RiskManager
-from bot.state_manager import StateStore as MMStateStore
-from bot.morning_main import EntryContext, EntryLoop, _reconcile_pending_entries
-from bot.clock import market_datetime, market_now, config_window, MARKET_TZ
+from bot import config as cfg
+from bot.condor_config import StrategyConfig
+from bot.options_client import (
+    get_equity,
+    get_option_positions,
+    cancel_all_orders,
+    get_account_info,
+)
+from bot.market_data import (
+    MorningTracker,
+    get_vix_previous_close,
+    refresh_tracker,
+)
+from bot.condor_strategy import CondorStrategy
+from bot.directional_strategy import DirectionalStrategy
 
 # ═══════════════════════════════════════════════════
-# Global Logging setup - all modules will use this
+# Timezone
 # ═══════════════════════════════════════════════════
-os.makedirs(ma_config.LOG_DIR, exist_ok=True)
+MARKET_TZ = ZoneInfo("America/New_York")
 
-LOG_PATH = ma_config.LOG_FILE
+
+def market_now() -> datetime:
+    return datetime.now(MARKET_TZ)
+
+
+def parse_time(time_str: str) -> datetime:
+    """Parse HH:MM into today's datetime in ET."""
+    h, m = map(int, time_str.split(":"))
+    now = market_now()
+    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+# ═══════════════════════════════════════════════════
+# Logging setup
+# ═══════════════════════════════════════════════════
+os.makedirs(cfg.LOG_DIR, exist_ok=True)
+LOG_PATH = cfg.LOG_FILE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,1209 +62,474 @@ logging.basicConfig(
     ],
 )
 
-logger = logging.getLogger("integrated_bot")
+logger = logging.getLogger("condor_bot")
 logger.info(f"Logging initialized: {LOG_PATH}")
 
 
-class IntegratedBot:
-    """Gap momentum trading bot - monitors positions until all closed"""
-    
-    def __init__(self, dry_run=False):
-        logger.info("IntegratedBot.__init__ starting...")
+class CondorBot:
+    """
+    0DTE Options Bot — Daily schedule:
+
+    09:00  Bot starts, pull account info, VIX prev close
+    09:30  Market opens, begin tracking SPY/QQQ bars
+    10:30  Morning assessment (directional filters)
+    10:45  Directional entry (if qualified)
+    11:30  Condor entry (every day)
+    11:30–16:00  Defense monitoring (SPY 1% trigger)
+    16:00  Cash settlement
+    16:15  Shutdown
+    """
+
+    def __init__(self, dry_run: bool = False):
+        logger.info("CondorBot.__init__ starting...")
         self.dry_run = dry_run
-        self.mm_config = MMConfig()
-        self.mm_state_store = MMStateStore("state/mm_positions.json")
-        
-        # Initialize trade reporter with error handling (don't let reporting kill trading)
-        try:
-            self.trade_reporter = get_trade_reporter()
-            logger.info("TradeReporter initialized successfully")
-        except Exception as e:
-            logger.exception("TradeReporter init failed; disabling reporting. Error=%s", e)
-            self.trade_reporter = None
-        
-        # Initialize data stack
-        self.mm_data = init_data_stack()
-        
-        # Initialize execution client
-        exec_cfg = ExecutionConfig(
-            buy_slippage_pct=self.mm_config.exec_slippage_buy_pct,
-            sell_slippage_pct=self.mm_config.exec_slippage_sell_pct,
-        )
-        self.execution = ExecutionClient(
-            paper=ma_config.ALPACA_PAPER,
-            dry_run=dry_run,
-            cfg=exec_cfg,
-            quote_provider=self.mm_data.alpaca.get_latest_quote,
-        )
-        
-        # Risk manager for morning momentum
-        self.risk_manager = RiskManager(self.mm_config, state_store=self.mm_state_store)
-        
-        self.momentum_completed = False
-        self.mm_positions = None
-        self.mm_execution = None
-        self.clock_check_failed = False
-        
-        # Candidate caching to prevent rescans on retry
-        self.mm_candidates = None
-        self.mm_watchlist = None
-        self.mm_subscribe_symbols = None
-        self.mm_candidate_map = None
-        self.mm_candidates_date = None
-        
-        # Stage-specific caching to avoid rebuilding stage 1 on every call
-        self.mm_stage1_result = None
-        self.mm_stage2_result = None
-        self.mm_stage3_result = None
-        self.mm_stages_completed = set()  # Track which stages have been run
-        
-        # Per-stage filter counts for audit trail
-        self.mm_filter_counts = {}   # stage_name -> FilterCounts
-        self.mm_near_misses = []     # NearMiss list from final stage
-        
-        # One-shot latch: prevent repeated hard-exit/flatten spam
-        self.mm_hard_exit_done = False
-        
-        # Initialize monitoring system
-        try:
-            self.monitor = get_session_monitor()
-            logger.info("SessionMonitor initialized")
-        except Exception as e:
-            logger.exception("SessionMonitor init failed; disabling monitoring. Error=%s", e)
-            self.monitor = None
-        
-        self._last_live_summary_ts = 0.0  # monotonic seconds
-        self._last_account_update_ts = 0.0
-    
-    def _update_monitoring(self) -> None:
-        """Periodic monitoring update: account refresh, risk snapshot, live summary, alerts."""
-        if not self.monitor:
-            return
-        try:
-            now_mono = time.monotonic()
-            
-            # Update account every 60 seconds
-            if now_mono - self._last_account_update_ts >= 60:
-                try:
-                    equity = broker.get_equity()
-                    cash = broker.get_cash()
-                    self.monitor.update_account(equity, cash)
-                    
-                    # Update market status
-                    try:
-                        clock = broker.get_clock()
-                        self.monitor.update_market_status(clock.is_open)
-                    except Exception:
-                        pass
-                    
-                    # Update risk exposure from positions
-                    positions = {}
-                    if self.mm_positions is not None:
-                        positions = self.mm_positions.positions
-                    pending_notional = 0.0
-                    try:
-                        pending = self.mm_state_store.load_pending_entries()
-                        for pe in pending.values():
-                            pending_notional += getattr(pe, 'intended_qty', 0) * getattr(pe, 'intended_price', 0)
-                    except Exception:
-                        pass
-                    self.monitor.update_risk_exposure(
-                        positions, equity, cash,
-                        pending_notional=pending_notional,
-                    )
-                    self._last_account_update_ts = now_mono
-                except Exception as e:
-                    logger.debug(f"Monitoring account update failed: {e}")
-            
-            # Print live summary every 5 minutes
-            if now_mono - self._last_live_summary_ts >= 300:
-                self.monitor.check_alerts()
-                print_live_summary(self.monitor)
-                self._last_live_summary_ts = now_mono
-                
-        except Exception as e:
-            logger.debug(f"Monitoring update error: {e}")
-    
-    def _generate_eod_monitoring_report(self) -> None:
-        """Generate end-of-day monitoring reports (all 4 layers)."""
-        if not self.monitor:
-            return
-        try:
-            self.monitor.record_session_stop()
-            
-            # Final account update
-            try:
-                equity = broker.get_equity()
-                cash = broker.get_cash()
-                self.monitor.update_account(equity, cash)
-            except Exception:
-                pass
-            
-            # Final alert check
-            self.monitor.check_alerts()
-            
-            # Layer 1: Final live summary to console
-            print_live_summary(self.monitor)
-            
-            # Layer 2: Full EOD report
-            save_eod_report(self.monitor)
-            
-            # Layer 3: Trade ledger CSV
-            append_trade_ledger_csv(self.monitor)
-            
-            # Layer 4: Rolling stats JSON
-            self.monitor.update_rolling_stats()
-            
-            logger.info("All monitoring reports generated successfully")
-        except Exception as e:
-            logger.exception("Failed to generate EOD monitoring reports: %s", e)
+        self.config = StrategyConfig()
 
-    def _check_orphaned_broker_positions(self):
-        """Check for and log any unexpected positions in broker account."""
-        try:
-            positions = broker.get_all_positions()
-            if not positions:
-                return
-            
-            # Known tickers from both strategies
-            ma_tickers = {
-                ma_config.MA_TRADE_GROWTH,
-                ma_config.MA_TRADE_SAFE,
-                ma_config.MA_TRADE_ALT,
-            }
-            
-            # Get MM positions if available
-            mm_symbols = set()
-            if self.mm_positions:
-                mm_symbols = set(self.mm_positions.positions.keys())
-            
-            known_symbols = ma_tickers | mm_symbols
-            
-            # Check for orphaned positions
-            for pos in positions:
-                symbol = getattr(pos, "symbol", None)
-                qty = float(getattr(pos, "qty", 0) or 0)
-                if symbol and abs(qty) > 0 and symbol not in known_symbols:
-                    logger.warning(f"WARNING: ORPHANED POSITION DETECTED: {symbol} qty={qty} - not tracked by bot")
-                    if self.monitor:
-                        self.monitor.record_broker_event("position_mismatch")
-        except Exception as e:
-            logger.error(f"Failed to check orphaned positions: {e}")
-        
-    def run(self):
-        """Main bot loop from 8:30 AM until all positions closed"""
+        # Strategy modules
+        self.condor = CondorStrategy(self.config.condor, dry_run=dry_run)
+        self.directional = DirectionalStrategy(self.config.directional, dry_run=dry_run)
+
+        # Market data tracker
+        self.tracker = MorningTracker()
+
+        # State flags
+        self.session_started = False
+        self.bars_tracking = False
+        self.assessment_done = False
+        self.directional_entered = False
+        self.condor_entered = False
+        self.settlement_done = False
+
+        # Account info
+        self.start_equity = 0.0
+        self.start_buying_power = 0.0
+
+        # Timing
+        self._last_defense_check = 0.0
+        self._last_price_refresh = 0.0
+        self._last_status_log = 0.0
+
+        # Defense escalation cap — prevents infinite re-close loop if the
+        # broker persistently rejects defense orders.
+        self._defense_escalation_count = 0
+        self.MAX_DEFENSE_ESCALATIONS = 3
+
+    # ─── Session lifecycle ─────────────────────────────────────────────────
+
+    def _start_session(self):
+        """9:00 AM — Pull account info, VIX close, log starting state."""
         logger.info("=" * 60)
-        logger.info("INTEGRATED BOT START" + (" [DRY RUN]" if self.dry_run else ""))
+        logger.info("SESSION START" + (" [DRY RUN]" if self.dry_run else ""))
         logger.info("=" * 60)
-        
-        # Record session start for monitoring
-        if self.monitor:
-            try:
-                equity = broker.get_equity()
-                cash = broker.get_cash()
-                self.monitor.record_session_start(
-                    equity, cash,
-                    strategy_modules=["morning_momentum"],
-                )
-            except Exception as e:
-                logger.warning(f"Could not fetch account info for monitoring: {e}")
-                self.monitor.record_session_start(0.0, 0.0, strategy_modules=["morning_momentum"])
-        
+
         try:
-            # Check if market is open (but allow morning momentum to start at 8:30)
-            clock = broker.get_clock()
-            if not clock.is_open and not self.dry_run:
-                now = market_now()
-                universe_build_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
-                
-                # If it's after 8:30 AM but before market opens, allow morning momentum to start
-                if now.time() >= datetime.strptime("08:30", "%H:%M").time():
-                    logger.info("Market not open yet, but starting morning momentum at 8:30 AM")
-                    # Continue to main loop to start staged candidate building
-                elif now.time() >= datetime.strptime("08:00", "%H:%M").time():
-                    # Between 8:00-8:30: wait for 8:30
-                    wait_seconds = (universe_build_time - now).total_seconds()
-                    if wait_seconds > 0:
-                        logger.info(f"Waiting for morning momentum start at 8:30 AM ({wait_seconds/60:.1f} minutes)")
-                        time.sleep(wait_seconds)
-                else:
-                    logger.info("Market is closed and it's not within operating hours. Exiting.")
-                    return
+            acct = get_account_info()
+            self.start_equity = float(acct.get("equity", 0))
+            self.start_buying_power = float(acct.get("buying_power", 0))
+            cash = float(acct.get("cash", 0))
+            logger.info(
+                "Account: equity=$%.2f buying_power=$%.2f cash=$%.2f",
+                self.start_equity, self.start_buying_power, cash,
+            )
         except Exception as e:
-            logger.warning(f"Could not check market clock: {e}. Continuing in safe mode (no trading until confirmed open)")
-            # Don't exit - continue running but be cautious
-            self.clock_check_failed = True
-        
-        # Main loop
-        while True:
-            now = market_now()
-            current_time = now.time()
-            
-            # Safety exit at 3:30 PM (should have exited earlier when positions closed)
-            if current_time >= datetime.strptime("15:30", "%H:%M").time():
-                logger.warning("Reached 3:30 PM safety exit - positions may still be open")
-                break
-            
-            # If market has closed early, exit gracefully (avoid false negatives at the open)
-            if current_time >= datetime.strptime("09:35", "%H:%M").time() and not self.dry_run:
-                try:
-                    clock = broker.get_clock()
-                    if not clock.is_open:
-                        # require confirmation before exiting
-                        if not hasattr(self, "_closed_clock_first_seen"):
-                            self._closed_clock_first_seen = time.monotonic()
-                            logger.warning(
-                                "Clock reports closed after 9:35; will re-check before exiting. "
-                                f"next_open={getattr(clock,'next_open',None)} next_close={getattr(clock,'next_close',None)}"
-                            )
-                        elif time.monotonic() - self._closed_clock_first_seen > 60:
-                            logger.info("Market clock still closed after confirm window; shutting down loop")
-                            break
-                    else:
-                        # reset if clock is healthy again
-                        if hasattr(self, "_closed_clock_first_seen"):
-                            delattr(self, "_closed_clock_first_seen")
-                except Exception as e:
-                    logger.warning(f"Failed to check market clock during run loop: {e}")
+            logger.error("Failed to fetch account info: %s", e)
 
-            # If clock check failed, be extra cautious before 9:30 AM
-            if self.clock_check_failed and current_time < datetime.strptime("09:30", "%H:%M").time():
-                logger.debug("Clock check failed - waiting until 9:30 AM to ensure market is open")
-                time.sleep(60)
-                continue
-            
-            # Re-check clock status after 9:30 AM if it failed before
-            if self.clock_check_failed and current_time >= datetime.strptime("09:30", "%H:%M").time():
-                try:
-                    clock = broker.get_clock()
-                    if clock.is_open:
-                        logger.info("Clock re-check successful - market is open, proceeding normally")
-                        self.clock_check_failed = False
-                    else:
-                        logger.warning("Clock re-check shows market still closed - continuing to wait")
-                        time.sleep(60)
-                        continue
-                except Exception as e:
-                    logger.warning(f"Clock re-check failed: {e} - continuing to wait")
-                    time.sleep(60)
-                    continue
-            
-            # Morning Momentum: Staged timeline 8:30 AM - hard_exit + 30 min cleanup buffer
-            mm_cleanup_deadline = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
-            mm_cleanup_deadline = (datetime.combine(datetime.today(), mm_cleanup_deadline) + timedelta(minutes=30)).time()
-            if current_time < mm_cleanup_deadline:
-                if not self.momentum_completed:
-                    # If after entry cutoff, skip morning momentum (entry window closed)
-                    if current_time >= datetime.strptime(self.mm_config.entry_cutoff, "%H:%M").time():
-                        logger.info(f"Started after {self.mm_config.entry_cutoff} - morning momentum entry window closed, skipping")
-                        self.momentum_completed = True
-                        continue
-                    
-                    # Staged timeline: Run at appropriate times (8:30, 9:05, 9:15, 9:25)
-                    universe_build = datetime.strptime(self.mm_config.universe_build_time, "%H:%M").time()
-                    
-                    # If before 8:30, wait for universe build time
-                    if current_time < universe_build:
-                        wait_time = now.replace(hour=universe_build.hour, minute=universe_build.minute, second=0, microsecond=0)
-                        wait_seconds = (wait_time - now).total_seconds()
-                        if wait_seconds > 0:
-                            logger.debug(f"Waiting for universe build at {self.mm_config.universe_build_time} ({wait_seconds/60:.1f} minutes)")
-                            time.sleep(min(wait_seconds, 60))  # Check every minute
-                            continue
-                    
-                    # Run morning momentum strategy (handles staged timeline internally)
-                    status = self.run_morning_momentum(now)
-                    if status == "completed":
-                        self.momentum_completed = True
-                        logger.info("Morning momentum completed successfully")
-                    elif status == "in_progress":
-                        # Stage completed, continue normal loop timing (no error, no backoff)
-                        logger.debug("Morning momentum stage completed, continuing...")
-                        time.sleep(5)  # Brief sleep to avoid tight loop
-                    elif status == "failed":
-                        logger.error("Morning momentum failed; waiting 30 seconds before retry")
-                        time.sleep(30)  # Backoff to prevent rapid retry loops
-                    else:
-                        logger.error(f"Unexpected status from run_morning_momentum: {status}")
-                        time.sleep(30)
-                else:
-                    # After momentum completes, supervise positions until hard exit
-                    self._supervise_mm_positions_until_hard_exit(now)
-                    time.sleep(30)  # Prevent tight loop after supervision returns
-                    continue
-            
-            # Periodic monitoring update
-            self._update_monitoring()
-            
-            # Check for any orphaned broker positions after emergency flatten
-            self._check_orphaned_broker_positions()
-            
-            # After hard exit: Monitor positions every 5 minutes until all closed
-            hard_exit_time = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
-            if current_time >= hard_exit_time:
-                positions_closed = self._all_positions_closed()
-                
-                if positions_closed:
-                    # Generate EOD monitoring report before shutdown
-                    self._generate_eod_monitoring_report()
-                    
-                    logger.info("All positions closed - waiting for 4:05 PM to generate liquidity ranking")
-                    
-                    # Sleep until 4:05 PM for liquidity ranking generation
-                    ranking_time = now.replace(hour=16, minute=5, second=0, microsecond=0)
-                    if now < ranking_time:
-                        wait_seconds = (ranking_time - now).total_seconds()
-                        logger.info(f"Sleeping for {wait_seconds/60:.1f} minutes until 4:05 PM")
-                        time.sleep(wait_seconds)
-                    
-                    # Generate liquidity ranking for tomorrow's universe
-                    # This runs regardless of position state to ensure daily refresh
-                    logger.info("Generating liquidity ranking at 4:05 PM...")
-                    self._generate_liquidity_ranking()
-                    
-                    logger.info("Liquidity ranking complete - shutting down")
-                    break
-                else:
-                    # If positions still open past 3:00 PM, generate ranking anyway at 4:05 PM
-                    # to ensure daily refresh even if there's a position state issue
-                    if current_time >= datetime.strptime("15:00", "%H:%M").time():
-                        logger.warning("Positions still open past 3:00 PM - will generate ranking at 4:05 PM anyway")
-                        
-                        ranking_time = now.replace(hour=16, minute=5, second=0, microsecond=0)
-                        if now < ranking_time:
-                            wait_seconds = (ranking_time - now).total_seconds()
-                            logger.info(f"Sleeping for {wait_seconds/60:.1f} minutes until 4:05 PM")
-                            time.sleep(wait_seconds)
-                        
-                        logger.info("Generating liquidity ranking at 4:05 PM (positions may still be open)...")
-                        self._generate_liquidity_ranking()
-                        
-                        logger.warning("Liquidity ranking complete - shutting down with positions potentially open")
-                        break
-                    else:
-                        logger.debug("Positions still open - checking again in 5 minutes")
-                        time.sleep(300)  # 5 minutes
-    
-    def _supervise_mm_positions_until_hard_exit(self, now):
-        """Supervise MM positions until hard exit time, regardless of EntryLoop status."""
-        # One-shot latch: once hard exit has been executed, never run again
-        if self.mm_hard_exit_done:
-            return
-        
-        hard_exit_time = datetime.strptime(self.mm_config.hard_exit, "%H:%M").time()
-        
-        if now.time() >= hard_exit_time:
-            logger.info("Hard exit time reached - forcing MM positions flat")
-            self._force_mm_positions_flat()
-            self.mm_hard_exit_done = True
-            return
-        
-        # Check if we have any MM positions to supervise
-        try:
-            mm_positions = self.mm_state_store.load_positions()
-            if not mm_positions and self.mm_positions is not None:
-                mm_positions = self.mm_positions.positions
+        # VIX previous close
+        self.tracker.vix_prev_close = get_vix_previous_close()
+        if self.tracker.vix_prev_close is not None:
+            logger.info("VIX previous close: %.2f", self.tracker.vix_prev_close)
+        else:
+            logger.warning("VIX data unavailable — directional filters will fail")
 
-            if not mm_positions:
-                logger.debug("No MM positions to supervise - waiting for hard exit")
-                # Sleep until hard exit time
-                hard_exit_dt = now.replace(
-                    hour=int(self.mm_config.hard_exit.split(':')[0]),
-                    minute=int(self.mm_config.hard_exit.split(':')[1]),
-                    second=0, microsecond=0
-                )
-                wait_seconds = (hard_exit_dt - now).total_seconds()
-                if wait_seconds > 0:
-                    logger.debug(f"Waiting for hard exit at {hard_exit_time} ({wait_seconds/60:.1f} minutes)")
-                    time.sleep(min(wait_seconds, 300))  # Cap at 5 minutes, will re-evaluate
-                return
-            
-            logger.debug(f"Supervising {len(mm_positions)} MM positions until hard exit at {hard_exit_time}")
-            
-            # Check exits periodically (every 30 seconds)
-            while now.time() < hard_exit_time:
-                try:
-                    # Use self.mm_positions.positions as single source of truth
-                    if self.mm_positions is not None:
-                        current_positions = self.mm_positions.positions
-                    else:
-                        current_positions = self.mm_state_store.load_positions()
-                        if not current_positions:
-                            logger.debug("All MM positions closed - waiting for hard exit")
-                            break
-                    if not current_positions:
-                        logger.debug("All MM positions closed - waiting for hard exit")
-                        break
-                    
-                    # Get current quotes for exit price checks (batched)
-                    symbols = list(current_positions.keys())
-                    quotes = {}
-                    try:
-                        quote_dict = self.mm_data.alpaca.get_latest_quotes(symbols)
-                        if quote_dict:
-                            quotes = quote_dict
-                    except Exception as e:
-                        logger.warning(f"Failed to get batched quotes for MM supervision: {e}")
-                    
-                    # Check position exits using quotes (not calling on_bar with Quote objects)
-                    for symbol in list(current_positions.keys()):
-                        if symbol in quotes:
-                            quote = quotes[symbol]
-                            position = current_positions.get(symbol)
-                            if position and quote.bid_price > 0:
-                                # Check if stop loss hit
-                                if quote.bid_price <= position.stop_price:
-                                    logger.info(f"Stop loss hit for {symbol}: bid={quote.bid_price:.2f} <= stop={position.stop_price:.2f}")
-                                    if self.mm_positions is not None:
-                                        self.mm_positions.exit_position(symbol, quote.bid_price, market_now(), reason="stop_loss")
-                                    else:
-                                        logger.warning("MM supervisor: no active position manager, forcing broker close for %s", symbol)
-                                        order = self.execution.client.close_position(symbol)
-                                        try:
-                                            stored_positions = self.mm_state_store.load_positions()
-                                        except RuntimeError as err:
-                                            logger.critical(
-                                                "Unable to load MM state while supervising %s broker close: %s",
-                                                symbol,
-                                                err,
-                                            )
-                                            stored_positions = {}
+        self.session_started = True
 
-                                        state = stored_positions.get(symbol)
-                                        if state is not None:
-                                            state.exit_pending = True
-                                            state.exit_reason = "supervisor_broker_close"
-                                            state.exit_submitted_ts = time.monotonic()
-                                            state.exit_order_id = getattr(order, "id", state.exit_order_id)
-                                            if getattr(order, "client_order_id", None):
-                                                state.exit_client_order_id = order.client_order_id
-                                            self.mm_state_store.save_positions(stored_positions)
-                                        else:
-                                            logger.warning(
-                                                "Supervisor broker close for %s without stored position; state may already be cleared",
-                                                symbol,
-                                            )
-                    
-                    # Sleep for 30 seconds
-                    time.sleep(30)
-                    now = market_now()
-                    
-                except Exception as e:
-                    logger.error(f"Error in MM position supervision: {e}")
-                    time.sleep(30)
-                    now = market_now()
-            
-            # Force flat at hard exit time regardless
-            if self.mm_positions is not None:
-                logger.info("Hard exit time reached - forcing MM positions flat")
-                self._force_mm_positions_flat()
-            else:
-                logger.warning("MM supervisor: no active position manager, skipping force flat")
-            self.mm_hard_exit_done = True
-            
-        except Exception as e:
-            logger.error(f"Critical error in MM position supervision: {e}")
-            # Emergency flatten on error
-            if self.mm_positions is not None:
-                self._force_mm_positions_flat()
-            else:
-                logger.warning("MM supervisor: no active position manager, skipping emergency flatten")
-            self.mm_hard_exit_done = True
-    
-    def _force_mm_positions_flat(self):
-        """Force all MM positions flat immediately."""
-        try:
-            logger.warning("EMERGENCY: Forcing all MM positions flat")
-            
-            # Cancel all MM orders first
-            self._cancel_all_mm_orders()
-            
-            runtime_manager = self.mm_positions
-            runtime_positions = {}
-            if runtime_manager is not None:
-                runtime_positions = dict(runtime_manager.positions)
-
-            try:
-                stored_positions = self.mm_state_store.load_positions()
-            except RuntimeError as e:
-                logger.critical(f"Unable to load stored MM positions during emergency flatten: {e}")
-                stored_positions = {}
-
-            allowed_symbols = set(runtime_positions.keys()) | set(stored_positions.keys())
-
-            if not allowed_symbols:
-                logger.info("No MM positions recorded; nothing to flatten")
-                return
-
-            # Get current prices for all tracked symbols (batched)
-            price_lookup = {}
-            symbols = list(allowed_symbols)
-            
-            try:
-                quote_dict = self.mm_data.alpaca.get_latest_quotes(symbols)
-            except Exception as e:
-                logger.warning(f"Failed to get batched quotes during emergency flatten: {e}")
-                quote_dict = {}
-            
-            for symbol in symbols:
-                quote = quote_dict.get(symbol) if quote_dict else None
-                if quote and getattr(quote, "bid_price", 0) > 0:
-                    price_lookup[symbol] = quote.bid_price
-                else:
-                    position = runtime_positions.get(symbol) or stored_positions.get(symbol)
-                    if position:
-                        price_lookup[symbol] = position.peak_price or position.entry_price
-
-            # Force exits using runtime manager when available, otherwise broker fallback
-            closed_symbols: set[str] = set()
-
-            if runtime_manager is not None and runtime_manager.positions:
-                before_symbols = set(runtime_manager.positions.keys())
-                runtime_manager.force_exit_all(price_lookup, reason="emergency_hard_exit")
-
-                logger.info("Starting MM time-based exit reconciliation...")
-                runtime_manager.reconcile_pending_exits_time_based(max_wait_seconds=30.0)
-
-                remaining_symbols = set(runtime_manager.positions.keys())
-                closed_symbols.update(before_symbols - remaining_symbols)
-
-                if remaining_symbols:
-                    logger.error(
-                        "CRITICAL: %d MM positions still open after emergency flatten via manager",
-                        len(remaining_symbols),
-                    )
-                    self._emergency_mm_flatten()
-            else:
-                client = getattr(self.mm_execution, "client", None) or getattr(self.execution, "client", None)
-                if client is None:
-                    logger.critical("No execution client available for emergency flatten fallback")
-                for symbol in allowed_symbols:
-                    try:
-                        logger.critical(f"Emergency closing MM position (fallback) {symbol}")
-                        order = None
-                        if client:
-                            order = client.close_position(symbol)
-
-                        state = (
-                            runtime_positions.get(symbol)
-                            or stored_positions.get(symbol)
-                        )
-                        if state is None:
-                            logger.warning(
-                                "Fallback emergency close for %s without stored state; tracking skipped",
-                                symbol,
-                            )
-                            continue
-
-                        state.exit_reason = "integrated_emergency_close"
-                        state.exit_pending = True
-                        state.exit_submitted_ts = time.monotonic()
-                        state.exit_time = None
-                        if order is not None:
-                            state.exit_order_id = getattr(order, "id", state.exit_order_id)
-                            client_id = getattr(order, "client_order_id", None)
-                            if client_id:
-                                state.exit_client_order_id = client_id
-
-                        stored_positions[symbol] = state
-                        if runtime_manager is not None and symbol in runtime_manager.positions:
-                            runtime_manager.positions[symbol] = state
-                    except Exception as e:
-                        logger.error(f"Failed to emergency close {symbol}: {e}")
-
-            # Persist cleared state
-            if runtime_manager is not None:
-                stored_positions = dict(runtime_manager.positions)
-            self.mm_state_store.save_positions(stored_positions)
-            
-        except Exception as e:
-            logger.error(f"Critical error forcing MM positions flat: {e}")
-    
-    def _cancel_all_mm_orders(self):
-        """Cancel all MM-related orders."""
-        try:
-            client = getattr(self.mm_execution, "client", None) or getattr(self.execution, "client", None)
-            if client:
-                orders = client.get_orders()
-                mm_symbols = set()
-                if self.mm_positions is not None:
-                    mm_symbols.update(self.mm_positions.positions.keys())
-                try:
-                    mm_symbols.update(self.mm_state_store.load_positions().keys())
-                except Exception:
-                    pass
-                
-                for order in orders:
-                    order_status = getattr(order, 'status', None)
-                    client_order_id = getattr(order, 'client_order_id', None)
-                    symbol = getattr(order, 'symbol', None)
-                    
-                    # Cancel any order that's still open
-                    if (
-                        order_status in {'new', 'partially_filled', 'submitted', 'accepted'}
-                        and symbol in mm_symbols
-                        and client_order_id
-                        and (
-                            client_order_id.startswith("ENTRY:")
-                            or client_order_id.startswith("EXIT:")
-                            or client_order_id.startswith("MM:")
-                        )
-                    ):
-                        try:
-                            client.cancel_order(order.id)
-                            logger.info(f"Cancelled MM order {order.id} for {symbol} ({client_order_id})")
-                            
-                            # Clear pending entry state if it's an entry order
-                            if client_order_id and client_order_id.startswith("ENTRY:"):
-                                self.mm_state_store.clear_pending_entry(client_order_id)
-                                
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel MM order {order.id}: {e}")
-                            
-        except Exception as e:
-            logger.warning(f"Error cancelling MM orders: {e}")
-    
-    def _emergency_mm_flatten(self):
-        """Emergency flatten for MM positions - close everything at market."""
-        try:
-            logger.critical("EMERGENCY MM FLATTEN: Closing all positions at market")
-            
-            client = getattr(self.mm_execution, "client", None) or getattr(self.execution, "client", None)
-            if client is None:
-                logger.critical("No execution client available for emergency MM flatten")
-                return
-
-            # Get all positions from broker
-            positions = client.get_positions()
-            allowed_symbols = set()
-            if self.mm_positions is not None:
-                allowed_symbols.update(self.mm_positions.positions.keys())
-            try:
-                stored_positions = self.mm_state_store.load_positions()
-                allowed_symbols.update(stored_positions.keys())
-            except Exception:
-                stored_positions = {}
-            
-            for pos in positions:
-                symbol = getattr(pos, 'symbol', None)
-                qty = float(getattr(pos, 'qty', 0) or 0)
-
-                if symbol and qty > 0 and symbol in allowed_symbols:
-                    try:
-                        logger.critical(f"Emergency closing MM position {symbol} ({qty} shares)")
-                        order = client.close_position(symbol)
-
-                        state = None
-                        if self.mm_positions is not None:
-                            state = self.mm_positions.positions.get(symbol)
-                        if state is None:
-                            state = stored_positions.get(symbol)
-                        if state is None:
-                            logger.warning("Emergency flatten: no state record for %s; unable to track close", symbol)
-                            continue
-
-                        state.exit_reason = "integrated_emergency_close"
-                        state.exit_pending = True
-                        state.exit_submitted_ts = time.monotonic()
-                        state.exit_time = None
-                        state.exit_order_id = getattr(order, "id", state.exit_order_id)
-                        client_id = getattr(order, "client_order_id", None)
-                        if client_id:
-                            state.exit_client_order_id = client_id
-
-                        stored_positions[symbol] = state
-                        if self.mm_positions is not None:
-                            self.mm_positions.positions[symbol] = state
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to emergency close {symbol}: {e}")
-
-            # Save state
-            self.mm_state_store.save_positions(stored_positions)
-            
-        except Exception as e:
-            logger.error(f"Critical error in emergency MM flatten: {e}")
-
-    def _write_candidate_audit(self, now, candidates) -> None:
-        """Always write candidate audit JSON, even when candidates=0."""
-        import json
-        from dataclasses import asdict
-        try:
-            reports_dir = Path(__file__).resolve().parents[1] / "state" / "reports"
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            
-            date_str = now.date().isoformat()
-            audit_path = reports_dir / f"mm_candidate_audit_{date_str}.json"
-            
-            # Build per-stage filter breakdown
-            filter_stages = {}
-            for stage_name, fc in self.mm_filter_counts.items():
-                filter_stages[stage_name] = asdict(fc)
-            
-            # Build near-miss list
-            near_miss_list = []
-            for nm in self.mm_near_misses[:25]:
-                near_miss_list.append({
-                    "symbol": nm.symbol,
-                    "reason": nm.reason,
-                    "detail": nm.detail,
-                })
-            
-            # Build candidate summary
-            candidate_list = []
-            for c in (candidates or [])[:50]:
-                candidate_list.append({
-                    "symbol": c.symbol,
-                    "price": round(c.price, 4),
-                    "prev_close": round(c.prev_close, 4),
-                    "gap_pct": round(c.gap_pct, 4),
-                })
-            
-            audit = {
-                "date": date_str,
-                "freeze_time": self.mm_config.candidate_freeze,
-                "stages_completed": sorted(self.mm_stages_completed),
-                "candidates_found": len(candidates) if candidates else 0,
-                "filter_counts_by_stage": filter_stages,
-                "near_misses": near_miss_list,
-                "candidates": candidate_list,
-                "config_snapshot": {
-                    "min_gap_pct": self.mm_config.min_gap_pct,
-                    "max_gap_pct": self.mm_config.max_gap_pct,
-                    "min_price": self.mm_config.min_price,
-                    "max_price": self.mm_config.max_price,
-                    "min_dollar_volume": self.mm_config.min_dollar_volume,
-                },
-            }
-            
-            with open(audit_path, "w") as f:
-                json.dump(audit, f, indent=2)
-            
-            logger.info(f"Candidate audit written to {audit_path}")
-        except Exception as e:
-            logger.error(f"Failed to write candidate audit: {e}")
-
-    def run_morning_momentum(self, now) -> str:
-        """Run morning momentum strategy with staged timeline.
-        
-        Returns:
-            "in_progress": Stage completed, more stages pending
-            "completed": All stages done, entry loop started
-            "failed": Error occurred
+    def _start_bar_tracking(self):
         """
-        logger.info("Starting morning momentum strategy (staged timeline)")
+        9:30 AM — Begin recording SPY and QQQ prices.
+
+        If the bot starts after 9:30 AM, refresh_tracker() will backfill
+        the daily-bar open/high/low from the Alpaca snapshot so that
+        morning range calculations are as accurate as possible even on
+        a late start.
+        """
+        now = market_now()
+        market_open_t = parse_time(self.config.schedule.market_open)
+        late_minutes = (now - market_open_t).total_seconds() / 60
+        if late_minutes > 5:
+            logger.warning(
+                "Late start detected: market has been open %.0f min. "
+                "Open prices will be backfilled from Alpaca daily bar.",
+                late_minutes,
+            )
+
+        logger.info("Market open — starting SPY/QQQ price tracking")
+        self.tracker = refresh_tracker(self.tracker)
+        self.bars_tracking = True
+        logger.info(
+            "Initial prices: SPY=$%.2f (open=$%.2f) QQQ=$%.2f (open=$%.2f)",
+            self.tracker.spy_last, self.tracker.spy_open or 0,
+            self.tracker.qqq_last, self.tracker.qqq_open or 0,
+        )
+
+    def _refresh_prices(self):
+        """Refresh SPY/QQQ prices periodically."""
+        now_mono = time.monotonic()
+        if now_mono - self._last_price_refresh < 30:
+            return
+        self._last_price_refresh = now_mono
 
         try:
-            from .premarket_scan_staged import (
-                stage1_broad_filter_delayed_sip,
-                stage2_first_iex_refinement,
-                stage3_second_iex_refinement,
-            )
-            from .morning_main_staged import wait_for_timeline_stage
-            
-            # Check if we need to reset for a new day
-            today = now.date()
-            if self.mm_candidates_date != today:
-                logger.info("New day detected - resetting stage cache")
-                self.mm_stage1_result = None
-                self.mm_stage2_result = None
-                self.mm_stage3_result = None
-                self.mm_stages_completed = set()
-                self.mm_candidates_date = today
-                self.mm_filter_counts = {}
-                self.mm_near_misses = []
-            
-            # Determine current stage based on time
-            current_time = now.time()
-            stage1_time = datetime.strptime(self.mm_config.broad_filter_start, "%H:%M").time()
-            stage2_time = datetime.strptime(self.mm_config.first_refinement, "%H:%M").time()
-            stage3_time = datetime.strptime(self.mm_config.second_refinement, "%H:%M").time()
-            freeze_time = datetime.strptime(self.mm_config.candidate_freeze, "%H:%M").time()
-            post_open_retry_time = datetime.strptime("09:35", "%H:%M").time()
-            
-            # Stage 1: 8:30-8:40 broad filter (run once)
-            if current_time >= stage1_time and 1 not in self.mm_stages_completed:
-                logger.info("Running Stage 1: Broad filter (delayed_sip) at %s", current_time.strftime('%H:%M'))
-                
-                # Build universe from Alpaca Assets API (cached)
-                from .universe_loader import build_universe
-                
-                logger.info("Building 4,000-symbol universe from Alpaca Assets API...")
-                seed_symbols = build_universe(
-                    broker,
-                    target_size=self.mm_config.max_seed_universe,
-                )
-                
-                if not seed_symbols:
-                    logger.error("Failed to build universe, cannot proceed with Stage 1")
-                    return "failed"
-                
-                logger.info(f"Universe built: {len(seed_symbols)} symbols from Alpaca Assets")
-                
-                # Run stage 1 with pre-built universe
-                result1 = stage1_broad_filter_delayed_sip(
-                    self.mm_config,
-                    self.mm_data.alpaca,
-                    seed_symbols,
-                    now,
-                )
-                self.mm_stage1_result = result1.candidates
-                self.mm_stages_completed.add(1)
-                self.mm_filter_counts["stage1"] = result1.filter_counts
-                self.mm_near_misses = result1.near_misses
-                logger.info(f"Stage 1 complete: {len(self.mm_stage1_result)} candidates cached")
-                
-                # Record funnel metrics from Stage 1 ledger
-                if self.monitor:
-                    ledger = result1.ledger
-                    drop_reasons = {}
-                    for drop in ledger.drops:
-                        drop_reasons[drop.reason] = drop_reasons.get(drop.reason, 0) + 1
-                    self.monitor.record_funnel(
-                        starting_universe=ledger.seed_total,
-                        valid_data=ledger.seed_selected,
-                        pass_all=ledger.validated,
-                        final_ranked=ledger.final,
-                        drop_reasons=drop_reasons,
-                    )
-                
-                # Return to loop - don't block waiting for next stage
-                return "in_progress"  # Stage 1 done, more stages pending
-            
-            # Stage 2: 9:05 first IEX refinement (run once)
-            if current_time >= stage2_time and 2 not in self.mm_stages_completed:
-                if 1 not in self.mm_stages_completed:
-                    logger.warning("Stage 2 triggered but Stage 1 not complete - running Stage 1 first")
-                    
-                    # Build universe from Alpaca Assets API
-                    from .universe_loader import build_universe
-                    
-                    seed_symbols = build_universe(
-                        broker,
-                        target_size=self.mm_config.max_seed_universe,
-                    )
-                    
-                    if not seed_symbols:
-                        logger.error("Failed to build universe for recovery Stage 1")
-                        return "failed"
-                    
-                    # Run stage 1 first if missed
-                    result1 = stage1_broad_filter_delayed_sip(
-                        self.mm_config,
-                        self.mm_data.alpaca,
-                        seed_symbols,
-                        now,
-                    )
-                    self.mm_stage1_result = result1.candidates
-                    self.mm_stages_completed.add(1)
-                    self.mm_filter_counts["stage1"] = result1.filter_counts
-                    self.mm_near_misses = result1.near_misses
-                
-                logger.info("Running Stage 2: First IEX refinement at %s", current_time.strftime('%H:%M'))
-                result2 = stage2_first_iex_refinement(
-                    self.mm_config,
-                    self.mm_data.alpaca,
-                    self.mm_stage1_result,
-                )
-                self.mm_stage2_result = result2.candidates
-                self.mm_stages_completed.add(2)
-                self.mm_filter_counts["stage2"] = result2.filter_counts
-                self.mm_near_misses = result2.near_misses
-                logger.info(f"Stage 2 complete: {len(self.mm_stage2_result)} candidates cached")
-                # Return to loop - don't block waiting for next stage
-                return "in_progress"  # Stage 2 done, more stages pending
-            
-            # Stage 3: 9:15 second IEX refinement (run once)
-            if current_time >= stage3_time and 3 not in self.mm_stages_completed:
-                if 2 not in self.mm_stages_completed:
-                    logger.warning("Stage 3 triggered but Stage 2 not complete - running stages in order")
-                    # Run missing stages first
-                    if 1 not in self.mm_stages_completed:
-                        # Build universe from Alpaca Assets API
-                        from .universe_loader import build_universe
-                        
-                        seed_symbols = build_universe(
-                            broker,
-                            target_size=self.mm_config.max_seed_universe,
-                        )
-                        
-                        if not seed_symbols:
-                            logger.error("Failed to build universe for recovery Stage 1")
-                            return "failed"
-                        
-                        result1 = stage1_broad_filter_delayed_sip(
-                            self.mm_config,
-                            self.mm_data.alpaca,
-                            seed_symbols,
-                            now,
-                        )
-                        self.mm_stage1_result = result1.candidates
-                        self.mm_stages_completed.add(1)
-                        self.mm_filter_counts["stage1"] = result1.filter_counts
-                    
-                    result2 = stage2_first_iex_refinement(
-                        self.mm_config,
-                        self.mm_data.alpaca,
-                        self.mm_stage1_result,
-                    )
-                    self.mm_stage2_result = result2.candidates
-                    self.mm_stages_completed.add(2)
-                    self.mm_filter_counts["stage2"] = result2.filter_counts
-                
-                logger.info("Running Stage 3: Second IEX refinement at %s", current_time.strftime('%H:%M'))
-                result3 = stage3_second_iex_refinement(
-                    self.mm_config,
-                    self.mm_data.alpaca,
-                    self.mm_stage2_result,
-                )
-                self.mm_stage3_result = result3.candidates
-                self.mm_stages_completed.add(3)
-                self.mm_filter_counts["stage3"] = result3.filter_counts
-                self.mm_near_misses = result3.near_misses
-                logger.info(f"Stage 3 complete: {len(self.mm_stage3_result)} candidates cached")
-                # Return to loop - don't block waiting for freeze
-                return "in_progress"  # Stage 3 done, waiting for freeze
-            
-            # Candidate freeze: 9:25 - only proceed if we've reached freeze time
-            if current_time < freeze_time:
-                logger.info("Waiting for candidate freeze at %s (returning to loop)", self.mm_config.candidate_freeze)
-                return "in_progress"  # Waiting for freeze time
-            
-            # Use final stage results
-            if 3 in self.mm_stages_completed:
-                candidates = self.mm_stage3_result
-            elif 2 in self.mm_stages_completed:
-                candidates = self.mm_stage2_result
-            elif 1 in self.mm_stages_completed:
-                candidates = self.mm_stage1_result
-            else:
-                logger.error("No stages completed - cannot proceed")
-                return "failed"
-            
-            # ── Stage 4: Post-open retry ──────────────────────────────────
-            # If pre-open freeze yielded 0 candidates AND we're past 09:35,
-            # re-run Stage 3 with live post-open data. This catches days where
-            # pre-open gaps weren't visible but post-open momentum exists.
-            if not candidates and 4 not in self.mm_stages_completed:
-                if current_time < post_open_retry_time:
-                    logger.info(
-                        "Zero candidates at freeze; waiting for post-open retry at 09:35 "
-                        "(returning to loop)"
-                    )
-                    return "in_progress"
-                
-                logger.warning(
-                    "Zero candidates after pre-open freeze -- running Stage 4 post-open retry at %s",
-                    current_time.strftime('%H:%M'),
-                )
-                
-                # Determine best input list for retry
-                retry_input = (
-                    self.mm_stage2_result
-                    or self.mm_stage1_result
-                    or []
-                )
-                if retry_input:
-                    result4 = stage3_second_iex_refinement(
-                        self.mm_config,
-                        self.mm_data.alpaca,
-                        retry_input,
-                    )
-                    candidates = result4.candidates
-                    self.mm_filter_counts["stage4_post_open"] = result4.filter_counts
-                    self.mm_near_misses = result4.near_misses
-                    logger.info(f"Stage 4 post-open retry: {len(candidates)} candidates found")
-                else:
-                    logger.warning("No stage 1/2 pool available for post-open retry")
-                
-                self.mm_stages_completed.add(4)
-            
-            # ── Always write candidate audit file ─────────────────────────
-            self._write_candidate_audit(now, candidates)
-            
-            if not candidates:
-                logger.warning("No morning momentum candidates found (all stages exhausted)")
-                return "completed"  # No candidates but not an error
-            
-            logger.info("Candidates frozen at %s", self.mm_config.candidate_freeze)
-            
-            # Cache final results for entry loop
-            self.mm_candidates = candidates
-            self.mm_watchlist = candidates[:self.mm_config.max_candidates_monitored]
-            self.mm_subscribe_symbols = [c.symbol for c in candidates[:self.mm_config.max_subscribe_symbols]]
-            self.mm_candidate_map = {c.symbol: c for c in candidates[:self.mm_config.max_subscribe_symbols]}
-            
-            logger.info(f"Final candidates: {len(candidates)} total")
-            logger.info(f"Watchlist: {len(self.mm_watchlist)} symbols")
-            logger.info(f"Subscribe: {len(self.mm_subscribe_symbols)} symbols")
-            logger.info(f"Stages completed: {sorted(self.mm_stages_completed)}")
-            
-            # Update funnel metrics with final numbers
-            if self.monitor:
-                self.monitor.funnel.final_ranked_candidates = len(candidates)
-                self.monitor.funnel.selected_for_sizing = len(self.mm_watchlist)
-                self.monitor.dashboard.candidates_found = len(candidates)
-            
-            # Use final cached values
-            watchlist = self.mm_watchlist
-            subscribe_symbols = self.mm_subscribe_symbols
-            candidate_map = self.mm_candidate_map
-            candidates = self.mm_candidates
-            
-            logger.info(f"Morning momentum watchlist: {', '.join(c.symbol for c in watchlist)}")
-            
-            # Initialize position manager
-            positions = PositionManager(
-                self.mm_config, 
-                self.execution, 
-                self.risk_manager, 
-                state_store=self.mm_state_store
-            )
-            
-            # Wrap with reporting functionality
-            positions = create_reporting_position_manager(positions, "morning_momentum")
-
-            # Store for supervision
-            self.mm_positions = positions
-            self.mm_execution = self.execution
-            
-            # Load existing positions
-            existing_positions = self.mm_state_store.load_positions()
-            if existing_positions:
-                positions.load_states(existing_positions)
-            
-            # Load risk state
-            risk_payload = self.mm_state_store.load_risk_state()
-            self.risk_manager.load_state(risk_payload)
-            self.risk_manager.maybe_reset(now.date())
-            
-            # Reconcile pending entries
-            _reconcile_pending_entries(self.execution, self.mm_state_store, positions)
-            
-            # Get account info
-            try:
-                equity = broker.get_equity()
-                cash = broker.get_cash()
-            except Exception as e:
-                logger.error(f"Could not fetch account info: {e}")
-                equity = 100000  # Default
-                cash = equity
-            
-            # Create entry context
-            ctx = EntryContext(
-                cfg=self.mm_config,
-                data=self.mm_data,
-                watchlist=watchlist,
-                max_bar_history=120,
-                candidate_map=candidate_map,
-                risk_manager=self.risk_manager,
-                account_equity=equity,
-                account_cash=cash,
-                execution=self.execution,
-                positions=positions,
-                state_store=self.mm_state_store,
-                subscribe_symbols=subscribe_symbols,
-            )
-            
-            # Run entry loop
-            loop = EntryLoop(ctx)
-            loop.run()
-
-            # After loop completes, mark done
-            logger.info("Morning momentum loop completed")
-            status = "completed"
-
-            # Save latest state
-            if self.mm_positions is not None:
-                self.mm_state_store.save_positions(self.mm_positions.positions)
-            self.risk_manager.persist_state()
-
-            # Check orphaned positions post MM run
-            self._check_orphaned_broker_positions()
-            
-            # Only unsubscribe on success to avoid resubscription churn on retry
-            try:
-                self.mm_data.unsubscribe_all()
-                logger.info("Unsubscribed from all data feeds after successful completion")
-            except Exception as e:
-                logger.warning(f"Failed to unsubscribe data feeds: {e}")
-
+            self.tracker = refresh_tracker(self.tracker)
         except Exception as e:
-            logger.error(f"Error running morning momentum: {e}", exc_info=True)
-            # Ensure supervision components reflect failure
-            if self.mm_positions is None:
-                logger.error("Morning momentum initialization failed before position manager setup")
-            else:
-                logger.error("Morning momentum encountered an error after initialization; supervision will attempt emergency flatten if needed")
-            # On failure, avoid using partial state and keep subscriptions for retry
-            self.mm_positions = None
-            self.mm_execution = None
-            logger.info("Keeping data feed subscriptions active for retry")
-            return "failed"
+            logger.warning("Price refresh failed: %s", e)
 
-        return status
+    # ─── Morning assessment ────────────────────────────────────────────────
 
-    def _generate_liquidity_ranking(self) -> None:
-        """Generate liquidity ranking file for tomorrow's universe selection."""
+    def _morning_assessment(self):
+        """10:30 AM — Check directional filters."""
+        logger.info("=" * 40)
+        logger.info("MORNING ASSESSMENT — 10:30 AM")
+        logger.info("=" * 40)
+
+        # Final price refresh before assessment
+        self.tracker = refresh_tracker(self.tracker)
+
+        qualified = self.directional.assess_filters(self.tracker)
+        self.assessment_done = True
+
+        logger.info(
+            "QQQ open=$%.2f high=$%.2f low=$%.2f last=$%.2f range=%.3f%% dir=%.3f%%",
+            self.tracker.qqq_open or 0, self.tracker.qqq_high,
+            self.tracker.qqq_low, self.tracker.qqq_last,
+            self.tracker.qqq_morning_range_pct * 100,
+            self.tracker.qqq_morning_direction_pct * 100,
+        )
+
+        if not qualified:
+            logger.info("Directional trade: NO TRADE today")
+
+    def _enter_directional(self):
+        """10:45 AM — Enter directional trade if qualified."""
+        if not self.directional.state.qualified:
+            logger.info("Directional: Skipping — not qualified")
+            self.directional_entered = True
+            return
+
+        logger.info("=" * 40)
+        logger.info("DIRECTIONAL ENTRY — 10:45 AM")
+        logger.info("=" * 40)
+
+        # Refresh prices right before entry
+        self.tracker = refresh_tracker(self.tracker)
+
+        success = self.directional.enter(self.tracker)
+        self.directional_entered = True
+
+        if success:
+            logger.info("Directional trade entered successfully")
+        else:
+            logger.warning("Directional trade entry failed")
+
+    # ─── Condor entry ──────────────────────────────────────────────────────
+
+    def _enter_condor(self):
+        """11:30 AM — Enter iron condor."""
+        logger.info("=" * 40)
+        logger.info("CONDOR ENTRY — 11:30 AM")
+        logger.info("=" * 40)
+
+        # Refresh prices to get precise anchor
+        self.tracker = refresh_tracker(self.tracker)
+
+        success = self.condor.enter(self.tracker)
+        self.condor_entered = True
+
+        if success:
+            summary = self.condor.get_summary()
+            logger.info("Condor entered: %s", json.dumps(summary, default=str))
+        else:
+            logger.error("Condor entry failed — no position today")
+
+    # ─── Defense monitoring ────────────────────────────────────────────────
+
+    def _check_defense(self):
+        """
+        Periodic defense check: has SPY breached 1% from anchor?
+
+        NOTE — Tick-level limitation:
+        Defense monitoring relies on sampled last-trade prices refreshed
+        every ~30 s.  A very fast intra-second excursion that reverses
+        between refreshes could be missed.  True tick-level defense would
+        require a streaming WebSocket connection, which is outside the
+        current polling architecture.  The post-anchor max-excursion
+        tracking (spy_post_anchor_high/low) mitigates this by remembering
+        the worst sampled price, but it is not a substitute for tick data.
+        """
+        if not self.condor.state.is_filled or self.condor.state.defense_triggered:
+            return
+
+        now_mono = time.monotonic()
+        interval = self.config.schedule.defense_check_interval
+        if now_mono - self._last_defense_check < interval:
+            return
+        self._last_defense_check = now_mono
+
+        # Refresh SPY price
+        self._refresh_prices()
+
+        if self.condor.check_defense(self.tracker):
+            logger.warning("DEFENSE TRIGGERED — closing condor immediately")
+            self.condor.close_defense()
+
+    # ─── Settlement ────────────────────────────────────────────────────────
+
+    def _handle_settlement(self):
+        """4:00 PM — Cash settlement for both sleeves."""
+        logger.info("=" * 40)
+        logger.info("SETTLEMENT — 4:00 PM")
+        logger.info("=" * 40)
+
+        # Final price refresh for accurate settlement
+        self.tracker = refresh_tracker(self.tracker)
+
+        # Condor settlement — pass tracker for intrinsic value calculation
+        condor_result = self.condor.on_settlement(self.tracker)
+        logger.info("Condor result: %s", json.dumps(condor_result, default=str))
+
+        # Directional settlement — pass tracker for NDX estimate
+        directional_result = self.directional.on_settlement(self.tracker)
+        logger.info("Directional result: %s", json.dumps(directional_result, default=str))
+
+        self.settlement_done = True
+
+    # ─── Shutdown ──────────────────────────────────────────────────────────
+
+    def _shutdown(self):
+        """4:15 PM — Log final P&L and shut down."""
+        logger.info("=" * 60)
+        logger.info("SHUTDOWN — 4:15 PM")
+        logger.info("=" * 60)
+
         try:
-            from pathlib import Path
-            from .liquidity_ranker import generate_liquidity_ranking
-            
-            output_path = Path(__file__).resolve().parents[1] / "state" / "universe" / "liquidity_ranking.json"
-            
-            success = generate_liquidity_ranking(
-                broker.get_trading_client(),
-                self.mm_data.alpaca,
-                output_path,
-            )
-            
-            if success:
-                logger.info("Successfully generated liquidity ranking for tomorrow")
-            else:
-                logger.error("Failed to generate liquidity ranking")
-        
+            acct = get_account_info()
+            end_equity = float(acct.get("equity", 0))
+            daily_pnl = end_equity - self.start_equity
+            daily_pct = (daily_pnl / self.start_equity * 100) if self.start_equity > 0 else 0
+
+            logger.info("Start equity:  $%.2f", self.start_equity)
+            logger.info("End equity:    $%.2f", end_equity)
+            logger.info("Daily P&L:     $%.2f (%.2f%%)", daily_pnl, daily_pct)
         except Exception as e:
-            logger.error(f"Error generating liquidity ranking: {e}", exc_info=True)
-    
-    def _all_positions_closed(self) -> bool:
-        """Check if all MM positions are closed and logs are posted."""
+            logger.error("Failed to fetch final account info: %s", e)
+
+        # Log strategy summaries
+        logger.info("Condor summary: %s", json.dumps(self.condor.get_summary(), default=str))
+        logger.info("Directional summary: %s", json.dumps(self.directional.get_summary(), default=str))
+
+        # Save daily report
+        self._save_daily_report()
+
+    def _save_daily_report(self):
+        """Save a JSON report for today's session."""
+        report_dir = os.path.join(cfg.STATE_DIR, "reports")
+        os.makedirs(report_dir, exist_ok=True)
+
+        today = market_now().strftime("%Y-%m-%d")
+        report_path = os.path.join(report_dir, f"daily_report_{today}.json")
+
+        report = {
+            "date": today,
+            "start_equity": self.start_equity,
+            "start_buying_power": self.start_buying_power,
+            "condor": self.condor.get_summary(),
+            "directional": self.directional.get_summary(),
+            "dry_run": self.dry_run,
+        }
+
         try:
-            # Check MM positions from state store
-            mm_positions = self.mm_state_store.load_positions()
-            if mm_positions:
-                logger.info(f"MM positions still open: {list(mm_positions.keys())}")
-                return False
-            
-            # Check runtime position manager
-            if self.mm_positions is not None and self.mm_positions.positions:
-                logger.info(f"Runtime MM positions still open: {list(self.mm_positions.positions.keys())}")
-                return False
-            
-            # Check broker positions to be safe
-            try:
-                positions = broker.get_all_positions()
-                if positions:
-                    open_symbols = [p.symbol for p in positions if float(getattr(p, 'qty', 0) or 0) > 0]
-                    if open_symbols:
-                        logger.info(f"Broker positions still open: {open_symbols}")
-                        return False
-            except Exception as e:
-                logger.warning(f"Could not check broker positions: {e}")
-            
-            logger.info("All positions confirmed closed")
-            return True
-            
+            end_equity = get_equity()
+            report["end_equity"] = end_equity
+            report["daily_pnl"] = end_equity - self.start_equity
+        except Exception:
+            pass
+
+        try:
+            with open(report_path, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            logger.info("Daily report saved: %s", report_path)
         except Exception as e:
-            logger.error(f"Error checking if positions closed: {e}")
-            return False
-    
+            logger.error("Failed to save daily report: %s", e)
+
+    # ─── Periodic status logging ───────────────────────────────────────────
+
+    def _log_status(self):
+        """Log status every 5 minutes."""
+        now_mono = time.monotonic()
+        if now_mono - self._last_status_log < 300:
+            return
+        self._last_status_log = now_mono
+
+        now = market_now()
+        logger.info(
+            "STATUS [%s]: SPY=$%.2f QQQ=$%.2f | condor_open=%s defense=%s | directional_open=%s",
+            now.strftime("%H:%M"),
+            self.tracker.spy_last, self.tracker.qqq_last,
+            self.condor.state.is_open, self.condor.state.defense_triggered,
+            self.directional.state.is_open,
+        )
+
+        if self.condor.state.is_open and self.tracker.condor_anchor:
+            move = self.tracker.spy_move_from_anchor_pct()
+            if move is not None:
+                logger.info(
+                    "  Condor: anchor=$%.2f move=%.3f%% (trigger=%.2f%%)",
+                    self.tracker.condor_anchor, move * 100,
+                    self.config.condor.defense_trigger_pct * 100,
+                )
+
+    # ─── Main loop ─────────────────────────────────────────────────────────
+
+    def run(self):
+        """Main bot loop: 9:00 AM → 4:15 PM."""
+        logger.info("CondorBot starting — waiting for 9:00 AM ET")
+
+        try:
+            # Wait until 9:00 AM if started early
+            start_time = parse_time(self.config.schedule.bot_start)
+            now = market_now()
+            if now < start_time:
+                wait_secs = (start_time - now).total_seconds()
+                logger.info("Waiting %.1f minutes until 9:00 AM", wait_secs / 60)
+                time.sleep(max(wait_secs, 0))
+
+            # 9:00 AM — Session start
+            self._start_session()
+
+            # Main event loop
+            while True:
+                now = market_now()
+                t = now.time()
+
+                shutdown_t = parse_time(self.config.schedule.bot_shutdown).time()
+                if t >= shutdown_t:
+                    if not self.settlement_done:
+                        self._handle_settlement()
+                    self._shutdown()
+                    break
+
+                # 9:30 AM — Start bar tracking
+                market_open_t = parse_time(self.config.schedule.market_open).time()
+                if t >= market_open_t and not self.bars_tracking:
+                    self._start_bar_tracking()
+
+                # Refresh prices periodically after market open
+                if self.bars_tracking:
+                    self._refresh_prices()
+
+                # 10:30 AM — Morning assessment
+                assessment_t = parse_time(self.config.schedule.morning_assessment).time()
+                if t >= assessment_t and not self.assessment_done and self.bars_tracking:
+                    self._morning_assessment()
+
+                # 10:45 AM — Directional entry
+                dir_entry_t = parse_time(self.config.schedule.directional_entry).time()
+                if t >= dir_entry_t and not self.directional_entered and self.assessment_done:
+                    self._enter_directional()
+
+                # 11:30 AM — Condor entry
+                condor_entry_t = parse_time(self.config.schedule.condor_entry).time()
+                if t >= condor_entry_t and not self.condor_entered and self.bars_tracking:
+                    self._enter_condor()
+
+                # Check fill statuses (skip terminal/dead orders)
+                if (self.condor.state.entry_order_id
+                        and not self.condor.state.is_filled
+                        and not self.condor.state.entry_order_dead):
+                    self.condor.check_fill_status()
+                if (self.directional.state.entry_order_id
+                        and not self.directional.state.is_filled
+                        and not self.directional.state.entry_order_dead):
+                    self.directional.check_fill_status()
+
+                # Poll defense-close fill if defense was triggered
+                if self.condor.state.defense_triggered and not self.condor.state.defense_filled:
+                    self.condor.check_defense_fill()
+                    # Escalate only if the defense order reached a truly
+                    # terminal state (cancelled/rejected/expired).  Do NOT
+                    # re-close if the order is merely still pending — that
+                    # would risk duplicate close attempts.
+                    if (self.condor.state.defense_close_failed
+                            and not self.condor.state.defense_filled):
+                        self._defense_escalation_count += 1
+                        if self._defense_escalation_count <= self.MAX_DEFENSE_ESCALATIONS:
+                            logger.critical(
+                                "Defense close order terminally failed — "
+                                "emergency re-close attempt %d/%d",
+                                self._defense_escalation_count,
+                                self.MAX_DEFENSE_ESCALATIONS,
+                            )
+                            self.condor.state.defense_close_failed = False
+                            self.condor.state.defense_order_id = None
+                            self.condor.state.defense_triggered = False
+                            self.condor.close_defense()
+                        else:
+                            logger.critical(
+                                "Defense escalation limit (%d) reached — "
+                                "giving up on automated close. MANUAL INTERVENTION REQUIRED.",
+                                self.MAX_DEFENSE_ESCALATIONS,
+                            )
+
+                # Defense monitoring (only when condor is actually filled)
+                if self.condor.state.is_filled:
+                    self._check_defense()
+
+                # 4:00 PM — Settlement
+                settle_t = parse_time(self.config.schedule.market_close).time()
+                if t >= settle_t and not self.settlement_done:
+                    self._handle_settlement()
+
+                # Periodic status
+                self._log_status()
+
+                # Sleep to avoid tight loop
+                time.sleep(10)
+
+        except KeyboardInterrupt:
+            logger.warning("Keyboard interrupt — shutting down")
+            self._emergency_shutdown()
+        except Exception as e:
+            logger.exception("FATAL ERROR in main loop: %s", e)
+            self._emergency_shutdown()
+            raise
+
+    def _emergency_shutdown(self):
+        """Emergency shutdown: cancel all orders, log state."""
+        logger.warning("EMERGENCY SHUTDOWN")
+        try:
+            cancel_all_orders()
+            logger.info("All orders cancelled")
+        except Exception as e:
+            logger.error("Failed to cancel orders: %s", e)
+
+        try:
+            positions = get_option_positions()
+            if positions:
+                logger.warning("Open option positions at emergency shutdown:")
+                for p in positions:
+                    logger.warning("  %s qty=%s", p.get("symbol"), p.get("qty"))
+        except Exception as e:
+            logger.error("Failed to check positions: %s", e)
+
+        logger.info("Condor state: %s", json.dumps(self.condor.get_summary(), default=str))
+        logger.info("Directional state: %s", json.dumps(self.directional.get_summary(), default=str))
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Integrated Bot - Morning Momentum + 3 ETF Rotation")
-    parser.add_argument("--dry-run", action="store_true", help="Show signals without trading")
+    parser = argparse.ArgumentParser(description="0DTE Options Bot — XSP Iron Condor + XND Directional")
+    parser.add_argument("--dry-run", action="store_true", help="Log signals without submitting orders")
     args = parser.parse_args()
-    
-    bot = IntegratedBot(dry_run=args.dry_run)
+
+    bot = CondorBot(dry_run=args.dry_run)
     bot.run()
 
 
