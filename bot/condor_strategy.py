@@ -1,26 +1,33 @@
 """
 XSP Iron Condor Strategy — Entry, defense monitoring, and exit logic.
 
-Sleeve 1: Sells an iron condor on XSP at 11:30 AM, monitors for defense
-trigger (SPY 1% move from anchor), holds to 4:00 PM cash settlement.
+Sleeve 1: Sells an iron condor on XSP at 10:45 AM, monitors for defense
+trigger (SPY 1.4% move from anchor), holds to 4:00 PM cash settlement.
 """
 import logging
-from dataclasses import dataclass
+import math
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 from bot.condor_config import CondorConfig
 from bot.options_client import (
     CondorLegs,
+    CondorSpreadQuote,
     build_condor_legs,
+    cancel_order,
     close_condor_order,
     cancel_all_orders,
     get_buying_power,
+    get_condor_spread_quote,
     get_todays_expiration,
     place_iron_condor_order,
+    replace_order,
     size_condor,
     get_order,
 )
+from bot.clock import market_now, parse_time_str
 from bot.market_data import MorningTracker
 
 logger = logging.getLogger("bot.condor")
@@ -67,14 +74,26 @@ class CondorState:
     exit_cost: float = 0.0
     realized_pnl: float = 0.0
 
+    # Fill optimization state
+    entry_natural_credit: float = 0.0    # natural credit at entry time
+    entry_mid_credit: float = 0.0        # mid credit at entry time
+    entry_best_credit: float = 0.0       # best credit at entry time
+    entry_limit_price: float = 0.0       # current limit on the live order
+    entry_adjustments: int = 0           # number of price adjustments made
+    entry_last_adjust_ts: float = 0.0    # monotonic timestamp of last adjustment
+    entry_spread_quote: Optional[CondorSpreadQuote] = None  # initial quote snapshot
+    entry_qty_reduced: bool = False      # True if qty was reduced for wide spreads
+    entry_peak_natural: float = 0.0      # rolling peak natural for deterioration check
+    missed_trade_reason: Optional[str] = None  # reason if entry was skipped/aborted
+
 
 class CondorStrategy:
     """
     Manages the XSP iron condor sleeve.
 
     Lifecycle:
-    1. enter() — at 11:30 AM, compute strikes, size, place mleg order
-    2. check_defense() — every minute, check if SPY breached 1% from anchor
+    1. enter() — at 10:45 AM, compute strikes, size, place mleg order
+    2. check_defense() — every minute, check if SPY breached 1.4% from anchor
     3. close_defense() — if breached, close all legs immediately
     4. on_settlement() — at 4:00 PM, record cash settlement result
     """
@@ -86,21 +105,27 @@ class CondorStrategy:
 
     def enter(self, tracker: MorningTracker) -> bool:
         """
-        Enter the iron condor at 11:30 AM.
+        Enter the iron condor at 10:45 AM.
 
         Steps:
-        1. Record anchor price (SPY at 11:30)
+        1. Record anchor price (SPY at 10:45)
         2. Compute strikes (0.90% OTM short, 1.00% wing)
         3. Fetch XSP 0DTE contracts and find best legs
-        4. Size: floor(buying_power / max_loss_per_contract)
-        5. Place mleg limit order for target credit
+        4. Get live spread quotes — check spread health
+        5. Size: floor(buying_power / max_loss_per_contract), reduce on wide spreads
+        6. Place mleg limit order starting at mid credit
 
         Returns True if order was placed successfully.
         """
+        # Reset sticky state for clean entry attempt
+        self.state.missed_trade_reason = None
+        self.state.entry_peak_natural = 0.0
         # Step 1: Anchor price
         anchor = tracker.spy_last
         if anchor <= 0:
             logger.error("Cannot enter condor: SPY price unavailable (%.2f)", anchor)
+            self.state.missed_trade_reason = "anchor_unavailable"
+            logger.info("MISSED TRADE: reason=anchor_unavailable spy_price=%.2f", anchor)
             return False
 
         tracker.condor_anchor = anchor
@@ -120,16 +145,61 @@ class CondorStrategy:
 
         if legs is None:
             logger.error("CONDOR ENTRY FAILED: Could not build legs")
+            self.state.missed_trade_reason = "leg_build_failed"
+            logger.info("MISSED TRADE: reason=leg_build_failed")
             return False
 
         self.state.legs = legs
 
-        # Step 4: Sizing — use actual max loss from chosen strikes, not config estimate.
-        # max_wing_width is the raw wider wing before credit.
-        # Net max loss = wing - expected credit received.
+        # Step 4: Get live spread quotes
+        spread_quote = get_condor_spread_quote(legs)
+        self.state.entry_spread_quote = spread_quote
+
+        if not spread_quote.valid:
+            logger.error("CONDOR ENTRY FAILED: Could not get quotes for all 4 legs")
+            self.state.missed_trade_reason = "quote_unavailable"
+            logger.info("MISSED TRADE: reason=quote_unavailable")
+            return False
+
+        self.state.entry_natural_credit = spread_quote.natural_credit
+        self.state.entry_mid_credit = spread_quote.mid_credit
+        self.state.entry_best_credit = spread_quote.best_credit
+        self.state.entry_peak_natural = spread_quote.natural_credit
+
+        # Spread health gate — skip if any leg has excessively wide spread
+        if spread_quote.max_leg_spread_pct > self.cfg.max_leg_spread_pct:
+            logger.error(
+                "CONDOR ENTRY REJECTED: max leg spread %.1f%% exceeds limit %.1f%%",
+                spread_quote.max_leg_spread_pct * 100,
+                self.cfg.max_leg_spread_pct * 100,
+            )
+            self.state.missed_trade_reason = "wide_spread"
+            logger.info(
+                "MISSED TRADE: reason=wide_spread max_spread=%.1f%% limit=%.1f%%",
+                spread_quote.max_leg_spread_pct * 100,
+                self.cfg.max_leg_spread_pct * 100,
+            )
+            return False
+
+        # Walk away if natural credit is below minimum
+        if spread_quote.natural_credit < self.cfg.fill_min_credit:
+            logger.error(
+                "CONDOR ENTRY REJECTED: natural credit $%.2f below minimum $%.2f",
+                spread_quote.natural_credit, self.cfg.fill_min_credit,
+            )
+            self.state.missed_trade_reason = "low_credit"
+            logger.info(
+                "MISSED TRADE: reason=low_credit natural=$%.2f min=$%.2f",
+                spread_quote.natural_credit, self.cfg.fill_min_credit,
+            )
+            return False
+
+        # Step 5: Sizing
         max_wing = legs.max_wing_width
         if max_wing <= 0:
             logger.error("CONDOR ENTRY FAILED: max_wing_width is zero (bad leg geometry)")
+            self.state.missed_trade_reason = "bad_geometry"
+            logger.info("MISSED TRADE: reason=bad_geometry max_wing=0")
             return False
 
         net_max_loss = max_wing - self.cfg.target_credit
@@ -137,6 +207,26 @@ class CondorStrategy:
             logger.error(
                 "CONDOR ENTRY FAILED: net max loss <= 0 (wing=$%.2f credit=$%.2f)",
                 max_wing, self.cfg.target_credit,
+            )
+            self.state.missed_trade_reason = "bad_geometry"
+            logger.info("MISSED TRADE: reason=bad_geometry net_max_loss<=0")
+            return False
+
+        # Credit / risk ratio gate — protect edge integrity
+        # Note: Using natural_credit / max_wing as directional filter (not true credit/max_loss)
+        credit_risk_ratio = spread_quote.natural_credit / max_wing if max_wing > 0 else 0.0
+        if credit_risk_ratio < self.cfg.min_credit_risk_ratio:
+            logger.error(
+                "CONDOR ENTRY REJECTED: credit/risk ratio %.2f below minimum %.2f "
+                "(credit=$%.2f wing=$%.2f) - note: ratio uses wing not max_loss",
+                credit_risk_ratio, self.cfg.min_credit_risk_ratio,
+                spread_quote.natural_credit, max_wing,
+            )
+            self.state.missed_trade_reason = "poor_risk_reward"
+            logger.info(
+                "MISSED TRADE: reason=poor_risk_reward ratio=%.2f min=%.2f credit=$%.2f wing=$%.2f",
+                credit_risk_ratio, self.cfg.min_credit_risk_ratio,
+                spread_quote.natural_credit, max_wing,
             )
             return False
 
@@ -152,32 +242,64 @@ class CondorStrategy:
         qty = size_condor(buying_power, net_max_loss)
         if qty <= 0:
             logger.error("CONDOR ENTRY FAILED: Insufficient buying power ($%.2f)", buying_power)
+            self.state.missed_trade_reason = "insufficient_bp"
+            logger.info("MISSED TRADE: reason=insufficient_bp bp=$%.2f net_max_loss=$%.2f", buying_power, net_max_loss)
             return False
+
+        # Reduce size on moderately wide spreads
+        if spread_quote.avg_leg_spread_pct > self.cfg.wide_spread_size_reduce_pct:
+            original_qty = qty
+            qty = max(1, math.floor(qty * self.cfg.wide_spread_size_factor))
+            self.state.entry_qty_reduced = True
+            logger.warning(
+                "CONDOR SIZE REDUCED: avg spread %.1f%% > %.1f%% threshold — "
+                "qty %d → %d (factor=%.2f)",
+                spread_quote.avg_leg_spread_pct * 100,
+                self.cfg.wide_spread_size_reduce_pct * 100,
+                original_qty, qty, self.cfg.wide_spread_size_factor,
+            )
 
         self.state.qty = qty
 
-        # Step 5: Place order
+        # Step 6: Determine starting limit price
+        if self.cfg.fill_start_at_mid and spread_quote.mid_credit > 0:
+            # Start at mid — don't cross the spread
+            starting_credit = round(spread_quote.mid_credit, 2)
+            # Ensure we don't start below natural (that would never fill)
+            starting_credit = max(starting_credit, round(spread_quote.natural_credit, 2))
+            logger.info(
+                "SMART FILL: starting at mid=$%.2f (natural=$%.2f best=$%.2f target=$%.2f)",
+                starting_credit, spread_quote.natural_credit,
+                spread_quote.best_credit, self.cfg.target_credit,
+            )
+        else:
+            starting_credit = self.cfg.target_credit
+
+        # Place order
         try:
             order = place_iron_condor_order(
                 legs=legs,
                 qty=qty,
-                limit_price=self.cfg.target_credit,
+                limit_price=starting_credit,
                 time_in_force=self.cfg.time_in_force,
                 dry_run=self.dry_run,
             )
 
             if order:
                 self.state.entry_order_id = order.get("id")
-                self.state.entry_credit = self.cfg.target_credit
+                self.state.entry_credit = starting_credit
+                self.state.entry_limit_price = starting_credit
                 self.state.entry_time = datetime.now()
-                # is_open stays False until fill confirmed in check_fill_status()
+                self.state.entry_last_adjust_ts = time.monotonic()
                 logger.info(
                     "CONDOR ORDER SUBMITTED: %d contracts @ $%.2f credit, order_id=%s",
-                    qty, self.cfg.target_credit, self.state.entry_order_id,
+                    qty, starting_credit, self.state.entry_order_id,
                 )
                 return True
         except Exception as e:
             logger.error("CONDOR ENTRY ORDER FAILED: %s", e)
+            self.state.missed_trade_reason = "order_submission_failed"
+            logger.info("MISSED TRADE: reason=order_submission_failed error=%s", str(e))
 
         return False
 
@@ -202,9 +324,20 @@ class CondorStrategy:
                 self.state.is_open = True
                 filled_price = float(order.get("filled_avg_price", self.cfg.target_credit))
                 self.state.entry_credit = filled_price
+                # Fill quality metrics
+                mid = self.state.entry_mid_credit
+                natural = self.state.entry_natural_credit
+                mid_capture = 0.0
+                if mid > 0 and natural > 0 and mid != natural:
+                    mid_capture = (filled_price - natural) / (mid - natural) * 100
+                slippage = mid - filled_price if mid > 0 else 0.0
                 logger.info(
-                    "CONDOR FILLED: %d contracts @ $%.2f credit",
+                    "CONDOR FILLED: %d contracts @ $%.2f credit "
+                    "(mid=$%.2f natural=$%.2f slippage=$%.2f mid_capture=%.0f%% "
+                    "adjustments=%d)",
                     self.state.qty, filled_price,
+                    mid, natural, slippage, mid_capture,
+                    self.state.entry_adjustments,
                 )
                 return True
             elif status in ("cancelled", "expired", "rejected"):
@@ -215,6 +348,201 @@ class CondorStrategy:
                 logger.debug("Condor order status: %s", status)
         except Exception as e:
             logger.warning("Failed to check condor fill status: %s", e)
+
+        return False
+
+    def adjust_entry_if_needed(self) -> bool:
+        """
+        Gradually adjust the entry limit price toward the *live* natural credit.
+
+        Called by the orchestrator on each poll cycle while the entry order
+        is open and unfilled.  Respects fill_patience_secs between adjustments
+        and stops after fill_max_adjustments.
+
+        Key behaviours:
+        - Re-fetches live spread quote on each adjustment (no stale anchoring).
+        - Uses atomic PATCH replace_order to avoid cancel→replace gap.
+        - Falls back to cancel→replace if PATCH fails (e.g. pending_replace).
+        - Aborts if conditions have deteriorated (natural dropped too far).
+        - Aborts if past fill_max_entry_time cutoff.
+
+        Returns True if an adjustment was made, False otherwise.
+        """
+        # Guard: only adjust if we have a live, unfilled entry order
+        if (self.state.is_filled or self.state.entry_order_dead
+                or not self.state.entry_order_id):
+            return False
+
+        # ── Time cutoff ──────────────────────────────────────────────
+        now = market_now()
+        cutoff = parse_time_str(self.cfg.fill_max_entry_time)
+        if now.time() >= cutoff:
+            logger.warning(
+                "SMART FILL: past %s cutoff — cancelling unfilled entry",
+                self.cfg.fill_max_entry_time,
+            )
+            try:
+                cancel_order(self.state.entry_order_id)
+            except Exception as e:
+                logger.warning("Failed to cancel condor entry at cutoff: %s", e)
+            self.state.entry_order_dead = True
+            self.state.missed_trade_reason = "time_cutoff"
+            logger.info(
+                "MISSED TRADE: reason=time_cutoff cutoff=%s adjustments=%d last_limit=$%.2f",
+                self.cfg.fill_max_entry_time, self.state.entry_adjustments,
+                self.state.entry_limit_price,
+            )
+            return False
+
+        # Respect patience timer
+        elapsed = time.monotonic() - self.state.entry_last_adjust_ts
+        if elapsed < self.cfg.fill_patience_secs:
+            return False
+
+        # Respect max adjustments
+        if self.state.entry_adjustments >= self.cfg.fill_max_adjustments:
+            logger.info(
+                "SMART FILL: max adjustments (%d) reached — leaving order working at $%.2f "
+                "until fill or entry cutoff",
+                self.cfg.fill_max_adjustments, self.state.entry_limit_price,
+            )
+            return False
+
+        # ── Re-fetch live quotes ─────────────────────────────────────
+        try:
+            live_quote = get_condor_spread_quote(self.state.legs)
+        except Exception as e:
+            logger.warning("SMART FILL: quote fetch failed, skipping adjustment: %s", e)
+            self.state.entry_last_adjust_ts = time.monotonic()
+            return False
+
+        if not live_quote.valid:
+            logger.warning("SMART FILL: incomplete live quote, skipping adjustment")
+            self.state.entry_last_adjust_ts = time.monotonic()
+            return False
+
+        live_natural = live_quote.natural_credit
+        live_mid = live_quote.mid_credit
+
+        # ── Update peak natural (rolling high-water mark) ────────────
+        self.state.entry_peak_natural = max(
+            self.state.entry_peak_natural, live_natural,
+        )
+
+        # ── Deterioration guard (vs peak, not initial) ───────────────
+        peak = self.state.entry_peak_natural
+        if peak > 0:
+            drop_pct = (peak - live_natural) / peak
+            if drop_pct > self.cfg.fill_deterioration_pct:
+                logger.warning(
+                    "SMART FILL ABORT: natural deteriorated %.1f%% from peak "
+                    "(peak=$%.2f → live=$%.2f, threshold=%.0f%%) — cancelling",
+                    drop_pct * 100, peak, live_natural,
+                    self.cfg.fill_deterioration_pct * 100,
+                )
+                try:
+                    cancel_order(self.state.entry_order_id)
+                except Exception as e:
+                    logger.warning("Failed to cancel condor entry on deterioration: %s", e)
+                self.state.entry_order_dead = True
+                self.state.missed_trade_reason = "deterioration"
+                logger.info(
+                    "MISSED TRADE: reason=deterioration peak=$%.2f live=$%.2f drop=%.1f%%",
+                    peak, live_natural, drop_pct * 100,
+                )
+                return False
+
+        # ── Dynamic step: adapts to spread width ─────────────────────
+        spread_gap = live_mid - live_natural if live_mid > live_natural else 0.0
+        step = max(self.cfg.fill_adjust_step_min,
+                    round(self.cfg.fill_adjust_step_frac * spread_gap, 2))
+
+        # ── Compute new limit using LIVE natural as floor ────────────
+        new_limit = round(self.state.entry_limit_price - step, 2)
+        natural = round(live_natural, 2)
+
+        # Don't go below live natural — that's the floor
+        new_limit = max(new_limit, natural)
+
+        # Walk away if below minimum credit
+        if new_limit < self.cfg.fill_min_credit:
+            logger.warning(
+                "SMART FILL: next limit $%.2f below min credit $%.2f — "
+                "cancelling order and giving up",
+                new_limit, self.cfg.fill_min_credit,
+            )
+            try:
+                cancel_order(self.state.entry_order_id)
+            except Exception as e:
+                logger.warning("Failed to cancel condor entry order: %s", e)
+            self.state.entry_order_dead = True
+            self.state.missed_trade_reason = "min_credit_breach"
+            logger.info(
+                "MISSED TRADE: reason=min_credit_breach limit=$%.2f min=$%.2f",
+                new_limit, self.cfg.fill_min_credit,
+            )
+            return False
+
+        # No change needed if we're already at or below live natural
+        if new_limit == self.state.entry_limit_price:
+            logger.info(
+                "SMART FILL: already at live natural $%.2f — no further adjustment",
+                new_limit,
+            )
+            self.state.entry_last_adjust_ts = time.monotonic()
+            return False
+
+        # ── Atomic replace via PATCH (no cancel→replace gap) ─────────
+        old_limit = self.state.entry_limit_price
+        order = replace_order(self.state.entry_order_id, new_limit)
+
+        if order:
+            self.state.entry_order_id = order.get("id", self.state.entry_order_id)
+            self.state.entry_limit_price = new_limit
+            self.state.entry_credit = new_limit
+            self.state.entry_adjustments += 1
+            self.state.entry_last_adjust_ts = time.monotonic()
+            logger.info(
+                "SMART FILL ADJUST #%d: $%.2f → $%.2f (step=$%.2f) "
+                "(live_natural=$%.2f live_mid=$%.2f peak=$%.2f) order_id=%s",
+                self.state.entry_adjustments, old_limit, new_limit, step,
+                live_natural, live_mid, peak, self.state.entry_order_id,
+            )
+            return True
+
+        # PATCH failed (order in pending state?) — fall back to cancel→replace
+        logger.warning("SMART FILL: PATCH replace failed, falling back to cancel→replace")
+        try:
+            cancel_order(self.state.entry_order_id)
+        except Exception as e:
+            logger.warning("Failed to cancel condor entry for adjustment: %s", e)
+            self.state.entry_last_adjust_ts = time.monotonic()
+            return False
+
+        try:
+            order = place_iron_condor_order(
+                legs=self.state.legs,
+                qty=self.state.qty,
+                limit_price=new_limit,
+                time_in_force=self.cfg.time_in_force,
+                dry_run=self.dry_run,
+            )
+            if order:
+                self.state.entry_order_id = order.get("id")
+                self.state.entry_limit_price = new_limit
+                self.state.entry_credit = new_limit
+                self.state.entry_adjustments += 1
+                self.state.entry_last_adjust_ts = time.monotonic()
+                logger.info(
+                    "SMART FILL ADJUST #%d (cancel→replace): $%.2f → $%.2f (step=$%.2f) "
+                    "(live_natural=$%.2f peak=$%.2f) order_id=%s",
+                    self.state.entry_adjustments, old_limit, new_limit, step,
+                    live_natural, peak, self.state.entry_order_id,
+                )
+                return True
+        except Exception as e:
+            logger.error("SMART FILL: replacement order failed: %s", e)
+            self.state.entry_order_dead = True
 
         return False
 
@@ -442,7 +770,10 @@ class CondorStrategy:
         """
         if not self.state.is_filled:
             status = "never_filled" if self.state.entry_order_id else "no_position"
-            return {"status": status}
+            return {
+                "status": status,
+                "missed_trade_reason": self.state.missed_trade_reason,
+            }
 
         multiplier = 100
         credit_received = self.state.entry_credit * self.state.qty * multiplier
@@ -493,6 +824,16 @@ class CondorStrategy:
         self.state.settled = True
         self.state.is_open = False
 
+        # Fill quality metrics (vs original entry-time quotes)
+        # Note: These measure overall entry process quality, not slippage vs live market at fill time
+        mid = self.state.entry_mid_credit
+        natural = self.state.entry_natural_credit
+        filled = self.state.entry_credit
+        mid_capture = 0.0
+        if mid > 0 and natural > 0 and mid != natural:
+            mid_capture = (filled - natural) / (mid - natural) * 100
+        slippage = mid - filled if mid > 0 else 0.0
+
         result = {
             "status": status,
             "contracts": self.state.qty,
@@ -503,6 +844,15 @@ class CondorStrategy:
             "spy_settlement": round(tracker.spy_last, 2),
             "defense_triggered": self.state.defense_triggered,
             "realized_pnl": round(self.state.realized_pnl, 2),
+            "fill_quality": {
+                "natural_credit": round(natural, 4),
+                "mid_credit": round(mid, 4),
+                "actual_credit": round(filled, 4),
+                "slippage_vs_mid": round(slippage, 4),
+                "mid_capture_pct": round(mid_capture, 1),
+                "adjustments": self.state.entry_adjustments,
+                "qty_reduced": self.state.entry_qty_reduced,
+            },
         }
 
         logger.info(
@@ -521,6 +871,15 @@ class CondorStrategy:
             "anchor_price": self.state.anchor_price,
             "entry_credit": self.state.entry_credit,
             "defense_triggered": self.state.defense_triggered,
+            "missed_trade_reason": self.state.missed_trade_reason,
+            "fill_quality": {
+                "natural_credit": self.state.entry_natural_credit,
+                "mid_credit": self.state.entry_mid_credit,
+                "peak_natural": self.state.entry_peak_natural,
+                "limit_price": self.state.entry_limit_price,
+                "adjustments": self.state.entry_adjustments,
+                "qty_reduced": self.state.entry_qty_reduced,
+            },
             "legs": {
                 "long_put": getattr(self.state.legs, "long_put", None),
                 "short_put": getattr(self.state.legs, "short_put", None),
