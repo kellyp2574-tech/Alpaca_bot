@@ -66,7 +66,7 @@ class MorningTracker:
     # VIX previous close
     vix_prev_close: Optional[float] = None
 
-    # Condor anchor price (SPY at 11:30)
+    # Condor anchor price (SPY at 10:45)
     condor_anchor: Optional[float] = None
 
     def update_spy(self, price: float, high: Optional[float] = None, low: Optional[float] = None):

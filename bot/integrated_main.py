@@ -3,7 +3,7 @@
 Runs from 9:00 AM until 4:15 PM ET daily.
 
 Two independent sleeves:
-  Sleeve 1: XSP Iron Condor (every day at 11:30 AM)
+  Sleeve 1: XSP Iron Condor (every day at 10:45 AM)
   Sleeve 2: XND Directional (conditional, 10:45 AM if filters pass)
 """
 import logging
@@ -82,8 +82,8 @@ class CondorBot:
     09:30  Market opens, begin tracking SPY/QQQ bars
     10:30  Morning assessment (directional filters)
     10:45  Directional entry (if qualified)
-    11:30  Condor entry (every day)
-    11:30–16:00  Defense monitoring (SPY 1% trigger)
+    10:45  Condor entry (every day)
+    10:45–16:00  Defense monitoring (SPY 1.4% trigger)
     16:00  Cash settlement
     16:15  Shutdown
     """
@@ -262,9 +262,9 @@ class CondorBot:
     # ─── Condor entry ──────────────────────────────────────────────────────
 
     def _enter_condor(self):
-        """11:30 AM — Enter iron condor."""
+        """10:45 AM — Enter iron condor."""
         logger.info("=" * 40)
-        logger.info("CONDOR ENTRY — 11:30 AM")
+        logger.info("CONDOR ENTRY — 10:45 AM")
         logger.info("=" * 40)
 
         # Refresh prices to get precise anchor
@@ -603,7 +603,7 @@ class CondorBot:
                 if t >= self._t_dir_entry and not self.directional_entered and self.assessment_done:
                     self._enter_directional()
 
-                # 11:30 AM — Condor entry
+                # 10:45 AM — Condor entry
                 if t >= self._t_condor_entry and not self.condor_entered and self.bars_tracking:
                     self._enter_condor()
 
@@ -616,6 +616,9 @@ class CondorBot:
                     # Record entry fill with PDT guard
                     if self.condor.state.is_filled and not was_filled_before:
                         self._record_condor_entry_fill()
+                    # Smart fill: adjust limit price if still unfilled
+                    elif not self.condor.state.is_filled:
+                        self.condor.adjust_entry_if_needed()
 
                 if (self.directional.state.entry_order_id
                         and not self.directional.state.is_filled

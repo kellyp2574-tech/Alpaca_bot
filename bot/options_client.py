@@ -619,12 +619,179 @@ def get_option_snapshot(symbol: str) -> Optional[float]:
     return None
 
 
+@dataclass
+class LegQuote:
+    """Bid/ask/mid for a single option leg."""
+    symbol: str
+    bid: float
+    ask: float
+    mid: float
+    spread: float          # ask - bid
+    spread_pct: float      # spread / mid (0 if mid=0)
+
+
+@dataclass
+class CondorSpreadQuote:
+    """Aggregated quote for a 4-leg iron condor."""
+    # Per-leg quotes
+    long_put: Optional[LegQuote] = None
+    short_put: Optional[LegQuote] = None
+    short_call: Optional[LegQuote] = None
+    long_call: Optional[LegQuote] = None
+
+    # Net credits (positive = we receive)
+    natural_credit: float = 0.0   # immediately fillable (conservative)
+    best_credit: float = 0.0      # theoretical best
+    mid_credit: float = 0.0       # midpoint of natural and best
+
+    # Spread health
+    max_leg_spread_pct: float = 0.0   # worst single-leg spread as % of mid
+    avg_leg_spread_pct: float = 0.0   # average across legs
+    valid: bool = False               # True if all 4 legs have usable quotes
+
+
+def get_multi_option_snapshots(symbols: list[str]) -> dict[str, LegQuote]:
+    """
+    Fetch bid/ask snapshots for multiple option symbols in one API call.
+
+    Returns dict of symbol → LegQuote.  Symbols with no usable quote
+    are omitted from the result.
+    """
+    if not symbols:
+        return {}
+
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots"
+    params = {"symbols": ",".join(symbols), "feed": "indicative"}
+    result = {}
+
+    try:
+        resp = requests.get(url, headers=_headers(), params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Response: {"snapshots": {"SYMBOL": {"latestQuote": {...}, ...}, ...}}
+        snapshots = data.get("snapshots", {})
+        for sym, snap in snapshots.items():
+            quote = snap.get("latestQuote", {})
+            bid = float(quote.get("bp", 0))
+            ask = float(quote.get("ap", 0))
+
+            if bid <= 0 or ask <= 0:
+                # Fallback to latest trade as both bid and ask
+                trade = snap.get("latestTrade", {})
+                price = float(trade.get("p", 0))
+                if price > 0:
+                    bid = price
+                    ask = price
+                else:
+                    continue  # no usable data
+
+            mid = (bid + ask) / 2.0
+            spread = ask - bid
+            spread_pct = spread / mid if mid > 0 else 0.0
+
+            result[sym] = LegQuote(
+                symbol=sym, bid=bid, ask=ask, mid=mid,
+                spread=spread, spread_pct=spread_pct,
+            )
+
+    except Exception as e:
+        logger.warning("Failed to fetch multi-option snapshots: %s", e)
+
+    return result
+
+
+def get_condor_spread_quote(legs: CondorLegs) -> CondorSpreadQuote:
+    """
+    Get live bid/ask for all 4 condor legs and compute net credit levels.
+
+    For an iron condor sold for credit:
+    - natural_credit = (SP_bid + SC_bid) - (LP_ask + LC_ask)  [conservative]
+    - best_credit    = (SP_ask + SC_ask) - (LP_bid + LC_bid)  [aggressive]
+    - mid_credit     = (natural + best) / 2
+
+    Returns CondorSpreadQuote with per-leg data and aggregated metrics.
+    """
+    symbols = [legs.long_put, legs.short_put, legs.short_call, legs.long_call]
+    quotes = get_multi_option_snapshots(symbols)
+
+    result = CondorSpreadQuote()
+    result.long_put = quotes.get(legs.long_put)
+    result.short_put = quotes.get(legs.short_put)
+    result.short_call = quotes.get(legs.short_call)
+    result.long_call = quotes.get(legs.long_call)
+
+    if all([result.long_put, result.short_put, result.short_call, result.long_call]):
+        lp = result.long_put
+        sp = result.short_put
+        sc = result.short_call
+        lc = result.long_call
+
+        # Natural: sell at bid, buy at ask (immediately fillable)
+        result.natural_credit = (sp.bid + sc.bid) - (lp.ask + lc.ask)
+        # Best: sell at ask, buy at bid (theoretical best)
+        result.best_credit = (sp.ask + sc.ask) - (lp.bid + lc.bid)
+        # Mid
+        result.mid_credit = (result.natural_credit + result.best_credit) / 2.0
+
+        # Spread health
+        spreads = [lp.spread_pct, sp.spread_pct, sc.spread_pct, lc.spread_pct]
+        result.max_leg_spread_pct = max(spreads)
+        result.avg_leg_spread_pct = sum(spreads) / 4.0
+        result.valid = True
+
+        logger.info(
+            "CONDOR QUOTE: natural=$%.2f mid=$%.2f best=$%.2f | "
+            "max_leg_spread=%.1f%% avg_spread=%.1f%%",
+            result.natural_credit, result.mid_credit, result.best_credit,
+            result.max_leg_spread_pct * 100, result.avg_leg_spread_pct * 100,
+        )
+        logger.info(
+            "  LP(%s): %.2f/%.2f  SP(%s): %.2f/%.2f  "
+            "SC(%s): %.2f/%.2f  LC(%s): %.2f/%.2f",
+            lp.symbol, lp.bid, lp.ask, sp.symbol, sp.bid, sp.ask,
+            sc.symbol, sc.bid, sc.ask, lc.symbol, lc.bid, lc.ask,
+        )
+    else:
+        missing = [s for s in symbols if s not in quotes]
+        logger.warning("CONDOR QUOTE: incomplete — missing quotes for %s", missing)
+
+    return result
+
+
 def get_order(order_id: str) -> Optional[dict]:
     """Get order status by ID."""
     url = f"{_base_url()}/v2/orders/{order_id}"
     resp = requests.get(url, headers=_headers(), timeout=10)
     resp.raise_for_status()
     return resp.json()
+
+
+def replace_order(order_id: str, limit_price: float) -> Optional[dict]:
+    """
+    Replace an existing order's limit price via PATCH /v2/orders/{order_id}.
+
+    This is atomic — no gap where you have no order in market.
+    Returns the new order dict (with new order ID) on success, None on failure.
+    Note: the replaced order gets a NEW order ID.
+    """
+    url = f"{_base_url()}/v2/orders/{order_id}"
+    payload = {"limit_price": str(round(limit_price, 2))}
+    try:
+        resp = requests.patch(url, headers=_headers(), json=payload, timeout=10)
+        resp.raise_for_status()
+        order = resp.json()
+        logger.info(
+            "Order %s replaced: new_id=%s limit=$%.2f",
+            order_id, order.get("id"), limit_price,
+        )
+        return order
+    except requests.exceptions.HTTPError as e:
+        # 422 = order in non-replaceable state (pending_cancel, etc.)
+        logger.warning("Failed to replace order %s: %s", order_id, e)
+    except Exception as e:
+        logger.warning("Replace order %s error: %s", order_id, e)
+    return None
 
 
 def cancel_order(order_id: str) -> bool:

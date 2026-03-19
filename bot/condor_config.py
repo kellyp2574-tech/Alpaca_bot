@@ -21,10 +21,10 @@ class CondorConfig:
     max_loss_per_contract: float = 3.70  # Wing - credit ≈ max loss
 
     # Defense
-    defense_trigger_pct: float = 0.0100  # 1.00% move from anchor → close all
+    defense_trigger_pct: float = 0.0140  # 1.40% move from anchor → close all
 
     # Schedule (ET)
-    entry_time: str = "11:30"
+    entry_time: str = "10:45"
     expiry_time: str = "16:00"
     shutdown_time: str = "16:15"
 
@@ -32,6 +32,20 @@ class CondorConfig:
     order_type: str = "limit"
     time_in_force: str = "day"
     credit_tolerance: float = 0.20    # Accept credit within ±$0.20 of target
+
+    # Fill optimization — smart limit order entry
+    fill_start_at_mid: bool = True           # Start limit at mid instead of target_credit
+    fill_patience_secs: int = 30             # Seconds to wait at each price level
+    fill_adjust_step_min: float = 0.02        # Floor for dynamic step size
+    fill_adjust_step_frac: float = 0.25       # step = max(min, frac * (mid - natural))
+    fill_max_adjustments: int = 6            # Max price adjustments before accepting natural
+    fill_min_credit: float = 0.80            # Walk away if natural credit below this
+    fill_deterioration_pct: float = 0.30     # Abort if natural drops >30% from peak natural
+    min_credit_risk_ratio: float = 0.30      # Skip if credit/max_loss < 0.30 (edge integrity)
+    fill_max_entry_time: str = "11:00"       # Cancel and skip if not filled by this time (ET)
+    max_leg_spread_pct: float = 0.50         # Skip entry if any leg spread > 50% of mid
+    wide_spread_size_reduce_pct: float = 0.30  # Reduce avg spread threshold: reduce qty by 50%
+    wide_spread_size_factor: float = 0.50    # Multiply qty by this when spreads are wide
 
 
 @dataclass
@@ -71,7 +85,7 @@ class ScheduleConfig:
     market_open: str = "09:30"
     morning_assessment: str = "10:30"
     directional_entry: str = "10:45"
-    condor_entry: str = "11:30"
+    condor_entry: str = "10:45"
     market_close: str = "16:00"
     bot_shutdown: str = "16:15"
 
