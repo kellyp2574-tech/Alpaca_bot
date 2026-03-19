@@ -50,10 +50,12 @@ max_loss_per_contract = wing_width - credit ≈ $3.70 × 100 = $370
 
 ### Directional Sizing
 
+Both sleeves size off **live available buying power** at their respective entry times. The directional sleeve goes first (10:45 AM), and the condor uses whatever BP remains (11:30 AM).
+
 ```
-notional = buying_power × equity_risk_pct × leverage_multiplier
-         = buying_power × 0.0125 × 5.0
-qty = floor(notional / (premium_per_contract × 100))
+premium_budget = buying_power × directional_bp_pct × directional_leverage_multiplier
+               = buying_power × 0.0125 × 5.0
+qty = floor(premium_budget / (premium_per_contract × 100))
 ```
 
 Premium is estimated from a **live option snapshot** (bid/ask mid via Alpaca's option snapshot API). Falls back to prior close price, then a conservative $2.00 if no data is available. For 0DTE options, stale pricing can cause significant over- or under-sizing — the live snapshot mitigates this.
@@ -80,10 +82,34 @@ Premium is estimated from a **live option snapshot** (bid/ask mid via Alpaca's o
 Orders go through a clear state machine:
 
 1. **Order submitted** — `entry_order_id` is set, `is_open = False`, `is_filled = False`
-2. **Fill confirmed** — `is_filled = True`, `is_open = True` (position is now live)
+2. **Fill confirmed** — `is_filled = True`, `is_open = True` (position is now live; recorded in PDT ledger)
 3. **Terminal failure** — if the order is cancelled/rejected/expired, `entry_order_dead = True` and the bot stops polling it
 
 Defense close orders follow the same pattern. If a defense close order terminally fails, the bot retries up to 2 times (strategy level), then escalates to `cancel_all_orders()`. The orchestrator caps total escalation attempts at 3 before logging `MANUAL INTERVENTION REQUIRED`.
+
+Every exit fill is also recorded in the PDT ledger with an `exit_reason` (`scheduled_close`, `defense`, `emergency`, or `discretionary_early_exit`).
+
+---
+
+## PDT Protection
+
+The bot includes a Pattern Day Trader (PDT) guard to prevent accidental PDT classification.
+
+**Decision tree for discretionary early exits:**
+
+1. Is this a mandatory exit (defense, emergency, risk-reduction)? → **Always allowed**
+2. Is account equity > $30,000? → If no, **block early exit**
+3. Are there < 3 day trades in the rolling 5-business-day window? → If no, **block early exit**
+4. All checks pass → **Allow early exit**
+
+**What counts as a day trade:** A same-day round trip where both the entry fill and exit fill occur on the same trading day. Only confirmed fills are counted — cancelled orders are ignored.
+
+**Persistent ledger:** Day trades are recorded in `state/day_trade_log.json` and survive process restarts. Each record includes the trade date, strategy sleeve, symbol, timestamps, and exit reason.
+
+**Mandatory exits are never blocked:**
+- Condor defense close (SPY breach)
+- Emergency flatten
+- Broker/order failure cleanup
 
 ---
 
@@ -125,6 +151,11 @@ bot/
   condor_strategy.py        # Iron condor: enter, check_defense, close_defense,
                             #   check_defense_fill, on_settlement
   directional_strategy.py   # XND directional: assess_filters, enter, on_settlement
+  pdt_guard.py              # PDT protection — persistent day-trade ledger,
+                            #   rolling 5-business-day count, discretionary exit gate
+state/
+  day_trade_log.json        # Persistent PDT day-trade ledger (auto-created)
+  reports/                  # Daily JSON reports with PDT status
 ```
 
 Legacy momentum files (`morning_main.py`, `position_manager.py`, etc.) are preserved in `bot/` but are not used by the condor system.
@@ -183,9 +214,9 @@ vix_threshold = 18.0
 morning_range_pct = 0.004   # 0.40%
 morning_direction_pct = 0.003  # 0.30%
 
-# Directional sizing
-equity_risk_pct = 0.0125    # 1.25% of cash
-leverage_multiplier = 5.0
+# Directional sizing (based on current available buying power)
+directional_bp_pct = 0.0125             # Percent of current BP for premium budget
+directional_leverage_multiplier = 5.0   # Premium budget scaled by this multiplier
 ```
 
 ## Known Limitations
@@ -194,3 +225,4 @@ leverage_multiplier = 5.0
 - **Defense is polling-based.** Sub-second excursions between ~30 s refresh intervals could be missed. Streaming WebSocket defense is not implemented.
 - **Directional sizing falls back to stale data.** If the live option snapshot is unavailable, sizing uses prior close or a $2.00 fallback, which can be far off for 0DTE.
 - **NDX proxy.** XND strike selection and settlement use QQQ × 40 as an NDX approximation. The actual ratio fluctuates slightly.
+- **PDT guard uses local business-day count.** Does not account for market holidays. The 5-business-day window is based on Mon–Fri, not the exchange calendar.

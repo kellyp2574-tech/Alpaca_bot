@@ -44,6 +44,11 @@ class CondorState:
     defense_fill_price: Optional[float] = None  # actual debit paid to close
     defense_close_failed: bool = False  # True if close order was rejected/cancelled
 
+    # Early exit (discretionary close before settlement)
+    early_exit_order_id: Optional[str] = None
+    early_exit_filled: bool = False
+    early_exit_fill_price: Optional[float] = None
+
     # Status
     # is_open means the position is live (entry filled).
     # Before fill confirmation, only entry_order_id is set.
@@ -115,9 +120,32 @@ class CondorStrategy:
 
         self.state.legs = legs
 
-        # Step 4: Sizing
+        # Step 4: Sizing — use actual max loss from chosen strikes, not config estimate.
+        # max_wing_width is the raw wider wing before credit.
+        # Net max loss = wing - expected credit received.
+        max_wing = legs.max_wing_width
+        if max_wing <= 0:
+            logger.error("CONDOR ENTRY FAILED: max_wing_width is zero (bad leg geometry)")
+            return False
+
+        net_max_loss = max_wing - self.cfg.target_credit
+        if net_max_loss <= 0:
+            logger.error(
+                "CONDOR ENTRY FAILED: net max loss <= 0 (wing=$%.2f credit=$%.2f)",
+                max_wing, self.cfg.target_credit,
+            )
+            return False
+
+        if abs(net_max_loss - self.cfg.max_loss_per_contract) > 0.50:
+            logger.warning(
+                "Condor net max loss ($%.2f) differs from config estimate ($%.2f) "
+                "— sizing will use actual strikes (wing=$%.2f - credit=$%.2f)",
+                net_max_loss, self.cfg.max_loss_per_contract,
+                max_wing, self.cfg.target_credit,
+            )
+
         buying_power = get_buying_power()
-        qty = size_condor(buying_power, self.cfg.max_loss_per_contract)
+        qty = size_condor(buying_power, net_max_loss)
         if qty <= 0:
             logger.error("CONDOR ENTRY FAILED: Insufficient buying power ($%.2f)", buying_power)
             return False
@@ -313,6 +341,81 @@ class CondorStrategy:
                 logger.debug("Defense close order status: %s", status)
         except Exception as e:
             logger.warning("Failed to check defense fill: %s", e)
+        return False
+
+    def close_early_exit(self) -> bool:
+        """
+        Submit a discretionary early-exit close order.
+
+        Unlike close_defense(), this does NOT set defense_triggered.
+        The orchestrator polls check_early_exit_fill() and records
+        EXIT_REASON_DISCRETIONARY on confirmed fill.
+
+        Returns True if the close order was placed.
+        """
+        if not self.state.is_filled or not self.state.legs:
+            logger.warning("Cannot early-exit condor: no filled position")
+            return False
+
+        logger.info(
+            "CONDOR EARLY EXIT: Closing %d contracts at market",
+            self.state.qty,
+        )
+
+        try:
+            order = close_condor_order(
+                legs=self.state.legs,
+                qty=self.state.qty,
+                dry_run=self.dry_run,
+            )
+            if order:
+                self.state.early_exit_order_id = order.get("id")
+                logger.info(
+                    "CONDOR EARLY EXIT ORDER PLACED: order_id=%s",
+                    self.state.early_exit_order_id,
+                )
+                return True
+        except Exception as e:
+            logger.error("CONDOR EARLY EXIT ORDER FAILED: %s", e)
+        return False
+
+    def check_early_exit_fill(self) -> bool:
+        """
+        Poll the discretionary early-exit close order for a fill.
+
+        Returns True once the fill is confirmed.  The orchestrator
+        should record the PDT exit only after this returns True.
+        """
+        if self.state.early_exit_filled or not self.state.early_exit_order_id:
+            return self.state.early_exit_filled
+
+        if self.dry_run:
+            self.state.early_exit_filled = True
+            self.state.early_exit_fill_price = 0.50
+            self.state.is_open = False
+            return True
+
+        try:
+            order = get_order(self.state.early_exit_order_id)
+            status = order.get("status", "")
+            if status == "filled":
+                self.state.early_exit_filled = True
+                self.state.early_exit_fill_price = float(order.get("filled_avg_price", 0))
+                self.state.is_open = False
+                logger.info(
+                    "CONDOR EARLY EXIT FILLED: debit=$%.2f per contract",
+                    self.state.early_exit_fill_price,
+                )
+                return True
+            elif status in ("cancelled", "expired", "rejected"):
+                logger.error(
+                    "CONDOR EARLY EXIT ORDER %s — position may still be open!",
+                    status.upper(),
+                )
+            else:
+                logger.debug("Condor early-exit order status: %s", status)
+        except Exception as e:
+            logger.warning("Failed to check condor early-exit fill: %s", e)
         return False
 
     def on_settlement(self, tracker: MorningTracker) -> dict:

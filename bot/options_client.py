@@ -68,6 +68,11 @@ class CondorLegs:
     short_call_strike: float = 0.0
     long_call_strike: float = 0.0
 
+    # Actual spread geometry (computed from chosen strikes)
+    put_wing_width: float = 0.0     # short_put_strike - long_put_strike
+    call_wing_width: float = 0.0    # long_call_strike - short_call_strike
+    max_wing_width: float = 0.0     # max(put_wing, call_wing) — raw wing, before credit
+
 
 # ─── Contract lookup ──────────────────────────────────────────────────────────
 
@@ -151,6 +156,58 @@ def find_nearest_strike(contracts: list[OptionContract], target_strike: float) -
     return min(contracts, key=lambda c: abs(c.strike_price - target_strike))
 
 
+def find_strike_at_or_below(contracts: list[OptionContract], target: float) -> Optional[OptionContract]:
+    """
+    Find the contract whose strike is nearest to *target* while being
+    at or below it.  Used for short puts (must be OTM relative to anchor).
+    Falls back to nearest overall if nothing is at-or-below.
+    """
+    below = [c for c in contracts if c.strike_price <= target]
+    if below:
+        return max(below, key=lambda c: c.strike_price)  # closest to target from below
+    # Fallback: nearest overall (will be flagged by validation)
+    return find_nearest_strike(contracts, target)
+
+
+def find_strike_at_or_above(contracts: list[OptionContract], target: float) -> Optional[OptionContract]:
+    """
+    Find the contract whose strike is nearest to *target* while being
+    at or above it.  Used for short calls (must be OTM relative to anchor).
+    Falls back to nearest overall if nothing is at-or-above.
+    """
+    above = [c for c in contracts if c.strike_price >= target]
+    if above:
+        return min(above, key=lambda c: c.strike_price)  # closest to target from above
+    return find_nearest_strike(contracts, target)
+
+
+def find_strike_nearest_width(contracts: list[OptionContract], reference_strike: float, target_width: float, direction: str) -> Optional[OptionContract]:
+    """
+    Find the contract that best matches a target wing width from a
+    reference (short) strike.
+
+    direction="below": wing target = reference - width (long put)
+    direction="above": wing target = reference + width (long call)
+
+    Uses directional rules:
+    - "below": pick at-or-below the target (pushes wing further OTM)
+    - "above": pick at-or-above the target (pushes wing further OTM)
+    """
+    if direction == "below":
+        wing_target = reference_strike - target_width
+        candidates = [c for c in contracts if c.strike_price <= wing_target]
+        if candidates:
+            return max(candidates, key=lambda c: c.strike_price)
+    else:  # above
+        wing_target = reference_strike + target_width
+        candidates = [c for c in contracts if c.strike_price >= wing_target]
+        if candidates:
+            return min(candidates, key=lambda c: c.strike_price)
+
+    # Fallback: nearest to the ideal wing target
+    return find_nearest_strike(contracts, reference_strike - target_width if direction == "below" else reference_strike + target_width)
+
+
 def get_todays_expiration() -> str:
     """Return today's date as YYYY-MM-DD for 0DTE."""
     return date.today().strftime("%Y-%m-%d")
@@ -181,6 +238,11 @@ def compute_condor_strikes(
     }
 
 
+# Maximum acceptable asymmetry between put and call wing widths.
+# If they differ by more than this (in strike-price dollars), reject.
+WING_WIDTH_TOLERANCE = 3.0
+
+
 def build_condor_legs(
     anchor_price: float,
     option_root: str,
@@ -191,53 +253,115 @@ def build_condor_legs(
     """
     Fetch contracts and find the best 4 legs for an iron condor.
 
-    Returns CondorLegs with OCC symbols, or None if contracts not found.
+    Algorithm:
+    1. Compute target short/wing strikes from anchor.
+    2. Fetch all tradable puts and calls in a wide neighbourhood.
+    3. Pick short strikes using directional rules:
+       - short put  = nearest strike **at or below** the target  (OTM)
+       - short call = nearest strike **at or above** the target  (OTM)
+    4. Build wings from the chosen short strikes (not independently):
+       - long put   = nearest strike at-or-below  (short_put - target_wing_width)
+       - long call  = nearest strike at-or-above  (short_call + target_wing_width)
+    5. Validate:
+       - ordering (LP < SP < anchor < SC < LC)
+       - short strikes are on the correct side of the anchor
+       - put wing width ≈ call wing width (within WING_WIDTH_TOLERANCE)
+    6. Compute actual max loss per contract from chosen strikes.
+
+    Returns CondorLegs with OCC symbols and actual geometry, or None.
     """
     targets = compute_condor_strikes(anchor_price, short_pct, wing_pct)
+    target_wing_width = anchor_price * wing_pct  # dollar width target
+
     logger.info(
-        "Condor strike targets: anchor=%.2f LP=%.2f SP=%.2f SC=%.2f LC=%.2f",
-        anchor_price, targets["long_put"], targets["short_put"],
-        targets["short_call"], targets["long_call"],
+        "Condor strike targets: anchor=%.2f SP_target=%.2f SC_target=%.2f "
+        "wing_width_target=$%.2f",
+        anchor_price, targets["short_put"], targets["short_call"],
+        target_wing_width,
     )
 
-    # Fetch puts and calls
+    # Fetch puts and calls with a wider window to handle sparse chains
+    margin = target_wing_width + 10  # generous safety margin
     puts = fetch_option_contracts(
         option_root, expiration_date, option_type="put",
-        strike_price_gte=targets["long_put"] - 5,
-        strike_price_lte=targets["short_put"] + 5,
+        strike_price_gte=targets["long_put"] - margin,
+        strike_price_lte=targets["short_put"] + margin,
     )
     calls = fetch_option_contracts(
         option_root, expiration_date, option_type="call",
-        strike_price_gte=targets["short_call"] - 5,
-        strike_price_lte=targets["long_call"] + 5,
+        strike_price_gte=targets["short_call"] - margin,
+        strike_price_lte=targets["long_call"] + margin,
     )
 
     tradable_puts = [c for c in puts if c.tradable]
     tradable_calls = [c for c in calls if c.tradable]
 
-    long_put = find_nearest_strike(tradable_puts, targets["long_put"])
-    short_put = find_nearest_strike(tradable_puts, targets["short_put"])
-    short_call = find_nearest_strike(tradable_calls, targets["short_call"])
-    long_call = find_nearest_strike(tradable_calls, targets["long_call"])
+    # ── Step 3: Pick short strikes directionally ──────────────────────
+    short_put = find_strike_at_or_below(tradable_puts, targets["short_put"])
+    short_call = find_strike_at_or_above(tradable_calls, targets["short_call"])
 
-    if not all([long_put, short_put, short_call, long_call]):
+    if not short_put or not short_call:
+        logger.error("Could not find short strikes. SP=%s SC=%s", short_put, short_call)
+        return None
+
+    # Validate short strikes are on correct side of anchor
+    if short_put.strike_price >= anchor_price:
         logger.error(
-            "Could not find all 4 condor legs. LP=%s SP=%s SC=%s LC=%s",
-            long_put, short_put, short_call, long_call,
+            "Short put (%.2f) must be below anchor (%.2f)",
+            short_put.strike_price, anchor_price,
+        )
+        return None
+    if short_call.strike_price <= anchor_price:
+        logger.error(
+            "Short call (%.2f) must be above anchor (%.2f)",
+            short_call.strike_price, anchor_price,
         )
         return None
 
-    # Ensure puts are ordered correctly (long_put < short_put)
-    if long_put.strike_price >= short_put.strike_price:
-        logger.error("Long put strike (%.2f) must be < short put strike (%.2f)",
-                      long_put.strike_price, short_put.strike_price)
+    # ── Step 4: Build wings from chosen shorts ────────────────────────
+    long_put = find_strike_nearest_width(
+        tradable_puts, short_put.strike_price, target_wing_width, "below",
+    )
+    long_call = find_strike_nearest_width(
+        tradable_calls, short_call.strike_price, target_wing_width, "above",
+    )
+
+    if not long_put or not long_call:
+        logger.error(
+            "Could not find wing strikes. LP=%s LC=%s", long_put, long_call,
+        )
         return None
 
-    # Ensure calls are ordered correctly (short_call < long_call)
-    if short_call.strike_price >= long_call.strike_price:
-        logger.error("Short call strike (%.2f) must be < long call strike (%.2f)",
-                      short_call.strike_price, long_call.strike_price)
+    # ── Step 5: Validate structure ────────────────────────────────────
+    # Ordering
+    if long_put.strike_price >= short_put.strike_price:
+        logger.error(
+            "Long put (%.2f) must be < short put (%.2f)",
+            long_put.strike_price, short_put.strike_price,
+        )
         return None
+    if short_call.strike_price >= long_call.strike_price:
+        logger.error(
+            "Short call (%.2f) must be < long call (%.2f)",
+            short_call.strike_price, long_call.strike_price,
+        )
+        return None
+
+    # Compute actual wing widths
+    put_wing = short_put.strike_price - long_put.strike_price
+    call_wing = long_call.strike_price - short_call.strike_price
+
+    # Width symmetry check
+    if abs(put_wing - call_wing) > WING_WIDTH_TOLERANCE:
+        logger.error(
+            "Wing widths too asymmetric: put_wing=$%.2f call_wing=$%.2f "
+            "(tolerance=$%.2f)",
+            put_wing, call_wing, WING_WIDTH_TOLERANCE,
+        )
+        return None
+
+    # ── Step 6: Compute actual max loss ───────────────────────────────
+    max_wing = max(put_wing, call_wing)
 
     legs = CondorLegs(
         long_put=long_put.symbol,
@@ -248,14 +372,19 @@ def build_condor_legs(
         short_put_strike=short_put.strike_price,
         short_call_strike=short_call.strike_price,
         long_call_strike=long_call.strike_price,
+        put_wing_width=put_wing,
+        call_wing_width=call_wing,
+        max_wing_width=max_wing,  # raw wing width before credit
     )
 
     logger.info(
-        "Condor legs built: LP=%s(%.2f) SP=%s(%.2f) SC=%s(%.2f) LC=%s(%.2f)",
+        "Condor legs built: LP=%s(%.2f) SP=%s(%.2f) SC=%s(%.2f) LC=%s(%.2f) "
+        "put_wing=$%.2f call_wing=$%.2f max_wing=$%.2f",
         legs.long_put, legs.long_put_strike,
         legs.short_put, legs.short_put_strike,
         legs.short_call, legs.short_call_strike,
         legs.long_call, legs.long_call_strike,
+        put_wing, call_wing, max_wing,
     )
     return legs
 
@@ -527,6 +656,26 @@ def get_option_positions() -> list[dict]:
     return [p for p in positions if len(p.get("symbol", "")) > 10]
 
 
+def close_option_position(symbol: str) -> Optional[dict]:
+    """
+    Close an open option position at market via DELETE /v2/positions/{symbol}.
+
+    Used by emergency shutdown to flatten all live option positions.
+    Returns the close order dict, or None on failure.
+    """
+    url = f"{_base_url()}/v2/positions/{symbol}"
+    try:
+        resp = requests.delete(url, headers=_headers(), timeout=15)
+        if resp.status_code in (200, 204):
+            order = resp.json() if resp.content else {}
+            logger.info("Position closed: %s → order=%s", symbol, order.get("id", "n/a"))
+            return order
+        logger.warning("Failed to close position %s: %s %s", symbol, resp.status_code, resp.text)
+    except Exception as e:
+        logger.error("Exception closing position %s: %s", symbol, e)
+    return None
+
+
 def get_account_info() -> dict:
     """Get account details including buying power."""
     url = f"{_base_url()}/v2/account"
@@ -572,15 +721,17 @@ def size_condor(buying_power: float, max_loss_per_contract: float) -> int:
     return max(contracts, 0)
 
 
-def size_directional(buying_power: float, equity_risk_pct: float, leverage: float) -> float:
+def size_directional(buying_power: float, bp_pct: float, leverage: float) -> float:
     """
-    Calculate notional for directional trade.
-    notional = buying_power × equity_risk_pct × leverage
-    Returns dollar amount to spend on premium.
+    Calculate directional premium budget from current available buying power.
+
+    premium_budget = buying_power × bp_pct × leverage
+
+    Returns dollar amount to spend on option premium.
     """
-    notional = buying_power * equity_risk_pct * leverage
+    premium_budget = buying_power * bp_pct * leverage
     logger.info(
-        "Directional sizing: buying_power=$%.2f × %.4f × %.1fx = $%.2f notional",
-        buying_power, equity_risk_pct, leverage, notional,
+        "Directional sizing: buying_power=$%.2f × %.4f × %.1fx = $%.2f premium budget",
+        buying_power, bp_pct, leverage, premium_budget,
     )
-    return notional
+    return premium_budget

@@ -51,9 +51,12 @@ class DirectionalConfig:
     assessment_time: str = "10:30"    # Evaluate filters
     entry_time: str = "10:45"         # Place trade if qualified
 
-    # Sizing
-    equity_risk_pct: float = 0.0125   # 1.25% of cash risked
-    leverage_multiplier: float = 5.0   # Approximate option leverage
+    # Strike selection — slightly OTM in signal direction
+    directional_otm_offset: float = 0.001  # 0.10% OTM from NDX estimate
+
+    # Sizing — based on current available buying power at entry time
+    directional_bp_pct: float = 0.0125     # Percent of current buying power allocated to directional premium budget
+    directional_leverage_multiplier: float = 5.0  # Directional premium budget is scaled by this leverage multiplier
 
     # Order parameters
     order_type: str = "market"

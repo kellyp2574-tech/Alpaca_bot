@@ -19,6 +19,7 @@ from bot.condor_config import StrategyConfig
 from bot.options_client import (
     get_equity,
     get_option_positions,
+    close_option_position,
     cancel_all_orders,
     get_account_info,
 )
@@ -29,6 +30,13 @@ from bot.market_data import (
 )
 from bot.condor_strategy import CondorStrategy
 from bot.directional_strategy import DirectionalStrategy
+from bot.pdt_guard import (
+    PDTGuard,
+    EXIT_REASON_SCHEDULED,
+    EXIT_REASON_DISCRETIONARY,
+    EXIT_REASON_DEFENSE,
+    EXIT_REASON_EMERGENCY,
+)
 
 # ═══════════════════════════════════════════════════
 # Timezone
@@ -62,7 +70,7 @@ logging.basicConfig(
     ],
 )
 
-logger = logging.getLogger("condor_bot")
+logger = logging.getLogger("bot")
 logger.info(f"Logging initialized: {LOG_PATH}")
 
 
@@ -89,6 +97,9 @@ class CondorBot:
         self.condor = CondorStrategy(self.config.condor, dry_run=dry_run)
         self.directional = DirectionalStrategy(self.config.directional, dry_run=dry_run)
 
+        # PDT guard — persistent day-trade ledger
+        self.pdt_guard = PDTGuard()
+
         # Market data tracker
         self.tracker = MorningTracker()
 
@@ -99,6 +110,11 @@ class CondorBot:
         self.directional_entered = False
         self.condor_entered = False
         self.settlement_done = False
+
+        # Exit reason tracking for reporting
+        self._condor_exit_reason: str = ""
+        self._directional_exit_reason: str = ""
+        self._pdt_blocked_early_exit: bool = False
 
         # Account info
         self.start_equity = 0.0
@@ -113,6 +129,15 @@ class CondorBot:
         # broker persistently rejects defense orders.
         self._defense_escalation_count = 0
         self.MAX_DEFENSE_ESCALATIONS = 3
+
+        # Precompute schedule times (assumes single-day process)
+        sched = self.config.schedule
+        self._t_market_open = parse_time(sched.market_open).time()
+        self._t_assessment = parse_time(sched.morning_assessment).time()
+        self._t_dir_entry = parse_time(sched.directional_entry).time()
+        self._t_condor_entry = parse_time(sched.condor_entry).time()
+        self._t_settle = parse_time(sched.market_close).time()
+        self._t_shutdown = parse_time(sched.bot_shutdown).time()
 
     # ─── Session lifecycle ─────────────────────────────────────────────────
 
@@ -250,6 +275,113 @@ class CondorBot:
         else:
             logger.error("Condor entry failed — no position today")
 
+    # ─── PDT guard integration ──────────────────────────────────────────────
+
+    def _record_condor_entry_fill(self):
+        """Record condor entry fill with PDT guard."""
+        try:
+            symbol = "XSP_CONDOR"  # Synthetic — mleg has multiple symbols
+            self.pdt_guard.record_entry_fill(
+                symbol=symbol,
+                strategy="condor",
+                order_id=self.condor.state.entry_order_id or "",
+            )
+        except Exception as e:
+            logger.warning("PDT: Failed to record condor entry fill: %s", e)
+
+    def _record_directional_entry_fill(self):
+        """Record directional entry fill with PDT guard."""
+        try:
+            self.pdt_guard.record_entry_fill(
+                symbol=self.directional.state.option_symbol or "XND_UNKNOWN",
+                strategy="directional",
+                order_id=self.directional.state.entry_order_id or "",
+            )
+        except Exception as e:
+            logger.warning("PDT: Failed to record directional entry fill: %s", e)
+
+    def _attempt_discretionary_early_exit(self, sleeve: str) -> bool:
+        """
+        Gate a discretionary early exit through the PDT guard.
+
+        Call this before any non-mandatory early close (e.g., profit-taking,
+        time-based early exit).  Mandatory exits (defense, emergency) must
+        NOT use this method — they bypass PDT checks entirely.
+
+        Returns True if the exit was allowed and executed, False if blocked.
+        """
+        try:
+            equity = get_equity()
+        except Exception as e:
+            logger.warning("PDT: Cannot check equity for early exit: %s — blocking", e)
+            self._pdt_blocked_early_exit = True
+            return False
+
+        if not self.pdt_guard.can_take_discretionary_day_trade(equity):
+            self._pdt_blocked_early_exit = True
+            logger.warning(
+                "PDT GUARD: Discretionary early exit BLOCKED for %s sleeve", sleeve,
+            )
+            return False
+
+        # Exit is allowed — execute the close
+        if sleeve == "condor" and self.condor.state.is_filled and self.condor.state.is_open:
+            logger.info("DISCRETIONARY EARLY EXIT: closing condor")
+            success = self.condor.close_early_exit()
+            if success:
+                logger.info("Condor early-exit order submitted: %s",
+                            self.condor.state.early_exit_order_id)
+                return True
+            return False
+
+        elif sleeve == "directional" and self.directional.state.is_filled and self.directional.state.is_open:
+            logger.info("DISCRETIONARY EARLY EXIT: closing directional")
+            try:
+                from bot.options_client import place_single_option_order
+                order = place_single_option_order(
+                    symbol=self.directional.state.option_symbol,
+                    qty=self.directional.state.qty,
+                    side="sell",
+                    order_type="market",
+                    dry_run=self.dry_run,
+                )
+                if order:
+                    # Do NOT record PDT exit here — wait for confirmed fill.
+                    # Store the order ID so the main loop can poll for it.
+                    self.directional.state.early_exit_order_id = order.get("id")
+                    logger.info("Directional early-exit order submitted: %s", order.get("id"))
+                    return True
+            except Exception as e:
+                logger.error("Failed to submit directional early-exit order: %s", e)
+            return False
+
+        logger.debug("No open position for %s sleeve — nothing to early-exit", sleeve)
+        return False
+
+    def _record_condor_exit(self, exit_reason: str):
+        """Record condor exit fill with PDT guard."""
+        self._condor_exit_reason = exit_reason
+        try:
+            self.pdt_guard.record_exit_fill(
+                symbol="XSP_CONDOR",
+                strategy="condor",
+                exit_reason=exit_reason,
+            )
+        except Exception as e:
+            logger.warning("PDT: Failed to record condor exit: %s", e)
+
+    def _record_directional_exit(self, exit_reason: str):
+        """Record directional exit fill with PDT guard."""
+        self._directional_exit_reason = exit_reason
+        try:
+            self.pdt_guard.record_exit_fill(
+                symbol=self.directional.state.option_symbol or "XND_UNKNOWN",
+                strategy="directional",
+                exit_reason=exit_reason,
+            )
+        except Exception as e:
+            logger.warning("PDT: Failed to record directional exit: %s", e)
+
     # ─── Defense monitoring ────────────────────────────────────────────────
 
     def _check_defense(self):
@@ -280,6 +412,9 @@ class CondorBot:
         if self.condor.check_defense(self.tracker):
             logger.warning("DEFENSE TRIGGERED — closing condor immediately")
             self.condor.close_defense()
+            # NOTE: Do NOT record PDT exit here — the close order has only
+            # been *submitted*, not confirmed.  The exit is recorded in the
+            # defense-fill polling block once defense_filled transitions True.
 
     # ─── Settlement ────────────────────────────────────────────────────────
 
@@ -296,9 +431,17 @@ class CondorBot:
         condor_result = self.condor.on_settlement(self.tracker)
         logger.info("Condor result: %s", json.dumps(condor_result, default=str))
 
+        # Record condor exit if it wasn't already recorded (defense case)
+        if self.condor.state.is_filled and not self._condor_exit_reason:
+            self._record_condor_exit(EXIT_REASON_SCHEDULED)
+
         # Directional settlement — pass tracker for NDX estimate
         directional_result = self.directional.on_settlement(self.tracker)
         logger.info("Directional result: %s", json.dumps(directional_result, default=str))
+
+        # Record directional exit
+        if self.directional.state.is_filled and not self._directional_exit_reason:
+            self._record_directional_exit(EXIT_REASON_SCHEDULED)
 
         self.settlement_done = True
 
@@ -344,12 +487,34 @@ class CondorBot:
             "condor": self.condor.get_summary(),
             "directional": self.directional.get_summary(),
             "dry_run": self.dry_run,
+            # Exit reason tracking
+            "condor_exit_reason": self._condor_exit_reason or "none",
+            "directional_exit_reason": self._directional_exit_reason or "none",
+            "pdt_blocked_early_exit": self._pdt_blocked_early_exit,
+            # Settlement proxy disclaimers — P&L figures are estimates
+            "settlement_notes": {
+                "condor": "XSP settles off SOQ/SET, not SPY last trade. P&L is a proxy estimate.",
+                "directional": "XND settles off NDX special calc, not QQQ×40. P&L is a proxy estimate.",
+                "reconcile": "Reconcile against broker end-of-day statement for precise accounting.",
+            },
         }
 
         try:
-            end_equity = get_equity()
+            acct = get_account_info()
+            end_equity = float(acct.get("equity", 0))
+            end_bp = float(acct.get("buying_power", 0))
             report["end_equity"] = end_equity
+            report["end_buying_power"] = end_bp
             report["daily_pnl"] = end_equity - self.start_equity
+        except Exception as e:
+            logger.warning("Could not fetch final account info for report: %s", e)
+            report["end_equity"] = None
+            report["end_buying_power"] = None
+            report["daily_pnl"] = None
+
+        # PDT guard status
+        try:
+            report["pdt_guard"] = self.pdt_guard.get_status()
         except Exception:
             pass
 
@@ -379,13 +544,15 @@ class CondorBot:
         )
 
         if self.condor.state.is_open and self.tracker.condor_anchor:
-            move = self.tracker.spy_move_from_anchor_pct()
-            if move is not None:
-                logger.info(
-                    "  Condor: anchor=$%.2f move=%.3f%% (trigger=%.2f%%)",
-                    self.tracker.condor_anchor, move * 100,
-                    self.config.condor.defense_trigger_pct * 100,
-                )
+            current_move = self.tracker.spy_move_from_anchor_pct()
+            max_move = self.tracker.spy_max_move_from_anchor_pct()
+            logger.info(
+                "  Condor: anchor=$%.2f current_move=%.3f%% max_excursion=%.3f%% (trigger=%.2f%%)",
+                self.tracker.condor_anchor,
+                (current_move or 0.0) * 100,
+                (max_move or 0.0) * 100,
+                self.config.condor.defense_trigger_pct * 100,
+            )
 
     # ─── Main loop ─────────────────────────────────────────────────────────
 
@@ -410,16 +577,14 @@ class CondorBot:
                 now = market_now()
                 t = now.time()
 
-                shutdown_t = parse_time(self.config.schedule.bot_shutdown).time()
-                if t >= shutdown_t:
+                if t >= self._t_shutdown:
                     if not self.settlement_done:
                         self._handle_settlement()
                     self._shutdown()
                     break
 
                 # 9:30 AM — Start bar tracking
-                market_open_t = parse_time(self.config.schedule.market_open).time()
-                if t >= market_open_t and not self.bars_tracking:
+                if t >= self._t_market_open and not self.bars_tracking:
                     self._start_bar_tracking()
 
                 # Refresh prices periodically after market open
@@ -427,33 +592,45 @@ class CondorBot:
                     self._refresh_prices()
 
                 # 10:30 AM — Morning assessment
-                assessment_t = parse_time(self.config.schedule.morning_assessment).time()
-                if t >= assessment_t and not self.assessment_done and self.bars_tracking:
+                if t >= self._t_assessment and not self.assessment_done and self.bars_tracking:
                     self._morning_assessment()
 
                 # 10:45 AM — Directional entry
-                dir_entry_t = parse_time(self.config.schedule.directional_entry).time()
-                if t >= dir_entry_t and not self.directional_entered and self.assessment_done:
+                if t >= self._t_dir_entry and not self.directional_entered and self.assessment_done:
                     self._enter_directional()
 
                 # 11:30 AM — Condor entry
-                condor_entry_t = parse_time(self.config.schedule.condor_entry).time()
-                if t >= condor_entry_t and not self.condor_entered and self.bars_tracking:
+                if t >= self._t_condor_entry and not self.condor_entered and self.bars_tracking:
                     self._enter_condor()
 
                 # Check fill statuses (skip terminal/dead orders)
                 if (self.condor.state.entry_order_id
                         and not self.condor.state.is_filled
                         and not self.condor.state.entry_order_dead):
+                    was_filled_before = self.condor.state.is_filled
                     self.condor.check_fill_status()
+                    # Record entry fill with PDT guard
+                    if self.condor.state.is_filled and not was_filled_before:
+                        self._record_condor_entry_fill()
+
                 if (self.directional.state.entry_order_id
                         and not self.directional.state.is_filled
                         and not self.directional.state.entry_order_dead):
+                    was_filled_before = self.directional.state.is_filled
                     self.directional.check_fill_status()
+                    # Record entry fill with PDT guard
+                    if self.directional.state.is_filled and not was_filled_before:
+                        self._record_directional_entry_fill()
 
                 # Poll defense-close fill if defense was triggered
                 if self.condor.state.defense_triggered and not self.condor.state.defense_filled:
+                    was_defense_filled = self.condor.state.defense_filled
                     self.condor.check_defense_fill()
+
+                    # Record PDT exit only on confirmed defense fill
+                    if self.condor.state.defense_filled and not was_defense_filled:
+                        self._record_condor_exit(EXIT_REASON_DEFENSE)
+
                     # Escalate only if the defense order reached a truly
                     # terminal state (cancelled/rejected/expired).  Do NOT
                     # re-close if the order is merely still pending — that
@@ -479,13 +656,30 @@ class CondorBot:
                                 self.MAX_DEFENSE_ESCALATIONS,
                             )
 
+                # Poll condor early-exit fill (discretionary, separate from defense)
+                if (self.condor.state.early_exit_order_id
+                        and not self.condor.state.early_exit_filled):
+                    was_filled = self.condor.state.early_exit_filled
+                    self.condor.check_early_exit_fill()
+                    if self.condor.state.early_exit_filled and not was_filled:
+                        self._record_condor_exit(EXIT_REASON_DISCRETIONARY)
+
+                # Poll directional early-exit fill
+                if (self.directional.state.early_exit_order_id
+                        and not self.directional.state.early_exit_filled):
+                    was_filled = self.directional.state.early_exit_filled
+                    self.directional.check_early_exit_fill()
+                    if self.directional.state.early_exit_filled and not was_filled:
+                        self._record_directional_exit(EXIT_REASON_DISCRETIONARY)
+
                 # Defense monitoring (only when condor is actually filled)
-                if self.condor.state.is_filled:
+                # Skip if an early exit is already in progress
+                if (self.condor.state.is_filled
+                        and not self.condor.state.early_exit_order_id):
                     self._check_defense()
 
                 # 4:00 PM — Settlement
-                settle_t = parse_time(self.config.schedule.market_close).time()
-                if t >= settle_t and not self.settlement_done:
+                if t >= self._t_settle and not self.settlement_done:
                     self._handle_settlement()
 
                 # Periodic status
@@ -503,7 +697,15 @@ class CondorBot:
             raise
 
     def _emergency_shutdown(self):
-        """Emergency shutdown: cancel all orders, log state."""
+        """
+        Emergency shutdown: cancel all orders, then attempt to close
+        all open option positions at market.
+
+        This is a best-effort flatten — if any close fails, it is
+        logged for manual cleanup.  PDT rules are intentionally
+        ignored here; keeping positions open through a crash is a
+        larger risk than an extra day-trade count.
+        """
         logger.warning("EMERGENCY SHUTDOWN")
         try:
             cancel_all_orders()
@@ -511,17 +713,44 @@ class CondorBot:
         except Exception as e:
             logger.error("Failed to cancel orders: %s", e)
 
+        # Attempt to flatten all open option positions
         try:
             positions = get_option_positions()
             if positions:
-                logger.warning("Open option positions at emergency shutdown:")
+                logger.warning(
+                    "EMERGENCY FLATTEN: %d open option position(s) — closing at market",
+                    len(positions),
+                )
                 for p in positions:
-                    logger.warning("  %s qty=%s", p.get("symbol"), p.get("qty"))
+                    sym = p.get("symbol", "")
+                    qty = p.get("qty", "?")
+                    try:
+                        result = close_option_position(sym)
+                        if result:
+                            logger.info("  CLOSED %s qty=%s", sym, qty)
+                        else:
+                            logger.error("  FAILED to close %s qty=%s — MANUAL CLEANUP REQUIRED", sym, qty)
+                    except Exception as e:
+                        logger.error("  Exception closing %s: %s — MANUAL CLEANUP REQUIRED", sym, e)
+            else:
+                logger.info("No open option positions at emergency shutdown")
         except Exception as e:
-            logger.error("Failed to check positions: %s", e)
+            logger.error("Failed to check/close positions: %s", e)
+
+        # Record emergency exits in PDT ledger
+        if self.condor.state.is_filled and not self._condor_exit_reason:
+            self._record_condor_exit(EXIT_REASON_EMERGENCY)
+        if self.directional.state.is_filled and not self._directional_exit_reason:
+            self._record_directional_exit(EXIT_REASON_EMERGENCY)
 
         logger.info("Condor state: %s", json.dumps(self.condor.get_summary(), default=str))
         logger.info("Directional state: %s", json.dumps(self.directional.get_summary(), default=str))
+
+        # Save report even on crash
+        try:
+            self._save_daily_report()
+        except Exception:
+            pass
 
 
 def main():

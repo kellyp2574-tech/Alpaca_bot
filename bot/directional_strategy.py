@@ -14,6 +14,8 @@ from bot.condor_config import DirectionalConfig
 from bot.options_client import (
     fetch_option_contracts,
     find_nearest_strike,
+    find_strike_at_or_above,
+    find_strike_at_or_below,
     get_buying_power,
     get_option_snapshot,
     get_todays_expiration,
@@ -52,6 +54,11 @@ class DirectionalState:
     is_filled: bool = False
     is_open: bool = False
     entry_order_dead: bool = False  # terminal state — stop polling
+
+    # Early exit (discretionary close before settlement)
+    early_exit_order_id: Optional[str] = None
+    early_exit_filled: bool = False
+    early_exit_fill_price: Optional[float] = None
 
     # Settlement
     settled: bool = False
@@ -182,40 +189,70 @@ class DirectionalStrategy:
                          option_type, self.cfg.option_root, expiration, ndx_estimate)
             return False
 
-        # Select the ATM strike closest to our NDX estimate
-        contract = find_nearest_strike(tradable, ndx_estimate)
+        # Select a slightly OTM strike in the signal direction.
+        # Calls (up): strike at-or-above NDX * (1 + otm_offset)
+        # Puts (down): strike at-or-below NDX * (1 - otm_offset)
+        otm_offset = self.cfg.directional_otm_offset
+        if option_type == "call":
+            otm_target = ndx_estimate * (1 + otm_offset)
+            contract = find_strike_at_or_above(tradable, otm_target)
+        else:
+            otm_target = ndx_estimate * (1 - otm_offset)
+            contract = find_strike_at_or_below(tradable, otm_target)
 
         if not contract:
-            logger.error("DIRECTIONAL: Could not find suitable contract")
+            logger.error("DIRECTIONAL: Could not find suitable %s contract (OTM target=%.2f)",
+                         option_type, otm_target)
             return False
 
+        logger.info(
+            "DIRECTIONAL: OTM strike selection — NDX=%.2f, otm_target=%.2f, "
+            "chosen_strike=%.2f (%s)",
+            ndx_estimate, otm_target, contract.strike_price, option_type,
+        )
         self.state.option_symbol = contract.symbol
         self.state.strike_price = contract.strike_price
 
-        # Sizing
+        # Sizing — based on current available buying power at entry time
         buying_power = get_buying_power()
         notional = size_directional(
-            buying_power, self.cfg.equity_risk_pct, self.cfg.leverage_multiplier,
+            buying_power, self.cfg.directional_bp_pct, self.cfg.directional_leverage_multiplier,
         )
 
         # Try to get a live premium quote for this 0DTE contract.
         # contract.close_price is yesterday's close — potentially very
         # stale for a 0DTE option.  Prefer a live snapshot if available.
+        premium_is_stale = False
         live_premium = get_option_snapshot(contract.symbol)
         if live_premium and live_premium > 0:
             estimated_premium = live_premium
             logger.info("DIRECTIONAL: Using live premium $%.2f for %s", live_premium, contract.symbol)
         elif contract.close_price and contract.close_price > 0:
             estimated_premium = contract.close_price
+            premium_is_stale = True
             logger.warning(
-                "DIRECTIONAL: Live premium unavailable, falling back to prior close $%.2f for %s",
+                "DIRECTIONAL: Live premium unavailable, falling back to prior close $%.2f for %s "
+                "— qty will be capped at 1 (stale 0DTE premium risk)",
                 estimated_premium, contract.symbol,
             )
         else:
             estimated_premium = 2.00
-            logger.warning("DIRECTIONAL: No premium data — using conservative fallback $%.2f", estimated_premium)
+            premium_is_stale = True
+            logger.warning(
+                "DIRECTIONAL: No premium data — using hardcoded fallback $%.2f "
+                "— qty will be capped at 1 (stale 0DTE premium risk)",
+                estimated_premium,
+            )
         premium_per_contract = estimated_premium * contract.size  # × 100
         qty = max(1, math.floor(notional / premium_per_contract)) if premium_per_contract > 0 else 1
+
+        # Cap at 1 contract when premium is stale to limit sizing drift
+        if premium_is_stale and qty > 1:
+            logger.warning(
+                "DIRECTIONAL: Capping qty from %d to 1 (stale premium — live quote unavailable)",
+                qty,
+            )
+            qty = 1
 
         self.state.qty = qty
         self.state.premium_spent = estimated_premium * qty * contract.size
@@ -287,6 +324,46 @@ class DirectionalStrategy:
         except Exception as e:
             logger.warning("Failed to check directional fill status: %s", e)
 
+        return False
+
+    def check_early_exit_fill(self) -> bool:
+        """
+        Poll the discretionary early-exit close order for a fill.
+
+        Returns True once the fill is confirmed.  The orchestrator
+        should record the PDT exit only after this returns True.
+        """
+        if self.state.early_exit_filled or not self.state.early_exit_order_id:
+            return self.state.early_exit_filled
+
+        if self.dry_run:
+            self.state.early_exit_filled = True
+            self.state.early_exit_fill_price = 0.0
+            self.state.is_open = False
+            return True
+
+        try:
+            order = get_order(self.state.early_exit_order_id)
+            status = order.get("status", "")
+            if status == "filled":
+                self.state.early_exit_filled = True
+                self.state.early_exit_fill_price = float(order.get("filled_avg_price", 0))
+                self.state.is_open = False
+                logger.info(
+                    "DIRECTIONAL EARLY EXIT FILLED: %d × %s @ $%.2f",
+                    self.state.qty, self.state.option_symbol,
+                    self.state.early_exit_fill_price,
+                )
+                return True
+            elif status in ("cancelled", "expired", "rejected"):
+                logger.error(
+                    "DIRECTIONAL EARLY EXIT ORDER %s — position may still be open!",
+                    status.upper(),
+                )
+            else:
+                logger.debug("Directional early-exit order status: %s", status)
+        except Exception as e:
+            logger.warning("Failed to check directional early-exit fill: %s", e)
         return False
 
     def on_settlement(self, tracker: MorningTracker) -> dict:
