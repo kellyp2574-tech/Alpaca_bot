@@ -95,6 +95,11 @@ def fetch_option_contracts(
     strike_price_gte / strike_price_lte : strike price range
     limit : max results per page
     """
+    logger.info(
+        "OPTIONS FETCH: underlying=%s exp=%s type=%s gte=%s lte=%s limit=%s",
+        underlying, expiration_date, option_type, strike_price_gte, strike_price_lte, limit,
+    )
+
     url = f"{_base_url()}/v2/options/contracts"
     params = {
         "underlying_symbols": underlying,
@@ -526,6 +531,7 @@ def place_single_option_order(
     limit_price: Optional[float] = None,
     time_in_force: str = "day",
     dry_run: bool = False,
+    position_intent: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Place a single-leg option order (for directional trades).
@@ -537,8 +543,14 @@ def place_single_option_order(
     side : "buy" or "sell"
     order_type : "market" or "limit"
     limit_price : Required if order_type is "limit"
+    position_intent : Override for Alpaca position_intent field.
+        Defaults to "buy_to_open" for buys, "sell_to_close" for sells.
     """
-    position_intent = "buy_to_open" if side == "buy" else "sell_to_close"
+    if position_intent is None:
+        position_intent = "buy_to_open" if side == "buy" else "sell_to_close"
+
+    if order_type == "limit" and limit_price is None:
+        raise ValueError("limit_price is required for limit orders")
 
     payload = {
         "symbol": symbol,

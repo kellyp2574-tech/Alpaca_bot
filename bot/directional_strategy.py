@@ -59,6 +59,7 @@ class DirectionalState:
     early_exit_order_id: Optional[str] = None
     early_exit_filled: bool = False
     early_exit_fill_price: Optional[float] = None
+    early_exit_order_dead: bool = False  # terminal — stop polling
 
     # Settlement
     settled: bool = False
@@ -134,10 +135,17 @@ class DirectionalStrategy:
 
         return self.state.qualified
 
-    # QQQ ≈ NDX / 40.  XND is a mini-NDX product whose strikes are
-    # denominated in NDX index points (not QQQ ETF price).  We must
-    # convert QQQ → approximate NDX level before selecting strikes.
+    # QQQ ≈ NDX / 40.  XND is a mini-NDX product whose underlying
+    # value is 1/100th of NDX.  So XND strikes ≈ NDX / 100 ≈ QQQ × 0.4.
+    # We first convert QQQ → NDX estimate, then scale to the option
+    # root's strike denomination.
     QQQ_TO_NDX_RATIO = 40.0
+
+    # Strike scale divisors: NDX_estimate / divisor = strike-scale value
+    _STRIKE_DIVISORS = {
+        "XND": 100.0,   # XND strikes ≈ NDX / 100
+        "NDX": 1.0,     # NDX strikes are in NDX index points
+    }
 
     def enter(self, tracker: MorningTracker) -> bool:
         """
@@ -163,41 +171,77 @@ class DirectionalStrategy:
             logger.error("DIRECTIONAL: QQQ price unavailable")
             return False
 
-        # Convert QQQ ETF price → approximate NDX index level.
-        # XND strikes are in NDX index points.
+        # Convert QQQ ETF price → approximate NDX index level,
+        # then scale to the option root's strike denomination.
         ndx_estimate = qqq_price * self.QQQ_TO_NDX_RATIO
+        root = self.cfg.option_root.upper()
+        divisor = self._STRIKE_DIVISORS.get(root)
+        if divisor is None:
+            logger.error("DIRECTIONAL: Unsupported option root %s — cannot determine strike scale", root)
+            return False
+        strike_center = ndx_estimate / divisor
         logger.info(
-            "DIRECTIONAL: QQQ=$%.2f → NDX estimate=%.2f (ratio=%.0f)",
-            qqq_price, ndx_estimate, self.QQQ_TO_NDX_RATIO,
+            "DIRECTIONAL: QQQ=$%.2f → NDX≈%.2f → %s strike_center=%.2f (divisor=%.0f)",
+            qqq_price, ndx_estimate, root, strike_center, divisor,
         )
+
+        # Sanity-check strike_center against the option root
+        if root == "XND" and strike_center > 1000:
+            logger.error(
+                "DIRECTIONAL: Refusing XND contract lookup — strike_center=%.2f "
+                "is too high (expected ~200-300 for XND). Check scaling.",
+                strike_center,
+            )
+            return False
+        if root in {"NDX", "SPX"} and strike_center < 1000:
+            logger.error(
+                "DIRECTIONAL: Refusing %s contract lookup — strike_center=%.2f "
+                "is suspiciously low. Check scaling.",
+                root, strike_center,
+            )
+            return False
 
         expiration = get_todays_expiration()
 
-        # Fetch contracts in a neighbourhood around the estimated NDX level
-        strike_margin = ndx_estimate * 0.02  # ±2 % to capture nearby strikes
-        contracts = fetch_option_contracts(
-            underlying=self.cfg.option_root,
-            expiration_date=expiration,
-            option_type=option_type,
-            strike_price_gte=ndx_estimate - strike_margin,
-            strike_price_lte=ndx_estimate + strike_margin,
+        # Fetch contracts in a neighbourhood around the strike center
+        strike_margin = strike_center * 0.02  # ±2 % to capture nearby strikes
+
+        logger.info(
+            "DIRECTIONAL: Contract lookup — root=%s strike_center=%.2f "
+            "margin=%.2f gte=%.2f lte=%.2f exp=%s type=%s",
+            root, strike_center, strike_margin,
+            strike_center - strike_margin, strike_center + strike_margin,
+            expiration, option_type,
         )
+
+        try:
+            contracts = fetch_option_contracts(
+                underlying=self.cfg.option_root,
+                expiration_date=expiration,
+                option_type=option_type,
+                strike_price_gte=strike_center - strike_margin,
+                strike_price_lte=strike_center + strike_margin,
+            )
+        except Exception as e:
+            logger.error("DIRECTIONAL: Contract fetch failed for %s exp=%s: %s",
+                         self.cfg.option_root, expiration, e)
+            return False
 
         tradable = [c for c in contracts if c.tradable]
         if not tradable:
-            logger.error("DIRECTIONAL: No tradable %s contracts for %s exp=%s near NDX=%.0f",
-                         option_type, self.cfg.option_root, expiration, ndx_estimate)
+            logger.error("DIRECTIONAL: No tradable %s contracts for %s exp=%s near strike=%.0f",
+                         option_type, self.cfg.option_root, expiration, strike_center)
             return False
 
         # Select a slightly OTM strike in the signal direction.
-        # Calls (up): strike at-or-above NDX * (1 + otm_offset)
-        # Puts (down): strike at-or-below NDX * (1 - otm_offset)
+        # Calls (up): strike at-or-above center * (1 + otm_offset)
+        # Puts (down): strike at-or-below center * (1 - otm_offset)
         otm_offset = self.cfg.directional_otm_offset
         if option_type == "call":
-            otm_target = ndx_estimate * (1 + otm_offset)
+            otm_target = strike_center * (1 + otm_offset)
             contract = find_strike_at_or_above(tradable, otm_target)
         else:
-            otm_target = ndx_estimate * (1 - otm_offset)
+            otm_target = strike_center * (1 - otm_offset)
             contract = find_strike_at_or_below(tradable, otm_target)
 
         if not contract:
@@ -206,9 +250,9 @@ class DirectionalStrategy:
             return False
 
         logger.info(
-            "DIRECTIONAL: OTM strike selection — NDX=%.2f, otm_target=%.2f, "
+            "DIRECTIONAL: OTM strike selection — strike_center=%.2f, otm_target=%.2f, "
             "chosen_strike=%.2f (%s)",
-            ndx_estimate, otm_target, contract.strike_price, option_type,
+            strike_center, otm_target, contract.strike_price, option_type,
         )
         self.state.option_symbol = contract.symbol
         self.state.strike_price = contract.strike_price
@@ -258,8 +302,8 @@ class DirectionalStrategy:
         self.state.premium_spent = estimated_premium * qty * contract.size
 
         logger.info(
-            "DIRECTIONAL ENTRY: BUY %s %d contracts, strike=$%.2f (NDX≈%.0f), est_premium=$%.2f",
-            contract.symbol, qty, contract.strike_price, ndx_estimate, estimated_premium,
+            "DIRECTIONAL ENTRY: BUY %s %d contracts, strike=$%.2f (%s≈%.0f), est_premium=$%.2f",
+            contract.symbol, qty, contract.strike_price, root, strike_center, estimated_premium,
         )
 
         # Place order — position is NOT open yet, only order_submitted
@@ -360,6 +404,7 @@ class DirectionalStrategy:
                     "DIRECTIONAL EARLY EXIT ORDER %s — position may still be open!",
                     status.upper(),
                 )
+                self.state.early_exit_order_dead = True
             else:
                 logger.debug("Directional early-exit order status: %s", status)
         except Exception as e:
@@ -382,17 +427,23 @@ class DirectionalStrategy:
             status = "never_filled" if self.state.entry_order_id else "no_position"
             return {"status": status}
 
-        # Compute intrinsic value from QQQ → NDX estimate at settlement
+        # Compute intrinsic value from QQQ → NDX → strike-scale settlement
         qqq_settle = tracker.qqq_last
         ndx_settle = qqq_settle * self.QQQ_TO_NDX_RATIO if qqq_settle > 0 else 0.0
+        root = self.cfg.option_root.upper()
+        divisor = self._STRIKE_DIVISORS.get(root)
+        if divisor is None:
+            logger.error("DIRECTIONAL SETTLEMENT: Unsupported option root %s", root)
+            return {"status": "error", "reason": f"unsupported option root {root}"}
+        settle_level = ndx_settle / divisor  # same scale as the strike
 
         strike = self.state.strike_price
         multiplier = 100  # standard option multiplier
 
         if self.state.option_type == "call":
-            intrinsic_per = max(ndx_settle - strike, 0.0)
+            intrinsic_per = max(settle_level - strike, 0.0)
         else:  # put
-            intrinsic_per = max(strike - ndx_settle, 0.0)
+            intrinsic_per = max(strike - settle_level, 0.0)
 
         settlement_value = intrinsic_per * self.state.qty * multiplier
         self.state.settlement_value = settlement_value
@@ -408,6 +459,7 @@ class DirectionalStrategy:
             "symbol": self.state.option_symbol,
             "contracts": self.state.qty,
             "strike": self.state.strike_price,
+            "settle_level": round(settle_level, 2),
             "ndx_settlement": round(ndx_settle, 2),
             "intrinsic_per_contract": round(intrinsic_per, 2),
             "settlement_value": round(settlement_value, 2),
@@ -416,11 +468,11 @@ class DirectionalStrategy:
         }
 
         logger.info(
-            "DIRECTIONAL SETTLEMENT: %s %d × %s strike=$%.2f NDX_settle=%.2f "
+            "DIRECTIONAL SETTLEMENT: %s %d × %s strike=$%.2f %s_settle=%.2f "
             "intrinsic=$%.2f settlement=$%.2f premium=$%.2f pnl=$%.2f",
             self.state.option_type, self.state.qty,
             self.state.option_symbol, self.state.strike_price,
-            ndx_settle, intrinsic_per, settlement_value,
+            root, settle_level, intrinsic_per, settlement_value,
             self.state.premium_spent, self.state.realized_pnl,
         )
         return result

@@ -48,6 +48,10 @@ class CondorState:
     early_exit_order_id: Optional[str] = None
     early_exit_filled: bool = False
     early_exit_fill_price: Optional[float] = None
+    early_exit_order_dead: bool = False  # terminal — stop polling
+
+    # Defense order terminal tracking
+    defense_order_dead: bool = False  # terminal — stop polling
 
     # Status
     # is_open means the position is live (entry filled).
@@ -326,6 +330,8 @@ class CondorStrategy:
             if status == "filled":
                 self.state.defense_filled = True
                 self.state.defense_fill_price = float(order.get("filled_avg_price", 0))
+                self.state.is_open = False
+                self.state.defense_order_dead = True
                 logger.info(
                     "CONDOR DEFENSE FILLED: debit=$%.2f per contract",
                     self.state.defense_fill_price,
@@ -337,6 +343,7 @@ class CondorStrategy:
                     status.upper(),
                 )
                 self.state.defense_close_failed = True
+                self.state.defense_order_dead = True
             else:
                 logger.debug("Defense close order status: %s", status)
         except Exception as e:
@@ -412,6 +419,7 @@ class CondorStrategy:
                     "CONDOR EARLY EXIT ORDER %s — position may still be open!",
                     status.upper(),
                 )
+                self.state.early_exit_order_dead = True
             else:
                 logger.debug("Condor early-exit order status: %s", status)
         except Exception as e:

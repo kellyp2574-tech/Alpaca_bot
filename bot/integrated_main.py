@@ -244,16 +244,20 @@ class CondorBot:
         logger.info("DIRECTIONAL ENTRY — 10:45 AM")
         logger.info("=" * 40)
 
-        # Refresh prices right before entry
-        self.tracker = refresh_tracker(self.tracker)
+        try:
+            # Refresh prices right before entry
+            self.tracker = refresh_tracker(self.tracker)
 
-        success = self.directional.enter(self.tracker)
-        self.directional_entered = True
+            success = self.directional.enter(self.tracker)
+            self.directional_entered = True
 
-        if success:
-            logger.info("Directional trade entered successfully")
-        else:
-            logger.warning("Directional trade entry failed")
+            if success:
+                logger.info("Directional trade entered successfully")
+            else:
+                logger.warning("Directional trade entry failed")
+        except Exception:
+            logger.exception("Directional entry failed unexpectedly — continuing without directional sleeve")
+            self.directional_entered = True
 
     # ─── Condor entry ──────────────────────────────────────────────────────
 
@@ -623,7 +627,9 @@ class CondorBot:
                         self._record_directional_entry_fill()
 
                 # Poll defense-close fill if defense was triggered
-                if self.condor.state.defense_triggered and not self.condor.state.defense_filled:
+                if (self.condor.state.defense_triggered
+                        and not self.condor.state.defense_filled
+                        and not self.condor.state.defense_order_dead):
                     was_defense_filled = self.condor.state.defense_filled
                     self.condor.check_defense_fill()
 
@@ -646,6 +652,7 @@ class CondorBot:
                                 self.MAX_DEFENSE_ESCALATIONS,
                             )
                             self.condor.state.defense_close_failed = False
+                            self.condor.state.defense_order_dead = False
                             self.condor.state.defense_order_id = None
                             self.condor.state.defense_triggered = False
                             self.condor.close_defense()
@@ -658,7 +665,8 @@ class CondorBot:
 
                 # Poll condor early-exit fill (discretionary, separate from defense)
                 if (self.condor.state.early_exit_order_id
-                        and not self.condor.state.early_exit_filled):
+                        and not self.condor.state.early_exit_filled
+                        and not self.condor.state.early_exit_order_dead):
                     was_filled = self.condor.state.early_exit_filled
                     self.condor.check_early_exit_fill()
                     if self.condor.state.early_exit_filled and not was_filled:
@@ -666,7 +674,8 @@ class CondorBot:
 
                 # Poll directional early-exit fill
                 if (self.directional.state.early_exit_order_id
-                        and not self.directional.state.early_exit_filled):
+                        and not self.directional.state.early_exit_filled
+                        and not self.directional.state.early_exit_order_dead):
                     was_filled = self.directional.state.early_exit_filled
                     self.directional.check_early_exit_fill()
                     if self.directional.state.early_exit_filled and not was_filled:

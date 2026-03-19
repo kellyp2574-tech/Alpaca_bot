@@ -282,6 +282,19 @@ def refresh_tracker(tracker: MorningTracker) -> MorningTracker:
         # Use daily bar high/low if available, otherwise fall back to last price
         high = spy.daily_high if spy.daily_high > 0 else None
         low = spy.daily_low if spy.daily_low > 0 else None
+        # Sanity check: discard extended-hours extremes (>3% from last trade)
+        if high is not None and abs(high - spy.last_price) / spy.last_price > 0.03:
+            logger.warning(
+                "SPY daily_high=%.2f deviates >3%% from last=%.2f — likely extended hours; ignoring",
+                high, spy.last_price,
+            )
+            high = None
+        if low is not None and low > 0 and abs(low - spy.last_price) / spy.last_price > 0.03:
+            logger.warning(
+                "SPY daily_low=%.2f deviates >3%% from last=%.2f — likely extended hours; ignoring",
+                low, spy.last_price,
+            )
+            low = None
         tracker.update_spy(spy.last_price, high=high, low=low)
         # Backfill open on first successful refresh
         if tracker.spy_open is None and spy.daily_open > 0:
@@ -291,6 +304,21 @@ def refresh_tracker(tracker: MorningTracker) -> MorningTracker:
     if qqq and qqq.last_price > 0:
         high = qqq.daily_high if qqq.daily_high > 0 else None
         low = qqq.daily_low if qqq.daily_low > 0 else None
+        # Sanity check: daily bar high/low can include extended-hours data
+        # which distorts intraday range calculations. If > 3% from last
+        # trade, discard and use last price only.
+        if high is not None and abs(high - qqq.last_price) / qqq.last_price > 0.03:
+            logger.warning(
+                "QQQ daily_high=%.2f deviates >3%% from last=%.2f — likely extended hours; ignoring",
+                high, qqq.last_price,
+            )
+            high = None
+        if low is not None and low > 0 and abs(low - qqq.last_price) / qqq.last_price > 0.03:
+            logger.warning(
+                "QQQ daily_low=%.2f deviates >3%% from last=%.2f — likely extended hours; ignoring",
+                low, qqq.last_price,
+            )
+            low = None
         tracker.update_qqq(qqq.last_price, high=high, low=low)
         if tracker.qqq_open is None and qqq.daily_open > 0:
             tracker.qqq_open = qqq.daily_open
