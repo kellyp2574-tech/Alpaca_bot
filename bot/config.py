@@ -45,8 +45,8 @@ SNAPSHOT_TIME = "09:29"
 ENTRY_TIME = "09:30"
 
 # Price filters (Step 1: Universe reduction via Massive)
-MIN_PRICE = 1.00
-MAX_PRICE = 2.00
+MIN_PRICE = 0.50
+MAX_PRICE = 5.00
 
 # Gap filters (Step 2: Signal engine via Alpaca)
 MIN_GAP_PCT = 3.0
@@ -58,13 +58,20 @@ MIN_ADV_DOLLARS = 5_000_000  # $5M minimum average daily dollar volume
 # Position sizing
 LIQUIDITY_CAP_PCT = 0.003  # 0.3% of ADV max position size
 
-# Exit rules (VIX-conditioned)
+# Price bucket position sizing multipliers
+PRICE_BUCKET_LOW_MAX = 1.00      # Upper bound of low price bucket ($0.50-$1.00)
+PRICE_BUCKET_MID_MAX = 2.00      # Upper bound of mid price bucket ($1.00-$2.00)
+PRICE_BUCKET_LOW_MULTIPLIER = 0.5   # 0.5x for $0.50-$1.00
+PRICE_BUCKET_MID_MULTIPLIER = 1.0     # 1.0x baseline for $1.00-$2.00
+PRICE_BUCKET_HIGH_MULTIPLIER = 1.2  # 1.2x for $2.00-$5.00
+PRICE_BUCKET_LOW_EQUITY_CAP = 0.12    # 12% max equity for ALL low price bucket positions combined
 VIX_LOW_THRESHOLD = 12.0
 VIX_HIGH_THRESHOLD = 22.0
 EXIT_TIME_LOW_VIX = "14:30"  # 2:30 PM
 EXIT_TIME_MIDDLE_VIX = "15:30"  # 3:30 PM (VIX 12-22)
 EXIT_TIME_HIGH_VIX = "15:30"  # 3:30 PM
 
+# Exit rules (VIX-conditioned)
 # Trailing stop (for middle VIX regime: 12-22)
 TRAILING_STOP_ACTIVATION = 0.15  # 15% gain to activate
 TRAILING_STOP_PCT = 0.03  # 3% trail

@@ -46,7 +46,7 @@ class PositionManager:
         self.timed_exit_scheduled: Dict[str, datetime] = {}
 
     def load_positions(self, saved_positions: Dict):
-        """Restore positions from saved state"""
+        """Restore positions from saved state including trailing stop data"""
         for symbol, data in saved_positions.items():
             try:
                 position = Position(
@@ -57,10 +57,13 @@ class PositionManager:
                     entry_gap_pct=data.get("entry_gap_pct", 0),
                     adv_estimate=data.get("adv_estimate", 0),
                     peak_price=data.get("peak_price", data.get("entry_price", 0)),
+                    trailing_stop_price=data.get("trailing_stop_price", 0),
+                    is_trailing_active=data.get("is_trailing_active", False),
                     order_id=data.get("order_id"),
+                    current_price=data.get("current_price", data.get("entry_price", 0)),
                 )
                 self.positions[symbol] = position
-                logger.info(f"Restored position: {symbol} {position.quantity} shares @ {position.entry_price:.2f}")
+                logger.info(f"Restored position: {symbol} {position.quantity} shares @ {position.entry_price:.2f} (trailing_active={position.is_trailing_active})")
             except Exception as e:
                 logger.error(f"Failed to restore position {symbol}: {e}")
 
@@ -77,29 +80,25 @@ class PositionManager:
             return 0.0
 
     def calculate_position_size(
-        self, equity: float, num_trades: int, adv: float, current_price: float
+        self, 
+        target_dollars: float,  # Target dollar allocation for this position
+        adv: float,  # Average daily volume
+        current_price: float  # Entry price
     ) -> int:
         """
         Calculate position size based on:
-        1. Equal split of equity across trades
+        1. Target dollar allocation (from portfolio construction)
         2. Liquidity cap: max 0.3% of ADV
         """
-        if num_trades == 0:
-            return 0
-
-        # Equal split of equity
-        target_dollars = equity / num_trades
-
         # Liquidity cap (0.3% of ADV)
         liquidity_cap = adv * config.LIQUIDITY_CAP_PCT
-
-        # Use the smaller of the two
+        
+        # Use the smaller of target and liquidity cap
         position_dollars = min(target_dollars, liquidity_cap)
-
+        
         # Convert to shares
         quantity = int(position_dollars / current_price)
-
-        logger.debug(f"{target_dollars:.0f} target, {liquidity_cap:.0f} cap -> {quantity} shares")
+        
         return max(0, quantity)
 
     def get_order_fill(self, order_id: str, max_wait: int = 30) -> Optional[dict]:
@@ -143,50 +142,166 @@ class PositionManager:
         self, candidates: List, vix_level: float
     ) -> List[Position]:
         """
-        Enter market orders at 9:30 AM open.
+        Enter market orders at 9:30 AM open with portfolio-level allocation.
+        
+        Portfolio construction process:
+        1. Classify all candidates into price buckets (pre-trade)
+        2. Calculate weighted target allocations based on multipliers
+        3. Apply low bucket daily cap and redistribute excess to other buckets
+        4. Apply liquidity caps per position
+        5. Execute all orders (path-independent)
+        
         Returns list of successfully entered positions.
-        Note: vix_level stored for reference but entries are unconditional.
         """
         equity = self.get_account_equity()
         if equity <= 0:
             logger.error("Cannot enter positions: no equity")
             return []
-
+        
+        if not candidates:
+            return []
+        
+        # STEP 1: Classify all candidates into buckets (pre-trade classification)
+        bucketed_candidates = {"low": [], "mid": [], "high": []}
+        for c in candidates:
+            price = c.open_price
+            if price < config.PRICE_BUCKET_LOW_MAX:
+                bucketed_candidates["low"].append(c)
+            elif price < config.PRICE_BUCKET_MID_MAX:
+                bucketed_candidates["mid"].append(c)
+            else:
+                bucketed_candidates["high"].append(c)
+        
+        # Calculate total multipliers per bucket
+        bucket_multipliers = {
+            "low": len(bucketed_candidates["low"]) * config.PRICE_BUCKET_LOW_MULTIPLIER,
+            "mid": len(bucketed_candidates["mid"]) * config.PRICE_BUCKET_MID_MULTIPLIER,
+            "high": len(bucketed_candidates["high"]) * config.PRICE_BUCKET_HIGH_MULTIPLIER
+        }
+        total_multiplier_sum = sum(bucket_multipliers.values())
+        
+        if total_multiplier_sum == 0:
+            logger.error("No valid candidates with multipliers")
+            return []
+        
+        # STEP 2: Calculate initial target allocations
+        # Deploy up to 100% of equity (no Kelly cap)
+        deployable_capital = equity
+        
+        position_plan = []  # List of (candidate, target_dollars, bucket)
+        bucket_target = {"low": 0.0, "mid": 0.0, "high": 0.0}
+        
+        for bucket, bucket_candidates in bucketed_candidates.items():
+            if bucket == "low":
+                multiplier = config.PRICE_BUCKET_LOW_MULTIPLIER
+            elif bucket == "mid":
+                multiplier = config.PRICE_BUCKET_MID_MULTIPLIER
+            else:
+                multiplier = config.PRICE_BUCKET_HIGH_MULTIPLIER
+            
+            for c in bucket_candidates:
+                # Weighted allocation: (multiplier / total_sum) * deployable_capital
+                target_dollars = (multiplier / total_multiplier_sum) * deployable_capital
+                position_plan.append((c, target_dollars, bucket))
+                bucket_target[bucket] += target_dollars
+        
+        # STEP 3: Apply low bucket daily cap and redistribute excess
+        low_bucket_cap = equity * config.PRICE_BUCKET_LOW_EQUITY_CAP
+        if bucket_target["low"] > low_bucket_cap:
+            # Low bucket exceeds cap - scale down and redistribute
+            excess = bucket_target["low"] - low_bucket_cap
+            bucket_target["low"] = low_bucket_cap
+            
+            # Redistribute excess to mid and high proportionally
+            mid_high_total = bucket_multipliers["mid"] + bucket_multipliers["high"]
+            if mid_high_total > 0:
+                mid_ratio = bucket_multipliers["mid"] / mid_high_total
+                high_ratio = bucket_multipliers["high"] / mid_high_total
+                bucket_target["mid"] += excess * mid_ratio
+                bucket_target["high"] += excess * high_ratio
+            
+            # Recalculate individual position targets
+            new_plan = []
+            for c, old_target, bucket in position_plan:
+                if bucket == "low":
+                    # Scale down low bucket positions proportionally
+                    if bucket_target["low"] > 0:
+                        scale = bucket_target["low"] / (bucket_multipliers["low"] / total_multiplier_sum * deployable_capital)
+                        new_target = old_target * scale
+                    else:
+                        new_target = 0
+                elif bucket == "mid":
+                    # Scale up mid bucket positions
+                    if bucket_multipliers["mid"] > 0:
+                        base_target = (config.PRICE_BUCKET_MID_MULTIPLIER / total_multiplier_sum) * deployable_capital
+                        scale = bucket_target["mid"] / (bucket_multipliers["mid"] / total_multiplier_sum * deployable_capital)
+                        new_target = base_target * scale
+                    else:
+                        new_target = old_target
+                else:  # high
+                    # Scale up high bucket positions
+                    if bucket_multipliers["high"] > 0:
+                        base_target = (config.PRICE_BUCKET_HIGH_MULTIPLIER / total_multiplier_sum) * deployable_capital
+                        scale = bucket_target["high"] / (bucket_multipliers["high"] / total_multiplier_sum * deployable_capital)
+                        new_target = base_target * scale
+                    else:
+                        new_target = old_target
+                
+                new_plan.append((c, new_target, bucket))
+            
+            position_plan = new_plan
+            logger.info(f"Low bucket capped at ${low_bucket_cap:,.0f}, excess ${excess:,.0f} redistributed to mid/high")
+        
+        logger.info(f"Portfolio plan: {len(position_plan)} positions, "
+                   f"low=${bucket_target['low']:,.0f}, mid=${bucket_target['mid']:,.0f}, high=${bucket_target['high']:,.0f}, "
+                   f"total=${sum(bucket_target.values()):,.0f}")
+        
+        # STEP 4 & 5: Execute position plan
         entered = []
-
-        for candidate in candidates:
+        bucket_allocated = {"low": 0.0, "mid": 0.0, "high": 0.0}
+        
+        for candidate, target_dollars, bucket in position_plan:
             symbol = candidate.symbol
             expected_price = candidate.open_price
-
-            # Calculate size
-            quantity = self.calculate_position_size(
-                equity, len(candidates), candidate.adv_estimate, expected_price
-            )
-
-            if quantity <= 0:
-                logger.warning(f"Skipping {symbol}: calculated quantity <= 0")
+            
+            if target_dollars <= 0:
+                logger.debug(f"Skipping {symbol}: zero target allocation")
                 continue
-
+            
+            # Calculate final size with liquidity cap
+            quantity = self.calculate_position_size(
+                target_dollars,
+                candidate.adv_estimate,
+                expected_price
+            )
+            
+            if quantity <= 0:
+                logger.warning(f"Skipping {symbol}: liquidity cap prevents allocation")
+                continue
+            
             # Submit market order
             order_id = self._submit_market_order(symbol, quantity, "buy")
-
+            
             if not order_id:
                 continue
-
+            
             # Poll for actual fill price
             fill = self.get_order_fill(order_id, max_wait=30)
-
+            
             if not fill:
                 logger.error(f"Failed to get fill for {symbol} order {order_id}")
                 continue
-
+            
             actual_price = fill["filled_avg_price"]
             actual_qty = int(fill["filled_qty"])
-
+            
             if actual_qty <= 0:
                 logger.error(f"No shares filled for {symbol}")
                 continue
-
+            
+            # Track allocation using pre-trade bucket (for consistency)
+            bucket_allocated[bucket] += actual_price * actual_qty
+            
             position = Position(
                 symbol=symbol,
                 entry_price=actual_price,
@@ -199,10 +314,16 @@ class PositionManager:
             )
             self.positions[symbol] = position
             entered.append(position)
-
+            
             slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
-            logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (expected {expected_price:.2f}, slippage: {slippage:+.2f}%, gap: {candidate.gap_pct:.1f}%) [VIX={vix_level:.1f}]")
-
+            logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} ({bucket} bucket, slippage: {slippage:+.2f}%, gap: {candidate.gap_pct:.1f}%) [VIX={vix_level:.1f}]")
+        
+        # Log summary
+        total_deployed = sum(bucket_allocated.values())
+        logger.info(f"Entry complete: {len(entered)} positions, "
+                   f"low=${bucket_allocated['low']:,.0f}, mid=${bucket_allocated['mid']:,.0f}, high=${bucket_allocated['high']:,.0f}, "
+                   f"total=${total_deployed:,.0f} ({total_deployed/equity*100:.1f}% of equity)")
+        
         return entered
 
     def _submit_market_order(
@@ -316,15 +437,17 @@ class PositionManager:
                     # Check if we've already scheduled this position for exit
                     if symbol not in self.timed_exit_scheduled:
                         # Schedule exit distributed over the window
-                        # Stagger by symbol hash to avoid all exiting at once
-                        stagger_seconds = hash(symbol) % 120  # 0-119 seconds
-                        scheduled_time = datetime.combine(datetime.today(), exit_window_start) + timedelta(seconds=stagger_seconds)
+                        # Use deterministic staggering based on symbol characters (not hash)
+                        stagger_seconds = sum(ord(c) for c in symbol) % 120  # 0-119 seconds
+                        target_dt = datetime.combine(datetime.today(), exit_window_start)
+                        scheduled_time = target_dt + timedelta(seconds=stagger_seconds)
                         self.timed_exit_scheduled[symbol] = scheduled_time
                         logger.debug(f"Scheduled timed exit for {symbol} at {scheduled_time.time()}")
 
-                    # Check if scheduled time has passed
+                    # Check if scheduled time has passed (using current_time for consistency)
                     scheduled = self.timed_exit_scheduled.get(symbol)
-                    if scheduled and datetime.now() >= scheduled:
+                    current_dt = datetime.combine(datetime.today(), current_time)
+                    if scheduled and current_dt >= scheduled:
                         should_exit = True
                         exit_reason = f"time_exit (VIX={vix_level:.1f}, distributed)"
 

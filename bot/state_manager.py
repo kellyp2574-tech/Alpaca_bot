@@ -21,6 +21,9 @@ class PositionState:
     adv_estimate: float
     peak_price: float = 0.0
     order_id: Optional[str] = None
+    trailing_stop_price: float = 0.0
+    is_trailing_active: bool = False
+    current_price: float = 0.0
 
 
 class StateManager:
@@ -50,6 +53,9 @@ class StateManager:
                     "entry_gap_pct": pos.entry_gap_pct,
                     "adv_estimate": pos.adv_estimate,
                     "peak_price": pos.peak_price,
+                    "trailing_stop_price": getattr(pos, 'trailing_stop_price', 0),
+                    "is_trailing_active": getattr(pos, 'is_trailing_active', False),
+                    "current_price": getattr(pos, 'current_price', pos.entry_price),
                     "order_id": getattr(pos, 'order_id', None),
                 }
 
@@ -70,9 +76,15 @@ class StateManager:
 
             positions = {}
             for symbol, pos_data in data.items():
-                # Handle missing order_id for backward compatibility
+                # Handle missing fields for backward compatibility
                 if 'order_id' not in pos_data:
                     pos_data['order_id'] = None
+                if 'trailing_stop_price' not in pos_data:
+                    pos_data['trailing_stop_price'] = 0
+                if 'is_trailing_active' not in pos_data:
+                    pos_data['is_trailing_active'] = False
+                if 'current_price' not in pos_data:
+                    pos_data['current_price'] = pos_data.get('entry_price', 0)
                 positions[symbol] = PositionState(**pos_data)
 
             return positions
