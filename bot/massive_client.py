@@ -24,7 +24,8 @@ class MassiveClient:
         Fetch full market snapshot from Massive.
         Returns: Dict mapping symbol -> snapshot data with last trade price
         """
-        url = f"{self.base_url}/v1/stocks/snapshots"
+        # Correct v2 endpoint for Massive (Polygon) API
+        url = f"{self.base_url}/v2/snapshot/locale/us/markets/stocks/tickers"
 
         try:
             response = self.session.get(url, timeout=30)
@@ -32,20 +33,29 @@ class MassiveClient:
             data = response.json()
 
             snapshots = {}
-            for item in data.get("snapshots", []):
-                symbol = item.get("symbol")
+            # v2 endpoint returns tickers array
+            for item in data.get("tickers", []):
+                symbol = item.get("ticker")
                 if not symbol:
                     continue
 
-                last_trade = item.get("last_trade", {})
-                price = last_trade.get("price")
+                # v2 endpoint structure: try lastTrade first, then day close, then prevDay close
+                last_trade = item.get("lastTrade", {})
+                day_data = item.get("day", {})
+                prev_day = item.get("prevDay", {})
+                
+                price = (
+                    last_trade.get("p")  # last trade price
+                    or day_data.get("c")  # daily close
+                    or prev_day.get("c")  # previous day close
+                )
 
                 if price is not None:
                     snapshots[symbol] = {
                         "symbol": symbol,
                         "price": price,
-                        "volume": item.get("daily_volume", 0),
-                        "timestamp": last_trade.get("timestamp"),
+                        "volume": item.get("day", {}).get("v", 0),  # daily volume
+                        "timestamp": last_trade.get("t"),
                     }
 
             logger.info(f"Massive snapshot: {len(snapshots)} symbols")

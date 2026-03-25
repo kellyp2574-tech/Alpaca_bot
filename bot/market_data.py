@@ -48,7 +48,9 @@ class AlpacaDataClient:
                 response.raise_for_status()
                 data = response.json()
 
-                for symbol, snapshot in data.items():
+                # Alpaca wraps snapshots under top-level "snapshots" key
+                snapshots_map = data.get("snapshots", {})
+                for symbol, snapshot in snapshots_map.items():
                     if snapshot:
                         all_snapshots[symbol] = self._parse_snapshot(symbol, snapshot)
 
@@ -104,3 +106,34 @@ class AlpacaDataClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error getting latest trade for {symbol}: {e}")
             return None
+
+    def get_tradable_assets(self) -> List[str]:
+        """
+        Get list of tradable assets from Alpaca API.
+        Used as fallback when Massive universe build fails.
+        """
+        # Use Alpaca Trading API for assets (not Market Data API)
+        base_url = config.ALPACA_BASE_URL
+        url = f"{base_url}/v2/assets"
+        params = {
+            "status": "active",
+            "tradable": "true",
+        }
+
+        try:
+            response = self.session.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            # Filter for US equities only
+            symbols = []
+            for asset in data:
+                if asset.get("class") == "us_equity" and asset.get("tradable") and asset.get("status") == "active":
+                    symbols.append(asset.get("symbol"))
+
+            logger.info(f"Alpaca assets: {len(symbols)} tradable US equities")
+            return symbols
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Alpaca assets: {e}")
+            return []

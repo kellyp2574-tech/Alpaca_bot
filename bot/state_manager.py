@@ -97,6 +97,33 @@ class StateManager:
         if os.path.exists(self.positions_file):
             os.remove(self.positions_file)
 
+    def clear_bot_state(self):
+        """Clear bot state file"""
+        bot_state_file = self.positions_file.replace("positions.json", "bot_state.json")
+        if os.path.exists(bot_state_file):
+            os.remove(bot_state_file)
+
+    def save_bot_state(self, state: dict):
+        """Save bot state (VIX, stages) to file"""
+        bot_state_file = self.positions_file.replace("positions.json", "bot_state.json")
+        try:
+            with open(bot_state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving bot state: {e}")
+
+    def load_bot_state(self) -> Optional[dict]:
+        """Load bot state from file"""
+        bot_state_file = self.positions_file.replace("positions.json", "bot_state.json")
+        if not os.path.exists(bot_state_file):
+            return None
+        try:
+            with open(bot_state_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading bot state: {e}")
+            return None
+
     def log_daily_summary(self, date: str, summary: dict):
         """Log daily trading summary"""
         log_entry = {

@@ -108,11 +108,19 @@ class GapMomentumBot:
                 if current_time < self.market_close:
                     self._step4_manage_exits(current_time)
                 else:
-                    logger.info("Market close reached - finalizing exits")
-                    self.stage_exit_done = True
+                    # Market close reached - force exits BEFORE marking complete
+                    logger.info("Market close reached - forcing exits before finalizing")
+                    if self.position_mgr.get_position_count() > 0:
+                        self.position_mgr.force_exit_all("day_end")
+                    
+                    # Only mark done if positions are actually closed
+                    if self.position_mgr.get_position_count() == 0:
+                        self.stage_exit_done = True
+                    else:
+                        logger.error("Market close exit attempted, but positions remain open")
 
             # Check if day is complete
-            if current_time >= self.market_close and self.stage_entry_done:
+            if current_time >= self.market_close and self.stage_entry_done and self.stage_exit_done:
                 logger.info("Market closed - day complete")
                 self._finalize_day()
                 break
@@ -137,10 +145,11 @@ class GapMomentumBot:
             if not snapshots:
                 self.universe_retry_count += 1
                 if self.universe_retry_count >= self.max_universe_retries:
-                    logger.error(f"Failed to get Massive snapshot after {self.max_universe_retries} retries")
-                    self.stage_universe_done = True  # Give up after max retries
+                    logger.error(f"Failed to get Massive snapshot after {self.max_universe_retries} retries, falling back to Alpaca")
+                    self._fallback_to_alpaca_universe()
                 else:
                     logger.warning(f"Empty Massive snapshot, retry {self.universe_retry_count}/{self.max_universe_retries}")
+                    time.sleep(5)  # Back off before retry
                 return
 
             # Filter by price range ($1-$2)
@@ -158,9 +167,65 @@ class GapMomentumBot:
             logger.error(f"Error in Step 1: {e}")
             self.universe_retry_count += 1
             if self.universe_retry_count >= self.max_universe_retries:
-                logger.error(f"Max retries exceeded for Step 1, giving up")
-                self.stage_universe_done = True
+                logger.error(f"Max retries exceeded for Step 1, falling back to Alpaca")
+                self._fallback_to_alpaca_universe()
             # Don't mark done on error - will retry next loop iteration
+
+    def _fallback_to_alpaca_universe(self):
+        """Fallback: Build universe from Alpaca assets when Massive fails"""
+        logger.info("FALLBACK: Building universe from Alpaca assets")
+        
+        try:
+            # Get tradable assets from Alpaca
+            assets = self.alpaca.get_tradable_assets()
+            if not assets:
+                logger.error("Alpaca fallback also failed - no universe available")
+                self.stage_universe_done = True  # Give up
+                return
+            
+            # Filter by price range using Alpaca snapshots
+            # Chunk through all assets until we have enough qualified names
+            chunk_size = 1000
+            min_target_universe = 500  # Target at least 500 symbols
+            
+            self.universe = []
+            snapshots_received = False
+            
+            for i in range(0, len(assets), chunk_size):
+                chunk = assets[i:i + chunk_size]
+                snapshots = self.alpaca.get_snapshots(chunk)
+                
+                if snapshots:
+                    snapshots_received = True
+                
+                for symbol, data in snapshots.items():
+                    # Use fallback chain: last_price -> close -> prev_close
+                    price = (
+                        data.get("last_price")
+                        or data.get("close")
+                        or data.get("prev_close")
+                        or 0
+                    )
+                    if price and config.MIN_PRICE <= price <= config.MAX_PRICE:
+                        self.universe.append(symbol)
+                
+                # Stop early if we have enough
+                if len(self.universe) >= min_target_universe:
+                    logger.info(f"Fallback: reached {len(self.universe)} qualified symbols, stopping")
+                    break
+            
+            if not snapshots_received:
+                logger.error("Alpaca fallback: failed to get any snapshots")
+                self.stage_universe_done = True
+                return
+            
+            logger.info(f"Alpaca fallback universe: {len(self.universe)} symbols")
+            self.stage_universe_done = True
+            self._save_state()
+            
+        except Exception as e:
+            logger.error(f"Alpaca fallback error: {e}")
+            self.stage_universe_done = True  # Give up after fallback fails
 
     def _step2_find_candidates(self):
         """Step 2: Fetch Alpaca snapshots, compute gaps, find candidates"""
@@ -168,13 +233,15 @@ class GapMomentumBot:
 
         if not self.universe:
             logger.error("No universe available for Step 2")
+            time.sleep(5)  # Sleep to prevent log spam
             return
 
         try:
             # Get Alpaca snapshots for universe
             snapshots = self.alpaca.get_snapshots(self.universe)
             if not snapshots:
-                logger.error("Failed to get Alpaca snapshots")
+                logger.error("Failed to get Alpaca snapshots - will retry in 5 seconds")
+                time.sleep(5)  # Sleep to avoid spam
                 return
 
             # Find gap candidates
@@ -199,6 +266,7 @@ class GapMomentumBot:
 
         except Exception as e:
             logger.error(f"Error in Step 2: {e}")
+            time.sleep(5)  # Sleep to avoid spam on error
 
     def _step3_enter_positions(self):
         """Step 3: Enter market orders for candidates"""
@@ -222,6 +290,7 @@ class GapMomentumBot:
 
         except Exception as e:
             logger.error(f"Error in Step 3: {e}")
+            time.sleep(5)  # Back off before retry
 
     def _step4_manage_exits(self, current_time: dt_time):
         """Step 4: Monitor and execute exits based on VIX regime"""
@@ -250,10 +319,37 @@ class GapMomentumBot:
             self.stage_entry_done = True  # Assume entry was done if we have positions
             self.stage_universe_done = True
             self.stage_candidates_done = True
+        
+        # Load bot state (VIX, stages) - verify date matches today
+        bot_state = self.state_mgr.load_bot_state()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if bot_state:
+            saved_date = bot_state.get("date")
+            if saved_date == today:
+                self.vix_level = bot_state.get("vix_level", self.vix_level)
+                self.stage_universe_done = bot_state.get("stage_universe_done", self.stage_universe_done)
+                self.stage_candidates_done = bot_state.get("stage_candidates_done", self.stage_candidates_done)
+                self.stage_entry_done = bot_state.get("stage_entry_done", self.stage_entry_done)
+                self.stage_exit_done = bot_state.get("stage_exit_done", self.stage_exit_done)
+                logger.info(f"Restored state: VIX={self.vix_level}, stages: universe={self.stage_universe_done}, candidates={self.stage_candidates_done}, entry={self.stage_entry_done}, exit={self.stage_exit_done}")
+            else:
+                logger.warning(f"Stale bot state from {saved_date} - starting fresh (today is {today})")
+                self.state_mgr.clear_bot_state()  # Clear stale state
 
     def _save_state(self):
         """Save current state"""
         self.state_mgr.save_positions(self.position_mgr.positions)
+        
+        # Save bot state including VIX and date
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.state_mgr.save_bot_state({
+            "date": today,
+            "vix_level": self.vix_level,
+            "stage_universe_done": self.stage_universe_done,
+            "stage_candidates_done": self.stage_candidates_done,
+            "stage_entry_done": self.stage_entry_done,
+            "stage_exit_done": self.stage_exit_done,
+        })
 
     def _finalize_day(self):
         """Finalize trading day, log summary"""
@@ -263,9 +359,15 @@ class GapMomentumBot:
         if self.position_mgr.get_position_count() > 0:
             logger.warning("Force exiting remaining positions")
             self.position_mgr.force_exit_all("day_end")
+        
+        # Verify positions were actually closed before clearing state
+        if self.position_mgr.get_position_count() > 0:
+            logger.critical("FAILED TO FLATTEN POSITIONS AT END OF DAY - preserving state")
+            return  # Do NOT clear state if positions remain
 
-        # Clear state
+        # Clear state only after successful exit
         self.state_mgr.clear_positions()
+        self.state_mgr.clear_bot_state()
 
         # Log summary
         today = datetime.now().strftime("%Y-%m-%d")
