@@ -1,0 +1,55 @@
+{
+  "date": "2026-03-20",
+  "start_equity": 10000.0,
+  "start_buying_power": 20000.0,
+  "condor": {
+    "is_open": false,
+    "is_filled": false,
+    "qty": 0,
+    "anchor_price": 652.32,
+    "entry_credit": 0.0,
+    "defense_triggered": false,
+    "missed_trade_reason": null,
+    "fill_quality": {
+      "natural_credit": 0.0,
+      "mid_credit": 0.0,
+      "peak_natural": 0.0,
+      "limit_price": 0.0,
+      "adjustments": 0,
+      "qty_reduced": false
+    },
+    "legs": null
+  },
+  "directional": {
+    "filters_checked": true,
+    "qualified": true,
+    "direction": "down",
+    "option_type": "put",
+    "symbol": null,
+    "qty": 0,
+    "is_open": false,
+    "is_filled": false,
+    "vix": 24.059999465942383,
+    "qqq_range": "1.774%",
+    "qqq_direction": "-0.773%"
+  },
+  "dry_run": false,
+  "condor_exit_reason": "none",
+  "directional_exit_reason": "none",
+  "pdt_blocked_early_exit": false,
+  "settlement_notes": {
+    "condor": "XSP settles off SOQ/SET, not SPY last trade. P&L is a proxy estimate.",
+    "directional": "XND settles off NDX special calc, not QQQ\u00d740. P&L is a proxy estimate.",
+    "reconcile": "Reconcile against broker end-of-day statement for precise accounting."
+  },
+  "end_equity": 10000.0,
+  "end_buying_power": 20000.0,
+  "daily_pnl": 0.0,
+  "pdt_guard": {
+    "rolling_day_trade_count": 0,
+    "max_day_trades": 3,
+    "pdt_equity_buffer": 30000.0,
+    "open_intraday_positions": 0,
+    "ledger_size": 0
+  }
+}

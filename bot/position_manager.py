@@ -1,705 +1,375 @@
-"""Position sizing helpers and live exit management."""
-
-from __future__ import annotations
-
+"""Position manager for gap momentum strategy with VIX-conditioned exits"""
 import logging
-import time
-from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Optional
-
-if TYPE_CHECKING:
-    from .morning_main import SessionStats
-
-from .clock import market_now
-from .monitoring import get_session_monitor
-from .morning_config import Config
-from .execution import ExecutionClient, FillResult
-from .state_manager import StateStore
-from .storage import PositionState
-from alpaca.trading.enums import OrderSide
-
-_SESSION_DATE: Optional[str] = None
-
-
-def _session_date() -> str:
-    """Return today's date string, updating if day has changed."""
-    global _SESSION_DATE
-    today = market_now().strftime("%Y%m%d")
-    if _SESSION_DATE != today:
-        _SESSION_DATE = today
-    return _SESSION_DATE
-
-
-_CLIENT_ID_MAX_LEN: int = 48  # Alpaca client_order_id maximum length
-
-
-def _norm_symbol(symbol: str) -> str:
-    return symbol.strip().upper()
-
-
-def _entry_client_id(symbol: str, attempt: int = 1) -> str:
-    raw = f"ENTRY:{_norm_symbol(symbol)}:{_session_date()}:{attempt}"
-    if len(raw) > _CLIENT_ID_MAX_LEN:
-        raise ValueError(f"client_order_id too long ({len(raw)}): {raw!r}")
-    return raw
-
-
-def _exit_client_id(symbol: str, attempt: int) -> str:
-    raw = f"EXIT:{_norm_symbol(symbol)}:{_session_date()}:{attempt}"
-    if len(raw) > _CLIENT_ID_MAX_LEN:
-        raise ValueError(f"client_order_id too long ({len(raw)}): {raw!r}")
-    return raw
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+import requests
+from bot import config
+from bot.market_data import AlpacaDataClient
 
 logger = logging.getLogger(__name__)
 
 
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def initial_stop_pct(cfg: Config, atr: float, entry: float) -> float:
-    if entry <= 0 or atr <= 0:
-        return cfg.stop_max_pct
-    raw = cfg.stop_atr_mult * (atr / entry)
-    return clamp(raw, cfg.stop_min_pct, cfg.stop_max_pct)
-
-
-def calc_qty(
-    account_equity: float, risk_pct: float, entry: float, stop_pct: float
-) -> float:
-    risk_dollars = account_equity * risk_pct
-    stop_dollars = entry * stop_pct
-    if stop_dollars <= 0:
-        return 0.0
-    shares = risk_dollars / stop_dollars
-    return max(0.0, shares)
-
-
-def apply_volume_cap(
-    qty: float,
-    entry_price: float,
-    five_min_dollar_volume: float,
-    cfg: Config,
-) -> float:
-    """
-    Apply volume cap: max 1% of morning 5-min dollar volume.
-    Returns the smaller of risk-based qty or volume-capped qty.
-    """
-    if not cfg.use_smaller_of_sizing_or_vol_cap:
-        return qty
-    
-    if five_min_dollar_volume <= 0:
-        return qty
-    
-    # Max dollar amount = 1% of 5-min volume
-    max_dollar_amount = five_min_dollar_volume * cfg.max_position_pct_of_5min_vol
-    
-    # Convert to shares
-    max_qty_by_volume = max_dollar_amount / entry_price if entry_price > 0 else 0.0
-    
-    # Return smaller of the two
-    capped_qty = min(qty, max_qty_by_volume)
-    
-    if capped_qty < qty:
-        logger.info(
-            f"Volume cap applied: {qty:.0f} shares → {capped_qty:.0f} shares "
-            f"(1% of ${five_min_dollar_volume:,.0f} 5-min volume)"
-        )
-    
-    return capped_qty
+@dataclass
+class Position:
+    """Represents an open position"""
+    symbol: str
+    entry_price: float
+    quantity: int
+    entry_time: datetime
+    entry_gap_pct: float
+    adv_estimate: float
+    peak_price: float = field(default=0.0)
+    trailing_stop_price: float = field(default=0.0)
+    is_trailing_active: bool = field(default=False)
+    order_id: Optional[str] = None
+    current_price: float = field(default=0.0)  # Last known price from update_positions
 
 
 class PositionManager:
-    def __init__(
-        self,
-        cfg: Config,
-        execution: ExecutionClient,
-        risk_manager,
-        *,
-        state_store: Optional[StateStore] = None,
-    ) -> None:
-        self.cfg = cfg
-        self.execution = execution
-        self.risk_manager = risk_manager
-        self.positions: Dict[str, PositionState] = {}
-        self.state_store = state_store
-        self.stats: Optional[SessionStats] = None
-        # Stores realized exit metadata for positions that were just closed,
-        # so the reporting wrapper can read the actual fill price/qty/reason.
-        # Populated by _record_fill() and broker-flat handlers before pop.
-        self._realized_exits: Dict[str, dict] = {}
+    """Manages positions, entries, and VIX-conditioned exits"""
 
-    def load_states(self, states: Dict[str, PositionState]) -> None:
-        self.positions = dict(states)
-        self._persist()
+    def __init__(self):
+        self.positions: Dict[str, Position] = {}
+        self.client = AlpacaDataClient()
+        self.base_url = config.ALPACA_BASE_URL
+        self.api_key = config.ALPACA_API_KEY
+        self.secret_key = config.ALPACA_SECRET_KEY
 
-    @property
-    def open_count(self) -> int:
-        return len(self.positions)
+        self.session = requests.Session()
+        self.session.headers.update({
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.secret_key,
+        })
 
-    def has_position(self, symbol: str) -> bool:
-        return symbol in self.positions
+        # Track which positions have been scheduled for timed exit (distributed over 3 minutes)
+        self.timed_exit_scheduled: Dict[str, datetime] = {}
 
-    def open_position(
-        self,
-        symbol: str,
-        qty: float,
-        entry_price: float,
-        stop_pct: float,
-        *,
-        entry_time: Optional[datetime] = None,
-        entry_order_id: Optional[str] = None,
-        entry_client_order_id: Optional[str] = None,
-        gap_at_entry: float = 0.0,
-        first_5min_volume: float = 0.0,
-        fill_pct: float = 100.0,
-        entry_slippage_bps: float = 0.0,
-    ) -> PositionState:
-        entry_time = entry_time or market_now()
-        stop_price = entry_price * (1 - stop_pct)
-        state = PositionState(
-            symbol=symbol,
-            entry_time=entry_time,
-            entry_price=entry_price,
-            qty=qty,
-            stop_price=stop_price,
-            peak_price=entry_price,
-            r_stop_pct=stop_pct,
-            entry_order_id=entry_order_id,
-            entry_client_order_id=entry_client_order_id,
-            gap_at_entry=gap_at_entry,
-            first_5min_volume=first_5min_volume,
-            fill_pct=fill_pct,
-            entry_slippage_bps=entry_slippage_bps,
-        )
-        self.positions[symbol] = state
-        logger.info(
-            "Opened position %s qty=%.4f entry=%.2f stop=%.2f (%.2f%%)",
-            symbol,
-            qty,
-            entry_price,
-            stop_price,
-            stop_pct * 100,
-        )
-        self.risk_manager.on_new_trade()
-        self._persist()
-        return state
-
-    def on_bar(self, symbol: str, bar, *, now: Optional[datetime] = None) -> None:
-        state = self.positions.get(symbol)
-        if not state:
-            return
-
-        now = now or market_now()
-
-        # If an exit is in flight, run reconcile and skip new exit intents,
-        # but still update defensive state (trail, peak) so it stays current.
-        if state.exit_pending:
-            self._reconcile_pending_exit(symbol, state, now)
-            state.peak_price = max(state.peak_price, bar.h)
-            self._update_trail(state)
-            self._persist()
-            return
-
-        state.peak_price = max(state.peak_price, bar.h)
-        entry = state.entry_price
-        price = bar.c
-
-        self._update_breakeven(symbol, state)
-        self._update_trail(state)
-        
-        # Stop loss is handled by main.py _check_position_exits using quotes
-        # Bar-based stop disabled to avoid duplicate/conflicting triggers
-        # if bar.l <= state.stop_price:
-        #     self._exit(symbol, state, state.stop_price, now, reason="stop")
-        #     return
-
-        self._persist()
-
-    def _update_breakeven(self, symbol: str, state: PositionState) -> None:
-        if not state.breakeven_set and state.peak_price >= state.entry_price * (
-            1 + self.cfg.breakeven_at_pct
-        ):
-            state.stop_price = max(state.stop_price, state.entry_price)
-            state.breakeven_set = True
-            logger.debug("%s stop moved to breakeven", symbol)
-
-    def _update_trail(self, state: PositionState) -> None:
-        entry = state.entry_price
-        
-        # Gap strategy: activate at take_profit_pct, trail at trail_pct
-        if not state.trail_active and state.peak_price >= entry * (
-            1 + self.cfg.take_profit_pct
-        ):
-            state.trail_active = True
-            state.trail_pct = self.cfg.trail_pct
-            logger.debug("%s trail activated at %.2f%%", state.symbol, state.trail_pct * 100)
-
-        if state.trail_active:
-            trail_pct = state.trail_pct if state.trail_pct else self.cfg.trail_pct
-            trail_stop = state.peak_price * (1 - trail_pct)
-            state.stop_price = max(state.stop_price, trail_stop)
-
-    def exit_position(
-        self, symbol: str, price: float, now: datetime, *, reason: str
-    ) -> None:
-        """Public interface to exit a single named position."""
-        state = self.positions.get(symbol)
-        if state:
-            self._exit(symbol, state, price, now, reason=reason)
-
-    def force_exit_all(
-        self, price_lookup: Dict[str, float], *, reason: str = "hard_exit"
-    ) -> None:
-        items = list(self.positions.items())
-        for i, (symbol, state) in enumerate(items):
-            # Use current bid price from lookup, fallback to reference price, not peak
-            price = price_lookup.get(symbol)
-            if not price or price <= 0:
-                price = self.execution._reference_price(symbol, OrderSide.SELL, state.entry_price)
-            self._exit(symbol, state, price, market_now(), reason=reason)
-            # Rate-limit: pause between exits to stay under Alpaca 200 req/min
-            if i < len(items) - 1:
-                time.sleep(1.0)
-
-    def reconcile_pending_exits_time_based(self, max_wait_seconds: float = 30.0) -> int:
-        """Time-based reconciliation of pending exits (not bar-driven). Returns remaining pending count."""
-        start_time = time.monotonic()
-        
-        while time.monotonic() - start_time < max_wait_seconds:
-            pending_count = 0
-            for symbol, state in list(self.positions.items()):
-                if state.exit_pending:
-                    pending_count += 1
-                    # Force reconcile without waiting for bars
-                    self._reconcile_pending_exit_time_based(symbol, state, market_now())
-                    # Rate-limit: small delay between position checks to stay under 200 req/min
-                    time.sleep(0.5)
-            
-            if pending_count == 0:
-                logger.info("All exits reconciled successfully")
-                return 0
-            
-            logger.debug(f"Waiting for {pending_count} exits to reconcile...")
-            time.sleep(2.0)  # Check every 2 seconds
-        
-        remaining_pending = sum(1 for state in self.positions.values() if state.exit_pending)
-        logger.warning(f"{remaining_pending} exits still pending after {max_wait_seconds}s")
-        return remaining_pending
-
-    def _reconcile_pending_exit_time_based(
-        self, symbol: str, state: PositionState, now: datetime
-    ) -> None:
-        """Time-based reconcile: called every second regardless of bar flow."""
-        if not state.exit_submitted_ts:
-            # Shouldn't happen, but clear after timeout to avoid permanent lock
-            logger.warning("%s exit_pending with no submitted_ts; clearing", symbol)
-            state.exit_pending = False
-            return
-
-        age = time.monotonic() - state.exit_submitted_ts
-        if age < self.cfg.exit_ack_timeout_seconds:
-            return  # still within grace window, wait
-
-        fallback = state.exit_price or state.peak_price
-
-        # Prefer order_id lookup; fall back to client_order_id search
-        fill: Optional[FillResult] = None
-        if state.exit_order_id:
-            logger.debug(
-                "Time-based reconcile exit for %s via order_id %s (age %.0fs)",
-                symbol, state.exit_order_id, age,
-            )
+    def load_positions(self, saved_positions: Dict):
+        """Restore positions from saved state"""
+        for symbol, data in saved_positions.items():
             try:
-                fill = self.execution.poll_order_fill(
-                    state.exit_order_id, fallback_price=fallback
+                position = Position(
+                    symbol=data.get("symbol", symbol),
+                    entry_price=data.get("entry_price", 0),
+                    quantity=data.get("quantity", 0),
+                    entry_time=datetime.fromisoformat(data.get("entry_time", datetime.now().isoformat())),
+                    entry_gap_pct=data.get("entry_gap_pct", 0),
+                    adv_estimate=data.get("adv_estimate", 0),
+                    peak_price=data.get("peak_price", data.get("entry_price", 0)),
+                    order_id=data.get("order_id"),
                 )
-            except Exception:
-                logger.exception("Time-based reconcile poll failed for %s", symbol)
-                return
-        elif state.exit_client_order_id:
-            logger.debug(
-                "Time-based reconcile exit for %s via client_order_id %s (order_id lost)",
-                symbol, state.exit_client_order_id,
-            )
-            fill = self.execution.find_order_by_client_id(state.exit_client_order_id)
+                self.positions[symbol] = position
+                logger.info(f"Restored position: {symbol} {position.quantity} shares @ {position.entry_price:.2f}")
+            except Exception as e:
+                logger.error(f"Failed to restore position {symbol}: {e}")
 
-        if fill is None:
-            # Transient error - keep pending and retry next cycle
-            logger.warning("%s time-based reconcile transient error; keeping pending for retry", symbol)
-            return
-
-        self._apply_fill_result(symbol, state, fill, now)
-
-    # ------------------------------------------------------------------
-
-    def _reconcile_pending_exit(
-        self, symbol: str, state: PositionState, now: datetime
-    ) -> None:
-        """Slow-path reconcile: called each bar while exit_pending.
-        Waits exit_ack_timeout_seconds before querying broker.
-        Falls back to client_order_id search if order_id was lost.
-        """
-        if not state.exit_submitted_ts:
-            # Shouldn't happen, but clear after timeout to avoid permanent lock
-            logger.warning("%s exit_pending with no submitted_ts; clearing", symbol)
-            state.exit_pending = False
-            return
-
-        age = time.monotonic() - state.exit_submitted_ts  # Use monotonic for consistency
-        if age < self.cfg.exit_ack_timeout_seconds:
-            return  # still within grace window, wait
-
-        fallback = state.exit_price or state.peak_price
-
-        # Prefer order_id lookup; fall back to client_order_id search
-        fill: Optional[FillResult] = None
-        if state.exit_order_id:
-            logger.debug(
-                "Reconciling exit for %s via order_id %s (age %.0fs)",
-                symbol, state.exit_order_id, age,
-            )
-            try:
-                fill = self.execution.poll_order_fill(
-                    state.exit_order_id, fallback_price=fallback
-                )
-            except Exception:
-                logger.exception("Reconcile poll failed for %s", symbol)
-                return
-        elif state.exit_client_order_id:
-            logger.debug(
-                "Reconciling exit for %s via client_order_id %s (order_id lost)",
-                symbol, state.exit_client_order_id,
-            )
-            fill = self.execution.find_order_by_client_id(state.exit_client_order_id)
-
-        if fill is None:
-            # Transient error - keep pending and retry next bar
-            logger.warning("%s reconcile transient error; keeping pending for retry", symbol)
-            return
-
-        self._apply_fill_result(symbol, state, fill, now)
-
-    def _apply_fill_result(
-        self, symbol: str, state: PositionState, fill: FillResult, now: datetime
-    ) -> None:
-        """Dispatch a FillResult to the appropriate handler. Used by both _exit and reconcile."""
-        if fill.status in {"filled", "dry_run"}:
-            self._record_fill(symbol, state, fill, now)
-        elif fill.status == "partial":
-            logger.warning(
-                "%s partial fill on exit: %.4f/%.4f shares @ %.2f",
-                symbol, fill.filled_qty, state.qty, fill.avg_price,
-            )
-            if self.stats is not None:
-                latency = time.monotonic() - state.exit_submitted_ts if state.exit_submitted_ts else 0.0
-                self.stats.record_exit(
-                    status="partial",
-                    latency=latency,
-                    decision_price=state.exit_price or fill.avg_price,
-                    fill_price=fill.avg_price,
-                )
-
-            remaining_qty = max(state.qty - fill.filled_qty, 0.0)
-            broker_qty = None
-            if hasattr(self.execution, "_get_broker_qty"):
-                try:
-                    broker_qty = self.execution._get_broker_qty(symbol)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to query broker qty for %s after partial fill: %s",
-                        symbol,
-                        exc,
-                    )
-            if broker_qty is not None:
-                remaining_qty = max(float(broker_qty), 0.0)
-
-            state.qty = remaining_qty
-            state.exit_pending = False
-            state.exit_order_id = None
-            state.exit_client_order_id = None
-            state.exit_submitted_ts = None
-            if state.qty <= 0.0:
-                self.positions.pop(symbol, None)
-            self._persist()
-            return
-        elif fill.status == "unfilled":
-            logger.warning(
-                "Exit order for %s was unfilled; position remains open", symbol
-            )
-            if self.stats is not None:
-                self.stats.record_exit(
-                    status="unfilled", latency=0.0,
-                    decision_price=0.0, fill_price=0.0,
-                )
-            state.exit_pending = False
-            state.exit_order_id = None
-            state.exit_client_order_id = None
-            state.exit_submitted_ts = None
-            self._persist()
-        elif fill.status in {"unknown", "live"}:
-            logger.warning("%s exit order still %s after reconcile", symbol, fill.status)
-            if self.stats is not None:
-                self.stats.record_exit(
-                    status=fill.status, latency=0.0,
-                    decision_price=0.0, fill_price=0.0,
-                )
-            # Leave pending; will retry next bar / time-based reconcile
-
-    def _record_fill(
-        self, symbol: str, state: PositionState, fill: FillResult, now: datetime
-    ) -> None:
-        """Finalize a confirmed fill: compute R, notify risk manager, remove position."""
-        decision_price = state.exit_price or state.peak_price  # provisional price set at _exit time
-        price = fill.avg_price if fill.avg_price > 0 else decision_price
-        if state.r_stop_pct > 0:
-            state.realized_r = (price - state.entry_price) / (
-                state.entry_price * state.r_stop_pct
-            )
-        else:
-            state.realized_r = 0.0
-        state.exit_time = now
-        state.exit_price = price
-        self.risk_manager.on_trade_closed(state.realized_r or 0.0)
-        logger.info(
-            "EXIT %s qty=%.4f @ %.2f reason=%s R=%.2f order=%s",
-            symbol, fill.filled_qty, price, state.exit_reason,
-            state.realized_r or 0.0, fill.order_id,
-        )
-        if self.stats is not None:
-            latency = (
-                time.monotonic() - state.exit_submitted_ts
-                if state.exit_submitted_ts else 0.0
-            )
-            self.stats.record_exit(
-                status=fill.status,
-                latency=latency,
-                decision_price=decision_price,
-                fill_price=price,
-            )
-        
-        # Record exit to monitoring system
+    def get_account_equity(self) -> float:
+        """Get current account equity"""
+        url = f"{self.base_url}/v2/account"
         try:
-            monitor = get_session_monitor()
-            is_force = state.exit_reason in (
-                "hard_exit", "emergency_hard_exit", "emergency_market_close",
-                "integrated_emergency_close", "emergency_exit_failed_no_client",
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return float(data.get("equity", 0))
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error getting account equity: {e}")
+            return 0.0
+
+    def calculate_position_size(
+        self, equity: float, num_trades: int, adv: float, current_price: float
+    ) -> int:
+        """
+        Calculate position size based on:
+        1. Equal split of equity across trades
+        2. Liquidity cap: max 0.3% of ADV
+        """
+        if num_trades == 0:
+            return 0
+
+        # Equal split of equity
+        target_dollars = equity / num_trades
+
+        # Liquidity cap (0.3% of ADV)
+        liquidity_cap = adv * config.LIQUIDITY_CAP_PCT
+
+        # Use the smaller of the two
+        position_dollars = min(target_dollars, liquidity_cap)
+
+        # Convert to shares
+        quantity = int(position_dollars / current_price)
+
+        logger.debug(f"{target_dollars:.0f} target, {liquidity_cap:.0f} cap -> {quantity} shares")
+        return max(0, quantity)
+
+    def get_order_fill(self, order_id: str, max_wait: int = 30) -> Optional[dict]:
+        """Poll order until filled or timeout. Returns fill data with actual price."""
+        url = f"{self.base_url}/v2/orders/{order_id}"
+        start_time = datetime.now()
+
+        while (datetime.now() - start_time).seconds < max_wait:
+            try:
+                response = self.session.get(url, timeout=10)
+                response.raise_for_status()
+                order = response.json()
+
+                status = order.get("status")
+                filled_qty = float(order.get("filled_qty", 0))
+                filled_avg_price = order.get("filled_avg_price")
+
+                if status == "filled" and filled_qty > 0 and filled_avg_price:
+                    return {
+                        "order_id": order_id,
+                        "filled_qty": filled_qty,
+                        "filled_avg_price": float(filled_avg_price),
+                        "status": "filled",
+                    }
+                elif status in ("canceled", "expired", "rejected"):
+                    logger.error(f"Order {order_id} failed with status: {status}")
+                    return None
+
+                # Wait before polling again
+                import time
+                time.sleep(0.5)
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error polling order {order_id}: {e}")
+                return None
+
+        logger.warning(f"Order {order_id} did not fill within {max_wait} seconds")
+        return None
+
+    def enter_positions(
+        self, candidates: List, vix_level: float
+    ) -> List[Position]:
+        """
+        Enter market orders at 9:30 AM open.
+        Returns list of successfully entered positions.
+        Note: vix_level stored for reference but entries are unconditional.
+        """
+        equity = self.get_account_equity()
+        if equity <= 0:
+            logger.error("Cannot enter positions: no equity")
+            return []
+
+        entered = []
+
+        for candidate in candidates:
+            symbol = candidate.symbol
+            expected_price = candidate.open_price
+
+            # Calculate size
+            quantity = self.calculate_position_size(
+                equity, len(candidates), candidate.adv_estimate, expected_price
             )
-            latency_exit = (
-                time.monotonic() - state.exit_submitted_ts
-                if state.exit_submitted_ts else 0.0
-            )
-            entry_ts = state.entry_time.isoformat() if state.entry_time else ""
-            monitor.record_exit_order(
+
+            if quantity <= 0:
+                logger.warning(f"Skipping {symbol}: calculated quantity <= 0")
+                continue
+
+            # Submit market order
+            order_id = self._submit_market_order(symbol, quantity, "buy")
+
+            if not order_id:
+                continue
+
+            # Poll for actual fill price
+            fill = self.get_order_fill(order_id, max_wait=30)
+
+            if not fill:
+                logger.error(f"Failed to get fill for {symbol} order {order_id}")
+                continue
+
+            actual_price = fill["filled_avg_price"]
+            actual_qty = int(fill["filled_qty"])
+
+            if actual_qty <= 0:
+                logger.error(f"No shares filled for {symbol}")
+                continue
+
+            position = Position(
                 symbol=symbol,
-                intended_price=decision_price,
-                avg_exit_price=price,
-                status=fill.status,
-                entry_ts=entry_ts,
-                exit_signal_ts=now.isoformat(),
-                exit_submit_ts=now.isoformat(),
-                planned_reason=state.exit_reason,
-                actual_reason=state.exit_reason,
-                time_to_fill_s=latency_exit,
-                force_flat=is_force,
-                force_flat_reason=state.exit_reason if is_force else "",
+                entry_price=actual_price,
+                quantity=actual_qty,
+                entry_time=datetime.now(),
+                entry_gap_pct=candidate.gap_pct,
+                adv_estimate=candidate.adv_estimate,
+                peak_price=actual_price,
+                order_id=order_id,
             )
-        except Exception:
-            pass
-        
-        # Store realized exit metadata for reporting wrapper to read
-        self._realized_exits[symbol] = {
-            "exit_price": price,
-            "exit_qty": fill.filled_qty,
-            "exit_reason": state.exit_reason,
-            "exit_time": now,
-            "entry_price": state.entry_price,
-            "entry_time": state.entry_time,
-            "realized_r": state.realized_r,
-            "gap_at_entry": getattr(state, "gap_at_entry", 0.0),
-            "first_5min_volume": getattr(state, "first_5min_volume", 0.0),
-            "fill_pct": getattr(state, "fill_pct", 100.0),
-            "entry_slippage_bps": getattr(state, "entry_slippage_bps", 0.0),
-            "peak_price": getattr(state, "peak_price", state.entry_price),
-            "stop_price": getattr(state, "stop_price", 0.0),
+            self.positions[symbol] = position
+            entered.append(position)
+
+            slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
+            logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (expected {expected_price:.2f}, slippage: {slippage:+.2f}%, gap: {candidate.gap_pct:.1f}%) [VIX={vix_level:.1f}]")
+
+        return entered
+
+    def _submit_market_order(
+        self, symbol: str, quantity: int, side: str
+    ) -> Optional[str]:
+        """Submit market order to Alpaca"""
+        url = f"{self.base_url}/v2/orders"
+
+        order_data = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day",
         }
 
-        self.positions.pop(symbol, None)
-        self._persist()
+        try:
+            response = self.session.post(url, json=order_data, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            logger.info(f"Order submitted: {symbol} {side} {quantity} (ID: {order_id})")
+            return order_id
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Order error for {symbol}: {e}")
+            return None
 
-    def _exit(
-        self,
-        symbol: str,
-        state: PositionState,
-        price: float,
-        now: datetime,
-        *,
-        reason: str,
-    ) -> None:
-        """Exit position using IOC (Immediate or Cancel) to prevent hanging orders.
-        
-        IOC ensures immediate fill or cancel - no resting exit orders.
-        If unfilled, will retry up to 3 times with more aggressive pricing.
-        After 3 failed attempts, will emergency flatten the position.
+    def update_positions(self):
+        """Update position state with current prices. Returns dict of symbol->current_price."""
+        current_prices = {}
+
+        if not self.positions:
+            return current_prices
+
+        symbols = list(self.positions.keys())
+        snapshots = self.client.get_snapshots(symbols)
+
+        for symbol, position in self.positions.items():
+            snapshot = snapshots.get(symbol)
+            if not snapshot:
+                continue
+
+            current_price = snapshot.get("last_price", snapshot.get("close"))
+            if not current_price:
+                continue
+
+            # Store current price in position and return dict
+            position.current_price = current_price
+            current_prices[symbol] = current_price
+
+            # Update peak price
+            if current_price > position.peak_price:
+                position.peak_price = current_price
+
+            # Check trailing stop activation
+            entry_price = position.entry_price
+            gain_pct = (current_price - entry_price) / entry_price
+
+            if gain_pct >= config.TRAILING_STOP_ACTIVATION:
+                position.is_trailing_active = True
+
+            # Update trailing stop level
+            if position.is_trailing_active:
+                trail_level = position.peak_price * (1 - config.TRAILING_STOP_PCT)
+                position.trailing_stop_price = max(position.trailing_stop_price, trail_level)
+
+        return current_prices
+
+    def check_exits(self, current_time: time, vix_level: float, current_prices: Dict[str, float]) -> List[str]:
         """
-        if state.exit_pending:
-            logger.debug("Exit already in flight for %s, skipping duplicate", symbol)
+        Check if any positions should be exited based on:
+        1. Trailing stop hits (middle VIX regime only) - checked first for clean precedence
+        2. Time-based exits (all VIX regimes)
+
+        For timed exits: distribute across 3 minutes (minute before, minute of, minute after target)
+        to help with afternoon liquidity.
+        """
+        exited = []
+
+        # Determine exit time based on VIX (middle now has time exit too)
+        if vix_level < config.VIX_LOW_THRESHOLD:
+            target_exit = datetime.strptime(config.EXIT_TIME_LOW_VIX, "%H:%M").time()
+        elif vix_level > config.VIX_HIGH_THRESHOLD:
+            target_exit = datetime.strptime(config.EXIT_TIME_HIGH_VIX, "%H:%M").time()
+        else:
+            # Middle regime: 3:30 PM exit
+            target_exit = datetime.strptime(config.EXIT_TIME_MIDDLE_VIX, "%H:%M").time()
+
+        # Calculate distributed exit window: 1 minute before to 1 minute after
+        target_dt = datetime.combine(datetime.today(), target_exit)
+        exit_window_start = (target_dt - timedelta(minutes=1)).time()
+        exit_window_end = (target_dt + timedelta(minutes=1)).time()
+
+        for symbol, position in list(self.positions.items()):
+            should_exit = False
+            exit_reason = ""
+
+            # PRIORITY 1: Trailing stop exit (middle VIX regime only)
+            # This takes precedence over time exits in middle regime
+            if config.VIX_LOW_THRESHOLD <= vix_level <= config.VIX_HIGH_THRESHOLD:
+                if position.is_trailing_active and position.trailing_stop_price > 0:
+                    current_price = current_prices.get(symbol, position.current_price)
+                    if current_price and current_price <= position.trailing_stop_price:
+                        should_exit = True
+                        exit_reason = f"trailing_stop ({current_price:.2f} <= {position.trailing_stop_price:.2f})"
+
+            # PRIORITY 2: Time-based exit (all regimes, but only if not already exiting via trailing stop)
+            # Distributed across 3-minute window to help with liquidity
+            if not should_exit:
+                if exit_window_start <= current_time <= exit_window_end:
+                    # Check if we've already scheduled this position for exit
+                    if symbol not in self.timed_exit_scheduled:
+                        # Schedule exit distributed over the window
+                        # Stagger by symbol hash to avoid all exiting at once
+                        stagger_seconds = hash(symbol) % 120  # 0-119 seconds
+                        scheduled_time = datetime.combine(datetime.today(), exit_window_start) + timedelta(seconds=stagger_seconds)
+                        self.timed_exit_scheduled[symbol] = scheduled_time
+                        logger.debug(f"Scheduled timed exit for {symbol} at {scheduled_time.time()}")
+
+                    # Check if scheduled time has passed
+                    scheduled = self.timed_exit_scheduled.get(symbol)
+                    if scheduled and datetime.now() >= scheduled:
+                        should_exit = True
+                        exit_reason = f"time_exit (VIX={vix_level:.1f}, distributed)"
+
+            if should_exit:
+                self._exit_position(symbol, exit_reason)
+                exited.append(symbol)
+                # Clean up scheduled exit if present
+                self.timed_exit_scheduled.pop(symbol, None)
+
+        return exited
+
+    def _exit_position(self, symbol: str, reason: str):
+        """Exit a position with market order, using actual fill price"""
+        position = self.positions.get(symbol)
+        if not position:
             return
 
-        # ── Pre-flight: verify broker actually holds this position ──
-        broker_qty = self.execution._get_broker_qty(symbol)
-        if broker_qty is not None and broker_qty <= 0:
-            logger.warning(
-                "BROKER FLAT %s: broker reports 0 position but local state has qty=%.4f "
-                "-- clearing stale local state (reason=%s)",
-                symbol, state.qty, reason,
-            )
-            self._realized_exits[symbol] = {
-                "exit_price": 0.0,
-                "exit_qty": 0.0,
-                "exit_reason": "broker_flat_before_exit",
-                "exit_time": now,
-                "entry_price": state.entry_price,
-                "entry_time": state.entry_time,
-                "realized_r": 0.0,
-                "reconciled_without_fill": True,
-            }
-            state.exit_pending = False
-            state.exit_reason = "broker_flat_before_exit"
-            self.positions.pop(symbol, None)
-            self._persist()
+        order_id = self._submit_market_order(symbol, position.quantity, "sell")
+
+        if not order_id:
             return
 
-        # Use iterative retry instead of recursion to prevent stack overflow
-        max_attempts = 3
-        current_price = price
-        
-        for attempt in range(1, max_attempts + 1):
-            state.exit_attempts = attempt
-            client_id = _exit_client_id(symbol, attempt)
-            state.exit_pending = True
-            state.exit_submitted_ts = time.monotonic()  # Use monotonic for consistent time basis
-            state.exit_reason = reason
-            state.exit_client_order_id = client_id
-            state.exit_price = current_price  # provisional; overwritten by actual fill
-            self._persist()
+        # Poll for actual fill price
+        fill = self.get_order_fill(order_id, max_wait=30)
 
-            qty = state.qty
-            fill = self.execution.place_exit(symbol, qty, current_price, client_order_id=client_id)
-            state.exit_order_id = fill.order_id
-            self._persist()
-
-            # If place_exit returned unfilled with no order (broker confirmed 0),
-            # clear local state immediately -- do not retry or escalate.
-            if fill.status == "unfilled" and fill.order_id is None:
-                logger.warning(
-                    "BROKER FLAT %s: exit skipped by broker (no order submitted) "
-                    "-- clearing stale local state",
-                    symbol,
-                )
-                self._realized_exits[symbol] = {
-                    "exit_price": 0.0,
-                    "exit_qty": 0.0,
-                    "exit_reason": "broker_flat_on_exit",
-                    "exit_time": now,
-                    "entry_price": state.entry_price,
-                    "entry_time": state.entry_time,
-                    "realized_r": 0.0,
-                    "reconciled_without_fill": True,
-                }
-                state.exit_pending = False
-                state.exit_reason = "broker_flat_on_exit"
-                self.positions.pop(symbol, None)
-                self._persist()
-                return
-
-            self._apply_fill_result(symbol, state, fill, now)
-            
-            # Check if we're done
-            if fill.status in {"filled", "dry_run"}:
-                logger.info(f"Exit {symbol} completed on attempt {attempt}: {fill.status}")
-                return
-            elif fill.status == "partial":
-                if state.qty <= 0.0:
-                    logger.info(f"Exit {symbol} fully closed via partial fills on attempt {attempt}")
-                    return
-                if attempt < max_attempts:
-                    aggressiveness_factors = [0.995, 0.99, 0.985]
-                    aggressiveness = aggressiveness_factors[min(attempt - 1, len(aggressiveness_factors) - 1)]
-                    new_price = max(state.exit_price or current_price, 0.0) * aggressiveness
-                    current_price = new_price if new_price > 0 else current_price
-                    logger.debug(
-                        "Partial exit for %s left %.4f shares; retrying with price %.2f",
-                        symbol,
-                        state.qty,
-                        current_price,
-                    )
-                    continue
-                else:
-                    logger.error(f"Partial exit could not close {symbol} after {attempt} attempts - escalating to broker close_position")
-                    fill = FillResult(order_id=None, filled_qty=0.0, avg_price=current_price, status="unfilled")
-                    # fall through to escalation logic below
-
-            if fill.status == "unfilled" or (fill.status == "partial" and attempt >= max_attempts):
-                if attempt < max_attempts:
-                    logger.warning(f"IOC exit unfilled for {symbol}, attempt {attempt} - retrying with more aggressive price")
-                    aggressiveness_factors = [0.995, 0.99, 0.985]
-                    aggressiveness = aggressiveness_factors[min(attempt - 1, len(aggressiveness_factors) - 1)]
-                    current_price = price * aggressiveness
-                    logger.debug(f"Retry {attempt}: price {price:.2f} -> {current_price:.2f} (factor {aggressiveness})")
-                    continue  # Next iteration with new price
-                else:
-                    logger.error(f"IOC exit failed after {attempt} attempts for {symbol} - escalating to broker close_position")
-                    # Emergency: escalate to broker close_position (market order) to guarantee flat
-                    try:
-                        if hasattr(self.execution, 'client') and self.execution.client:
-                            logger.critical(f"Escalating {symbol} to broker close_position (market order)")
-                            order = self.execution.client.close_position(symbol)
-                            state.exit_reason = "emergency_market_close"
-                            state.exit_submitted_ts = time.monotonic()
-                            state.exit_pending = True
-                            state.exit_order_id = getattr(order, "id", state.exit_order_id)
-                            if getattr(order, "client_order_id", None):
-                                state.exit_client_order_id = order.client_order_id
-                            state.exit_price = current_price  # provisional until fill confirmed
-                            state.exit_time = None
-                            self._persist()
-                            logger.info(f"Emergency market close submitted for {symbol}")
-                        else:
-                            logger.critical(f"Cannot escalate {symbol} - no broker client available")
-                            state.exit_pending = False
-                            state.exit_reason = "emergency_exit_failed_no_client"
-                            self._persist()
-                    except Exception as e:
-                        if "position does not exist" in str(e).lower() or "404" in str(e):
-                            logger.warning(
-                                "BROKER FLAT %s: close_position 404 -- clearing stale local state", symbol
-                            )
-                            self._realized_exits[symbol] = {
-                                "exit_price": 0.0,
-                                "exit_qty": 0.0,
-                                "exit_reason": "broker_flat_on_escalation",
-                                "exit_time": now,
-                                "entry_price": state.entry_price,
-                                "entry_time": state.entry_time,
-                                "realized_r": 0.0,
-                                "reconciled_without_fill": True,
-                            }
-                            state.exit_pending = False
-                            state.exit_reason = "broker_flat_on_escalation"
-                            self.positions.pop(symbol, None)
-                            self._persist()
-                        else:
-                            logger.critical(f"Emergency close_position failed for {symbol}: {e}")
-                            state.exit_pending = False
-                            state.exit_reason = "emergency_exit_failed_exception"
-                            self._persist()
-                    return
-            else:
-                logger.warning(f"Exit {symbol} status {fill.status} - keeping pending for reconcile")
-                return  # Let time-based reconcile handle live/unknown status
-
-    def _persist(self) -> None:
-        if not self.state_store:
+        if not fill:
+            logger.error(f"Failed to get exit fill for {symbol} order {order_id}")
             return
-        self.state_store.save_positions(self.positions)
+
+        exit_price = fill["filled_avg_price"]
+        filled_qty = fill["filled_qty"]
+
+        pnl = (exit_price - position.entry_price) * filled_qty
+        pnl_pct = ((exit_price / position.entry_price) - 1) * 100
+
+        logger.info(f"EXIT {symbol}: {filled_qty} shares @ {exit_price:.2f} (P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - {reason}")
+
+        del self.positions[symbol]
+
+    def get_position_count(self) -> int:
+        """Return number of open positions"""
+        return len(self.positions)
+
+    def force_exit_all(self, reason: str = "force"):
+        """Force exit all positions immediately"""
+        logger.warning(f"Force exiting all positions: {reason}")
+        for symbol in list(self.positions.keys()):
+            self._exit_position(symbol, reason)
