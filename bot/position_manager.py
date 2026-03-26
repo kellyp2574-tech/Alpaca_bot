@@ -1,5 +1,6 @@
 """Position manager for gap momentum strategy with VIX-conditioned exits"""
 import logging
+import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
@@ -23,7 +24,7 @@ class Position:
     trailing_stop_price: float = field(default=0.0)
     is_trailing_active: bool = field(default=False)
     order_id: Optional[str] = None
-    current_price: float = field(default=0.0)  # Last known price from update_positions
+    current_price: float = field(default=0.0)
 
 
 class PositionManager:
@@ -42,11 +43,10 @@ class PositionManager:
             "APCA-API-SECRET-KEY": self.secret_key,
         })
 
-        # Track which positions have been scheduled for timed exit (distributed over 3 minutes)
         self.timed_exit_scheduled: Dict[str, datetime] = {}
 
     def load_positions(self, saved_positions: Dict):
-        """Restore positions from saved state including trailing stop data"""
+        """Restore positions from saved state"""
         for symbol, data in saved_positions.items():
             try:
                 position = Position(
@@ -63,7 +63,7 @@ class PositionManager:
                     current_price=data.get("current_price", data.get("entry_price", 0)),
                 )
                 self.positions[symbol] = position
-                logger.info(f"Restored position: {symbol} {position.quantity} shares @ {position.entry_price:.2f} (trailing_active={position.is_trailing_active})")
+                logger.info(f"Restored position: {symbol} {position.quantity} shares @ {position.entry_price:.2f}")
             except Exception as e:
                 logger.error(f"Failed to restore position {symbol}: {e}")
 
@@ -79,34 +79,43 @@ class PositionManager:
             logger.error(f"Error getting account equity: {e}")
             return 0.0
 
-    def calculate_position_size(
-        self, 
-        target_dollars: float,  # Target dollar allocation for this position
-        adv: float,  # Average daily volume
-        current_price: float  # Entry price
-    ) -> int:
-        """
-        Calculate position size based on:
-        1. Target dollar allocation (from portfolio construction)
-        2. Liquidity cap: max 0.3% of ADV
-        """
-        # Liquidity cap (0.3% of ADV)
+    def calculate_position_size(self, target_dollars: float, adv: float, current_price: float) -> int:
+        """Calculate position size with liquidity cap (0.3% of ADV)"""
         liquidity_cap = adv * config.LIQUIDITY_CAP_PCT
-        
-        # Use the smaller of target and liquidity cap
         position_dollars = min(target_dollars, liquidity_cap)
-        
-        # Convert to shares
         quantity = int(position_dollars / current_price)
-        
         return max(0, quantity)
 
+    def _cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order. Returns True if successfully canceled or already complete."""
+        url = f"{self.base_url}/v2/orders/{order_id}"
+        try:
+            response = self.session.delete(url, timeout=10)
+            if response.status_code in (200, 204):
+                logger.info(f"Canceled order {order_id}")
+                return True
+            elif response.status_code == 422:
+                # Order already filled or canceled
+                logger.debug(f"Order {order_id} already complete (422)")
+                return True
+            else:
+                logger.warning(f"Failed to cancel order {order_id}: HTTP {response.status_code}")
+                return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error canceling order {order_id}: {e}")
+            return False
+
     def get_order_fill(self, order_id: str, max_wait: int = 30) -> Optional[dict]:
-        """Poll order until filled or timeout. Returns fill data with actual price."""
+        """
+        Poll order until filled, partially filled, or timeout.
+        SAFER PATTERN: On partial fill, cancel residual immediately inside this function,
+        then re-read order state to return final filled quantity. This prevents the race
+        window where remaining shares could fill before caller cancels.
+        """
         url = f"{self.base_url}/v2/orders/{order_id}"
         start_time = datetime.now()
 
-        while (datetime.now() - start_time).seconds < max_wait:
+        while (datetime.now() - start_time).total_seconds() < max_wait:
             try:
                 response = self.session.get(url, timeout=10)
                 response.raise_for_status()
@@ -117,41 +126,117 @@ class PositionManager:
                 filled_avg_price = order.get("filled_avg_price")
 
                 if status == "filled" and filled_qty > 0 and filled_avg_price:
-                    return {
-                        "order_id": order_id,
-                        "filled_qty": filled_qty,
-                        "filled_avg_price": float(filled_avg_price),
-                        "status": "filled",
-                    }
-                elif status in ("canceled", "expired", "rejected"):
+                    return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "filled"}
+                
+                # SAFER PATTERN: On partial fill, cancel immediately and poll until terminal state
+                if status == "partially_filled" and filled_qty > 0 and filled_avg_price:
+                    logger.warning(f"Order {order_id} partially filled: {filled_qty} shares - canceling residual immediately")
+                    cancel_success = self._cancel_order(order_id)
+                    if not cancel_success:
+                        logger.error(f"Failed to cancel order {order_id} - order may still be working, proceeding with caution")
+                    
+                    # Poll until order reaches terminal state (not just one re-read)
+                    terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
+                    poll_start = datetime.now()
+                    max_post_cancel_poll = 5  # Max 5 seconds of post-cancellation polling
+                    
+                    while (datetime.now() - poll_start).total_seconds() < max_post_cancel_poll:
+                        time.sleep(0.5)
+                        try:
+                            response = self.session.get(url, timeout=10)
+                            response.raise_for_status()
+                            final_order = response.json()
+                            final_status = final_order.get("status", "unknown")
+                            
+                            if final_status in terminal_states:
+                                final_qty = float(final_order.get("filled_qty", filled_qty))
+                                final_price = final_order.get("filled_avg_price", filled_avg_price)
+                                
+                                if final_qty > filled_qty:
+                                    logger.info(f"Additional fill during cancellation: {final_qty - filled_qty} shares")
+                                
+                                return {
+                                    "order_id": order_id, 
+                                    "filled_qty": final_qty, 
+                                    "filled_avg_price": float(final_price), 
+                                    "status": "filled" if final_status == "filled" else "partially_filled"
+                                }
+                        except Exception as e:
+                            logger.warning(f"Error polling after cancellation: {e}")
+                            break
+                    
+                    # If we exhausted polling without terminal state, return what we have
+                    logger.warning(f"Order {order_id} did not reach terminal state after cancellation - returning best known fill")
+                    return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "partially_filled"}
+                
+                if status in ("canceled", "expired", "rejected"):
+                    # Return any fills even if order was canceled/rejected
+                    if filled_qty > 0 and filled_avg_price:
+                        logger.warning(f"Order {order_id} {status} but {filled_qty} shares filled")
+                        return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": f"{status}_with_fill"}
                     logger.error(f"Order {order_id} failed with status: {status}")
                     return None
 
-                # Wait before polling again
-                import time
                 time.sleep(0.5)
 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error polling order {order_id}: {e}")
                 return None
 
+        # Timeout check - return partial fills if any, then cancel residual with polling
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            order = response.json()
+            filled_qty = float(order.get("filled_qty", 0))
+            filled_avg_price = order.get("filled_avg_price")
+            if filled_qty > 0 and filled_avg_price:
+                logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - canceling residual")
+                cancel_success = self._cancel_order(order_id)
+                if not cancel_success:
+                    logger.error(f"Failed to cancel order {order_id} after timeout - order may still be working")
+                
+                # Same post-cancel polling as partial_filled branch
+                terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
+                poll_start = datetime.now()
+                max_poll = 5
+                
+                while (datetime.now() - poll_start).total_seconds() < max_poll:
+                    time.sleep(0.5)
+                    try:
+                        response = self.session.get(url, timeout=10)
+                        response.raise_for_status()
+                        final_order = response.json()
+                        final_status = final_order.get("status", "unknown")
+                        
+                        if final_status in terminal_states:
+                            final_qty = float(final_order.get("filled_qty", filled_qty))
+                            final_price = final_order.get("filled_avg_price", filled_avg_price)
+                            
+                            if final_qty > filled_qty:
+                                logger.info(f"Additional fill during timeout cancellation: {final_qty - filled_qty} shares")
+                            
+                            return {
+                                "order_id": order_id, 
+                                "filled_qty": final_qty, 
+                                "filled_avg_price": float(final_price), 
+                                "status": "filled" if final_status == "filled" else "timeout_with_fill"
+                            }
+                    except requests.exceptions.RequestException as e:
+                        logger.warning(f"Error polling after timeout cancellation: {e}")
+                        break
+                
+                return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Timeout check request failed for {order_id}: {e}")
+            
         logger.warning(f"Order {order_id} did not fill within {max_wait} seconds")
         return None
 
-    def enter_positions(
-        self, candidates: List, vix_level: float
-    ) -> List[Position]:
+    def enter_positions(self, candidates: List, vix_level: float) -> List[Position]:
         """
-        Enter market orders at 9:30 AM open with portfolio-level allocation.
-        
-        Portfolio construction process:
-        1. Classify all candidates into price buckets (pre-trade)
-        2. Calculate weighted target allocations based on multipliers
-        3. Apply low bucket daily cap and redistribute excess to other buckets
-        4. Apply liquidity caps per position
-        5. Execute all orders (path-independent)
-        
-        Returns list of successfully entered positions.
+        Enter market orders with equal capital deployment.
+        CRITICAL FIX: Dynamic cash/slots recomputation after each partial fill.
         """
         equity = self.get_account_equity()
         if equity <= 0:
@@ -161,146 +246,66 @@ class PositionManager:
         if not candidates:
             return []
         
-        # STEP 1: Classify all candidates into buckets (pre-trade classification)
-        bucketed_candidates = {"low": [], "mid": [], "high": []}
-        for c in candidates:
-            price = c.open_price
-            if price < config.PRICE_BUCKET_LOW_MAX:
-                bucketed_candidates["low"].append(c)
-            elif price < config.PRICE_BUCKET_MID_MAX:
-                bucketed_candidates["mid"].append(c)
-            else:
-                bucketed_candidates["high"].append(c)
+        url = f"{self.base_url}/v2/account"
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            account_data = response.json()
+            cash = float(account_data.get("cash", equity))
+        except requests.exceptions.RequestException:
+            cash = equity
         
-        # Calculate total multipliers per bucket
-        bucket_multipliers = {
-            "low": len(bucketed_candidates["low"]) * config.PRICE_BUCKET_LOW_MULTIPLIER,
-            "mid": len(bucketed_candidates["mid"]) * config.PRICE_BUCKET_MID_MULTIPLIER,
-            "high": len(bucketed_candidates["high"]) * config.PRICE_BUCKET_HIGH_MULTIPLIER
-        }
-        total_multiplier_sum = sum(bucket_multipliers.values())
+        # CRITICAL FIX: Track remaining cash and slots dynamically
+        remaining_cash = cash
+        remaining_slots = min(len(candidates), config.MAX_POSITIONS)
+        selected_candidates = candidates[:remaining_slots]
         
-        if total_multiplier_sum == 0:
-            logger.error("No valid candidates with multipliers")
-            return []
+        logger.info(f"Portfolio plan: {remaining_slots} positions, starting with ${cash:,.2f} cash")
         
-        # STEP 2: Calculate initial target allocations
-        # Deploy up to 100% of equity (no Kelly cap)
-        deployable_capital = equity
-        
-        position_plan = []  # List of (candidate, target_dollars, bucket)
-        bucket_target = {"low": 0.0, "mid": 0.0, "high": 0.0}
-        
-        for bucket, bucket_candidates in bucketed_candidates.items():
-            if bucket == "low":
-                multiplier = config.PRICE_BUCKET_LOW_MULTIPLIER
-            elif bucket == "mid":
-                multiplier = config.PRICE_BUCKET_MID_MULTIPLIER
-            else:
-                multiplier = config.PRICE_BUCKET_HIGH_MULTIPLIER
-            
-            for c in bucket_candidates:
-                # Weighted allocation: (multiplier / total_sum) * deployable_capital
-                target_dollars = (multiplier / total_multiplier_sum) * deployable_capital
-                position_plan.append((c, target_dollars, bucket))
-                bucket_target[bucket] += target_dollars
-        
-        # STEP 3: Apply low bucket daily cap and redistribute excess
-        low_bucket_cap = equity * config.PRICE_BUCKET_LOW_EQUITY_CAP
-        if bucket_target["low"] > low_bucket_cap:
-            # Low bucket exceeds cap - scale down and redistribute
-            excess = bucket_target["low"] - low_bucket_cap
-            bucket_target["low"] = low_bucket_cap
-            
-            # Redistribute excess to mid and high proportionally
-            mid_high_total = bucket_multipliers["mid"] + bucket_multipliers["high"]
-            if mid_high_total > 0:
-                mid_ratio = bucket_multipliers["mid"] / mid_high_total
-                high_ratio = bucket_multipliers["high"] / mid_high_total
-                bucket_target["mid"] += excess * mid_ratio
-                bucket_target["high"] += excess * high_ratio
-            
-            # Recalculate individual position targets
-            new_plan = []
-            for c, old_target, bucket in position_plan:
-                if bucket == "low":
-                    # Scale down low bucket positions proportionally
-                    if bucket_target["low"] > 0:
-                        scale = bucket_target["low"] / (bucket_multipliers["low"] / total_multiplier_sum * deployable_capital)
-                        new_target = old_target * scale
-                    else:
-                        new_target = 0
-                elif bucket == "mid":
-                    # Scale up mid bucket positions
-                    if bucket_multipliers["mid"] > 0:
-                        base_target = (config.PRICE_BUCKET_MID_MULTIPLIER / total_multiplier_sum) * deployable_capital
-                        scale = bucket_target["mid"] / (bucket_multipliers["mid"] / total_multiplier_sum * deployable_capital)
-                        new_target = base_target * scale
-                    else:
-                        new_target = old_target
-                else:  # high
-                    # Scale up high bucket positions
-                    if bucket_multipliers["high"] > 0:
-                        base_target = (config.PRICE_BUCKET_HIGH_MULTIPLIER / total_multiplier_sum) * deployable_capital
-                        scale = bucket_target["high"] / (bucket_multipliers["high"] / total_multiplier_sum * deployable_capital)
-                        new_target = base_target * scale
-                    else:
-                        new_target = old_target
-                
-                new_plan.append((c, new_target, bucket))
-            
-            position_plan = new_plan
-            logger.info(f"Low bucket capped at ${low_bucket_cap:,.0f}, excess ${excess:,.0f} redistributed to mid/high")
-        
-        logger.info(f"Portfolio plan: {len(position_plan)} positions, "
-                   f"low=${bucket_target['low']:,.0f}, mid=${bucket_target['mid']:,.0f}, high=${bucket_target['high']:,.0f}, "
-                   f"total=${sum(bucket_target.values()):,.0f}")
-        
-        # STEP 4 & 5: Execute position plan
         entered = []
-        bucket_allocated = {"low": 0.0, "mid": 0.0, "high": 0.0}
+        total_allocated = 0.0
         
-        for candidate, target_dollars, bucket in position_plan:
+        for i, candidate in enumerate(selected_candidates):
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
-            if target_dollars <= 0:
+            # CRITICAL FIX: Recompute target per position dynamically
+            slots_left = remaining_slots - len(entered)
+            if slots_left <= 0:
+                logger.info(f"No slots remaining, skipping remaining candidates")
+                break
+                
+            target_per_position = remaining_cash / slots_left if slots_left > 0 else 0
+            
+            if target_per_position <= 0:
                 logger.debug(f"Skipping {symbol}: zero target allocation")
                 continue
             
-            # Calculate final size with liquidity cap
-            quantity = self.calculate_position_size(
-                target_dollars,
-                candidate.adv_estimate,
-                expected_price
-            )
-            
+            quantity = self.calculate_position_size(target_per_position, candidate.adv_estimate, expected_price)
             if quantity <= 0:
                 logger.warning(f"Skipping {symbol}: liquidity cap prevents allocation")
                 continue
             
-            # Submit market order
             order_id = self._submit_market_order(symbol, quantity, "buy")
-            
             if not order_id:
                 continue
             
-            # Poll for actual fill price
             fill = self.get_order_fill(order_id, max_wait=30)
-            
             if not fill:
-                logger.error(f"Failed to get fill for {symbol} order {order_id}")
+                logger.error(f"Failed to get fill for {symbol}")
                 continue
             
             actual_price = fill["filled_avg_price"]
             actual_qty = int(fill["filled_qty"])
+            fill_status = fill.get("status", "unknown")
             
             if actual_qty <= 0:
                 logger.error(f"No shares filled for {symbol}")
                 continue
             
-            # Track allocation using pre-trade bucket (for consistency)
-            bucket_allocated[bucket] += actual_price * actual_qty
+            actual_allocated = actual_price * actual_qty
+            total_allocated += actual_allocated
+            remaining_cash -= actual_allocated  # CRITICAL: Update remaining cash
             
             position = Position(
                 symbol=symbol,
@@ -315,23 +320,22 @@ class PositionManager:
             self.positions[symbol] = position
             entered.append(position)
             
-            slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
-            logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} ({bucket} bucket, slippage: {slippage:+.2f}%, gap: {candidate.gap_pct:.1f}%) [VIX={vix_level:.1f}]")
+            # SAFER PATTERN: get_order_fill() already cancels residual on partial fill,
+            # so we just need to log appropriately
+            if fill_status == "filled":
+                slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
+                logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, slippage: {slippage:+.2f}%) [VIX={vix_level:.1f}]")
+            else:
+                logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, PARTIAL FILL - {fill_status}) [VIX={vix_level:.1f}]")
+            
+            logger.debug(f"Remaining cash: ${remaining_cash:,.2f}, slots left: {slots_left - 1}")
         
-        # Log summary
-        total_deployed = sum(bucket_allocated.values())
-        logger.info(f"Entry complete: {len(entered)} positions, "
-                   f"low=${bucket_allocated['low']:,.0f}, mid=${bucket_allocated['mid']:,.0f}, high=${bucket_allocated['high']:,.0f}, "
-                   f"total=${total_deployed:,.0f} ({total_deployed/equity*100:.1f}% of equity)")
-        
+        logger.info(f"Entry complete: {len(entered)} positions, total allocated=${total_allocated:,.2f}, remaining cash=${remaining_cash:,.2f}")
         return entered
 
-    def _submit_market_order(
-        self, symbol: str, quantity: int, side: str
-    ) -> Optional[str]:
+    def _submit_market_order(self, symbol: str, quantity: int, side: str) -> Optional[str]:
         """Submit market order to Alpaca"""
         url = f"{self.base_url}/v2/orders"
-
         order_data = {
             "symbol": symbol,
             "qty": str(quantity),
@@ -339,7 +343,6 @@ class PositionManager:
             "type": "market",
             "time_in_force": "day",
         }
-
         try:
             response = self.session.post(url, json=order_data, timeout=10)
             response.raise_for_status()
@@ -352,9 +355,8 @@ class PositionManager:
             return None
 
     def update_positions(self):
-        """Update position state with current prices. Returns dict of symbol->current_price."""
+        """Update position state with current prices"""
         current_prices = {}
-
         if not self.positions:
             return current_prices
 
@@ -370,22 +372,18 @@ class PositionManager:
             if not current_price:
                 continue
 
-            # Store current price in position and return dict
             position.current_price = current_price
             current_prices[symbol] = current_price
 
-            # Update peak price
             if current_price > position.peak_price:
                 position.peak_price = current_price
 
-            # Check trailing stop activation
             entry_price = position.entry_price
             gain_pct = (current_price - entry_price) / entry_price
 
             if gain_pct >= config.TRAILING_STOP_ACTIVATION:
                 position.is_trailing_active = True
 
-            # Update trailing stop level
             if position.is_trailing_active:
                 trail_level = position.peak_price * (1 - config.TRAILING_STOP_PCT)
                 position.trailing_stop_price = max(position.trailing_stop_price, trail_level)
@@ -393,26 +391,16 @@ class PositionManager:
         return current_prices
 
     def check_exits(self, current_time: time, vix_level: float, current_prices: Dict[str, float]) -> List[str]:
-        """
-        Check if any positions should be exited based on:
-        1. Trailing stop hits (middle VIX regime only) - checked first for clean precedence
-        2. Time-based exits (all VIX regimes)
-
-        For timed exits: distribute across 3 minutes (minute before, minute of, minute after target)
-        to help with afternoon liquidity.
-        """
+        """Check if positions should be exited based on trailing stops or time"""
         exited = []
 
-        # Determine exit time based on VIX (middle now has time exit too)
         if vix_level < config.VIX_LOW_THRESHOLD:
             target_exit = datetime.strptime(config.EXIT_TIME_LOW_VIX, "%H:%M").time()
         elif vix_level > config.VIX_HIGH_THRESHOLD:
             target_exit = datetime.strptime(config.EXIT_TIME_HIGH_VIX, "%H:%M").time()
         else:
-            # Middle regime: 3:30 PM exit
             target_exit = datetime.strptime(config.EXIT_TIME_MIDDLE_VIX, "%H:%M").time()
 
-        # Calculate distributed exit window: 1 minute before to 1 minute after
         target_dt = datetime.combine(datetime.today(), target_exit)
         exit_window_start = (target_dt - timedelta(minutes=1)).time()
         exit_window_end = (target_dt + timedelta(minutes=1)).time()
@@ -421,78 +409,75 @@ class PositionManager:
             should_exit = False
             exit_reason = ""
 
-            # PRIORITY 1: Trailing stop exit (middle VIX regime only)
-            # This takes precedence over time exits in middle regime
             if config.VIX_LOW_THRESHOLD <= vix_level <= config.VIX_HIGH_THRESHOLD:
                 if position.is_trailing_active and position.trailing_stop_price > 0:
                     current_price = current_prices.get(symbol, position.current_price)
                     if current_price and current_price <= position.trailing_stop_price:
                         should_exit = True
-                        exit_reason = f"trailing_stop ({current_price:.2f} <= {position.trailing_stop_price:.2f})"
+                        exit_reason = f"trailing_stop"
 
-            # PRIORITY 2: Time-based exit (all regimes, but only if not already exiting via trailing stop)
-            # Distributed across 3-minute window to help with liquidity
             if not should_exit:
                 if exit_window_start <= current_time <= exit_window_end:
-                    # Check if we've already scheduled this position for exit
                     if symbol not in self.timed_exit_scheduled:
-                        # Schedule exit distributed over the window
-                        # Use deterministic staggering based on symbol characters (not hash)
-                        stagger_seconds = sum(ord(c) for c in symbol) % 120  # 0-119 seconds
+                        stagger_seconds = sum(ord(c) for c in symbol) % 120
                         target_dt = datetime.combine(datetime.today(), exit_window_start)
                         scheduled_time = target_dt + timedelta(seconds=stagger_seconds)
                         self.timed_exit_scheduled[symbol] = scheduled_time
-                        logger.debug(f"Scheduled timed exit for {symbol} at {scheduled_time.time()}")
 
-                    # Check if scheduled time has passed (using current_time for consistency)
                     scheduled = self.timed_exit_scheduled.get(symbol)
                     current_dt = datetime.combine(datetime.today(), current_time)
                     if scheduled and current_dt >= scheduled:
                         should_exit = True
-                        exit_reason = f"time_exit (VIX={vix_level:.1f}, distributed)"
+                        exit_reason = f"time_exit (VIX={vix_level:.1f})"
 
             if should_exit:
                 self._exit_position(symbol, exit_reason)
                 exited.append(symbol)
-                # Clean up scheduled exit if present
                 self.timed_exit_scheduled.pop(symbol, None)
 
         return exited
 
     def _exit_position(self, symbol: str, reason: str):
-        """Exit a position with market order, using actual fill price"""
+        """
+        Exit a position with market order.
+        Order state finalization (cancellation, polling for terminal state) is handled 
+        inside get_order_fill(). This method receives the final fill result and updates
+        local position state accordingly.
+        """
         position = self.positions.get(symbol)
         if not position:
             return
 
         order_id = self._submit_market_order(symbol, position.quantity, "sell")
-
         if not order_id:
             return
 
-        # Poll for actual fill price
         fill = self.get_order_fill(order_id, max_wait=30)
-
         if not fill:
-            logger.error(f"Failed to get exit fill for {symbol} order {order_id}")
+            logger.error(f"Failed to get exit fill for {symbol}")
             return
 
         exit_price = fill["filled_avg_price"]
-        filled_qty = fill["filled_qty"]
-
+        filled_qty = int(fill["filled_qty"])
+        fill_status = fill.get("status", "unknown")
+        
         pnl = (exit_price - position.entry_price) * filled_qty
         pnl_pct = ((exit_price / position.entry_price) - 1) * 100
 
-        logger.info(f"EXIT {symbol}: {filled_qty} shares @ {exit_price:.2f} (P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - {reason}")
-
-        del self.positions[symbol]
+        remaining = position.quantity - filled_qty
+        
+        if remaining > 0:
+            position.quantity = remaining
+            position.order_id = None
+            logger.warning(f"PARTIAL EXIT {symbol}: {filled_qty} shares @ {exit_price:.2f} (P&L: {pnl:+.2f}) - {reason} - REMAINING: {remaining}")
+        else:
+            logger.info(f"EXIT {symbol}: {filled_qty} shares @ {exit_price:.2f} (P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - {reason}")
+            del self.positions[symbol]
 
     def get_position_count(self) -> int:
-        """Return number of open positions"""
         return len(self.positions)
 
     def force_exit_all(self, reason: str = "force"):
-        """Force exit all positions immediately"""
         logger.warning(f"Force exiting all positions: {reason}")
         for symbol in list(self.positions.keys()):
             self._exit_position(symbol, reason)
