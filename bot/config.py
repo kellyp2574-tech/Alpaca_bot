@@ -57,6 +57,8 @@ MIN_ADV_DOLLARS = 5_000_000  # $5M minimum average daily dollar volume
 
 # Position sizing
 LIQUIDITY_CAP_PCT = 0.003  # 0.3% of ADV max position size
+MAX_POSITIONS = 12  # Maximum positions to hold at once
+POSITION_SIZE_DOLLARS = 10000  # Base position size per trade
 
 # Price bucket position sizing multipliers
 PRICE_BUCKET_LOW_MAX = 1.00      # Upper bound of low price bucket ($0.50-$1.00)

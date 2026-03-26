@@ -51,10 +51,14 @@ class MassiveClient:
                 )
 
                 if price is not None:
+                    day_data = item.get("day", {})
+                    prev_day = item.get("prevDay", {})
                     snapshots[symbol] = {
                         "symbol": symbol,
                         "price": price,
-                        "volume": item.get("day", {}).get("v", 0),  # daily volume
+                        "volume": day_data.get("v", 0),  # today's volume
+                        "prev_volume": prev_day.get("v", 0),  # yesterday's volume for ADV
+                        "prev_close": prev_day.get("c", 0),  # yesterday's close for gap calc
                         "timestamp": last_trade.get("t"),
                     }
 

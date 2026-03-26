@@ -47,12 +47,35 @@ class AlpacaDataClient:
                 response = self.session.get(url, params=params, timeout=30)
                 response.raise_for_status()
                 data = response.json()
-
-                # Alpaca wraps snapshots under top-level "snapshots" key
-                snapshots_map = data.get("snapshots", {})
+                
+                # Debug: Log raw response info
+                logger.info(f"Alpaca batch {i//batch_size + 1}: HTTP {response.status_code}")
+                logger.info(f"Response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+                
+                # Check if response is paginated (has 'NEXT' key) or direct snapshots
+                if "snapshots" in data:
+                    snapshots_map = data.get("snapshots", {})
+                elif "NEXT" in data:
+                    # Paginated response - data might be directly under symbol keys
+                    logger.warning(f"Paginated response detected. Raw first keys: {list(data.keys())[:5]}")
+                    # Try to use data directly as it might contain symbol:snapshot mappings
+                    snapshots_map = {k: v for k, v in data.items() if k != "NEXT" and isinstance(v, dict)}
+                else:
+                    # Direct symbol:snapshot mapping
+                    snapshots_map = {k: v for k, v in data.items() if isinstance(v, dict)}
+                
+                logger.info(f"Snapshots map type: {type(snapshots_map)}, len: {len(snapshots_map)}")
+                
                 for symbol, snapshot in snapshots_map.items():
-                    if snapshot:
-                        all_snapshots[symbol] = self._parse_snapshot(symbol, snapshot)
+                    if snapshot and isinstance(snapshot, dict):
+                        parsed = self._parse_snapshot(symbol, snapshot)
+                        if parsed:
+                            all_snapshots[symbol] = parsed
+                    else:
+                        logger.debug(f"Empty/invalid snapshot for {symbol}: {type(snapshot)}")
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Alpaca snapshot error for batch {i//batch_size + 1}: {e}")
 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Alpaca snapshot error for batch {i//batch_size + 1}: {e}")

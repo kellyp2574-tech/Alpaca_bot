@@ -43,19 +43,7 @@ def test_universe_build():
     
     if not snapshots:
         logger.error("Massive snapshot failed - would fall back to Alpaca")
-        # Try Alpaca fallback
-        alpaca = AlpacaDataClient()
-        logger.info("Fetching tradable assets from Alpaca...")
-        assets = alpaca.get_tradable_assets()
-        logger.info(f"Got {len(assets)} assets from Alpaca")
-        
-        # Get snapshots for first 2000 assets
-        logger.info("Fetching snapshots for price filtering...")
-        snapshots = alpaca.get_snapshots(assets[:2000])
-        
-        if not snapshots:
-            logger.error("FAILED: Could not get any snapshots from Massive or Alpaca")
-            return None
+        return None, {}
     
     logger.info(f"Total snapshots retrieved: {len(snapshots)}")
     
@@ -70,10 +58,11 @@ def test_universe_build():
     else:
         logger.error("WARNING: Universe is empty!")
     
-    return universe
+    # Return both universe list and full Massive data for ADV
+    return universe, snapshots
 
 
-def test_gap_calculation(universe):
+def test_gap_calculation(universe, massive_data):
     """Step 2: Test gap calculation and candidate selection."""
     logger.info("\n" + "=" * 60)
     logger.info("STEP 2: Testing Gap Calculation")
@@ -81,7 +70,7 @@ def test_gap_calculation(universe):
     
     if not universe:
         logger.error("Cannot calculate gaps - no universe available")
-        return []
+        return [], 15.0
     
     alpaca = AlpacaDataClient()
     gap_calc = GapCalculator()
@@ -93,15 +82,82 @@ def test_gap_calculation(universe):
     
     if not snapshots:
         logger.error("FAILED: Could not get Alpaca snapshots")
-        return []
+        return [], 15.0  # Return empty candidates and default VIX, 15.0  # Return empty candidates and default VIX
     
-    logger.info(f"Retrieved {len(snapshots)} snapshots")
+    # Merge Massive data (prev_volume, prev_close) with Alpaca snapshots
+    logger.info("Merging Massive ADV data with Alpaca price data...")
+    for symbol in snapshots:
+        if symbol in massive_data:
+            snapshots[symbol]["prev_volume"] = massive_data[symbol].get("prev_volume", 0)
+            snapshots[symbol]["prev_close"] = massive_data[symbol].get("prev_close", 0)
+            # Fallback: if Alpaca doesn't have prev_close, use Massive's
+            if not snapshots[symbol].get("prev_close"):
+                snapshots[symbol]["prev_close"] = massive_data[symbol].get("prev_close", 0)
+    
+    logger.info(f"Retrieved {len(snapshots)} snapshots with Massive ADV data")
+    
+    # Debug: Detailed gap analysis
+    logger.info("\n--- Detailed Gap Analysis ---")
+    
+    # Sample some symbols to check their data
+    sample_symbols = list(snapshots.keys())[:5]  # Just check 5
+    gaps_calculated = []
+    
+    for symbol in sample_symbols:
+        data = snapshots[symbol]
+        open_price = data.get("open")
+        prev_close = data.get("prev_close")
+        prev_volume = data.get("prev_volume", 0)
+        volume = data.get("volume", 0)
+        close = data.get("close")
+        last_price = data.get("last_price")
+        
+        # Show ALL fields
+        logger.info(f"{symbol} raw data: open={open_price}, prev_close={prev_close}, prev_vol={prev_volume}, vol={volume}, close={close}, last={last_price}")
+        
+        # Calculate ADV
+        if prev_volume and prev_close:
+            adv = prev_volume * prev_close
+        elif volume and open_price:
+            adv = volume * open_price * 5
+        else:
+            adv = 0
+        
+        if open_price and prev_close and prev_close > 0:
+            gap = ((open_price - prev_close) / prev_close) * 100
+            gaps_calculated.append((symbol, gap, open_price, prev_close, volume, adv))
+            logger.info(f"{symbol}: gap={gap:+.1f}%, adv=${adv/1e6:.2f}M")
+        else:
+            logger.info(f"{symbol}: MISSING DATA")
+    
+    # Show available fields from first snapshot
+    if snapshots:
+        first_sym = list(snapshots.keys())[0]
+        logger.info(f"\nAvailable fields in snapshot: {list(snapshots[first_sym].keys())}")
+    
+    logger.info("--- End Detailed Analysis ---\n")
     
     # Find gap candidates
     logger.info("Calculating gaps and finding candidates...")
     candidates = gap_calc.find_candidates(snapshots)
     
     logger.info(f"Raw candidates found: {len(candidates)}")
+    
+    # Debug: Show gap distribution
+    all_gaps = []
+    for symbol, data in snapshots.items():
+        open_price = data.get("open")
+        prev_close = data.get("prev_close")
+        if open_price and prev_close and prev_close > 0:
+            gap = ((open_price - prev_close) / prev_close) * 100
+            all_gaps.append(gap)
+    
+    if all_gaps:
+        all_gaps.sort(key=abs, reverse=True)
+        logger.info(f"Gap distribution (top 10): {[f'{g:+.1f}%' for g in all_gaps[:10]]}")
+        logger.info(f"Max gap seen: {max(all_gaps, key=abs):+.1f}%")
+        logger.info(f"Gaps >3%: {sum(1 for g in all_gaps if abs(g) >= 3)}")
+        logger.info(f"Gaps >5%: {sum(1 for g in all_gaps if abs(g) >= 5)}")
     
     # Select top candidates
     selected = gap_calc.select_by_liquidity_and_gap(candidates, max_positions=20)
@@ -119,7 +175,7 @@ def test_gap_calculation(universe):
     return selected, vix_level
 
 
-def show_what_would_be_bought(candidates, vix_level):
+def show_what_would_be_bought(candidates, vix_level, account_cash):
     """Display what the bot would buy at 9:30."""
     logger.info("\n" + "=" * 60)
     logger.info("WHAT WOULD BE BOUGHT AT 9:30")
@@ -129,9 +185,15 @@ def show_what_would_be_bought(candidates, vix_level):
         logger.warning("No candidates to display - bot would not buy anything")
         return
     
+    # Calculate dynamic position sizing
+    num_positions = min(len(candidates), config.MAX_POSITIONS)
+    position_size = account_cash / num_positions if num_positions > 0 else 0
+    
     logger.info(f"VIX Level: {vix_level:.2f}")
     logger.info(f"Max Positions: {config.MAX_POSITIONS}")
-    logger.info(f"Position Sizing: Base ${config.POSITION_SIZE_DOLLARS:,.0f} per position")
+    logger.info(f"Account Cash: ${account_cash:,.2f}")
+    logger.info(f"Positions to Enter: {num_positions}")
+    logger.info(f"Position Size (Cash / Positions): ${position_size:,.2f}")
     logger.info("")
     
     # Group by gap direction
@@ -159,13 +221,11 @@ def show_what_would_be_bought(candidates, vix_level):
         logger.info("\n" + "-" * 60)
         logger.info("Estimated position sizing (portfolio-level allocation):")
         
-        # Simple estimation
-        target_dollars = config.POSITION_SIZE_DOLLARS
-        total_target = target_dollars * min(len(candidates), config.MAX_POSITIONS)
+        total_target = position_size * num_positions
         
-        logger.info(f"Target per position: ${target_dollars:,.0f}")
-        logger.info(f"Total estimated allocation: ${total_target:,.0f}")
-        logger.info(f"Max positions allowed: {config.MAX_POSITIONS}")
+        logger.info(f"Position Size: ${position_size:,.2f} (account cash / {num_positions} positions)")
+        logger.info(f"Total Allocation: ${total_target:,.2f}")
+        logger.info(f"Remaining Cash: ${account_cash - total_target:,.2f}")
     
     logger.info("\n" + "=" * 60)
     logger.info("DRY RUN COMPLETE - No orders were placed")
@@ -180,17 +240,22 @@ def main():
     logger.info("=" * 60)
     
     # Step 1: Build universe
-    universe = test_universe_build()
+    universe, massive_data = test_universe_build()
     
     if not universe:
         logger.error("\nFAILED: Could not build universe - check API connections")
         return 1
     
     # Step 2: Calculate gaps
-    candidates, vix_level = test_gap_calculation(universe)
+    candidates, vix_level = test_gap_calculation(universe, massive_data)
+    
+    # Get Alpaca account cash for position sizing
+    alpaca = AlpacaDataClient()
+    account = alpaca.get_account()
+    account_cash = float(account.get("cash", 0)) if account else 100000.0  # Fallback for testing
     
     # Show results
-    show_what_would_be_bought(candidates, vix_level)
+    show_what_would_be_bought(candidates, vix_level, account_cash)
     
     # Summary
     logger.info("\n" + "=" * 60)

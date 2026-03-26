@@ -68,6 +68,12 @@ class GapCalculator:
 
         candidates = []
         adv_estimates = self.estimate_adv(snapshots)
+        
+        # Debug counters
+        missing_data = 0
+        low_adv = 0
+        gap_too_small = 0
+        gap_too_large = 0
 
         for symbol, data in snapshots.items():
             open_price = data.get("open")
@@ -77,17 +83,29 @@ class GapCalculator:
 
             # Skip if missing required data
             if not open_price or not prev_close:
+                missing_data += 1
                 continue
 
             # Check ADV filter
             if adv < min_adv:
+                low_adv += 1
+                # Log first few with GOOD GAPS but low ADV
+                test_gap = self.calculate_gap(open_price, prev_close)
+                if low_adv <= 5 and abs(test_gap) >= 3:
+                    logger.info(f"ADV reject (good gap): {symbol} - gap={test_gap:.1f}%, adv=${adv/1e6:.2f}M")
                 continue
 
             # Calculate gap
             gap_pct = self.calculate_gap(open_price, prev_close)
 
             # Check gap range
-            if not (self.min_gap <= gap_pct <= self.max_gap):
+            if gap_pct < self.min_gap:
+                gap_too_small += 1
+                continue
+            if gap_pct > self.max_gap:
+                gap_too_large += 1
+                if gap_too_large <= 3:
+                    logger.info(f"Gap too large: {symbol} - gap={gap_pct:.1f}% (max={self.max_gap}%)")
                 continue
 
             candidate = GapCandidate(
@@ -102,6 +120,10 @@ class GapCalculator:
 
         # Sort by gap percentage (descending)
         candidates.sort(key=lambda x: abs(x.gap_pct), reverse=True)
+        
+        # Debug summary
+        total = len(snapshots)
+        logger.info(f"Gap filter summary: {total} total, {missing_data} missing data, {low_adv} low ADV, {gap_too_small} gap too small, {gap_too_large} gap too large, {len(candidates)} passed")
 
         logger.info(f"Gap candidates: {len(candidates)} (gap {self.min_gap}%-{self.max_gap}%)")
         return candidates
