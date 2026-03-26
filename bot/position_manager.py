@@ -115,7 +115,7 @@ class PositionManager:
         url = f"{self.base_url}/v2/orders/{order_id}"
         start_time = datetime.now()
 
-        while (datetime.now() - start_time).seconds < max_wait:
+        while (datetime.now() - start_time).total_seconds() < max_wait:
             try:
                 response = self.session.get(url, timeout=10)
                 response.raise_for_status()
@@ -128,34 +128,46 @@ class PositionManager:
                 if status == "filled" and filled_qty > 0 and filled_avg_price:
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "filled"}
                 
-                # SAFER PATTERN: On partial fill, cancel immediately and re-read state
+                # SAFER PATTERN: On partial fill, cancel immediately and poll until terminal state
                 if status == "partially_filled" and filled_qty > 0 and filled_avg_price:
                     logger.warning(f"Order {order_id} partially filled: {filled_qty} shares - canceling residual immediately")
-                    self._cancel_order(order_id)
+                    cancel_success = self._cancel_order(order_id)
+                    if not cancel_success:
+                        logger.error(f"Failed to cancel order {order_id} - order may still be working, proceeding with caution")
                     
-                    # Re-read order state to get final filled quantity after cancellation
-                    time.sleep(0.3)  # Brief delay for cancellation to settle
-                    try:
-                        response = self.session.get(url, timeout=10)
-                        final_order = response.json()
-                        final_qty = float(final_order.get("filled_qty", filled_qty))
-                        final_price = final_order.get("filled_avg_price", filled_avg_price)
-                        final_status = final_order.get("status", "partially_filled")
-                        
-                        # If more filled during cancellation window, use that
-                        if final_qty > filled_qty:
-                            logger.info(f"Additional fill during cancellation: {final_qty - filled_qty} shares")
-                        
-                        return {
-                            "order_id": order_id, 
-                            "filled_qty": final_qty, 
-                            "filled_avg_price": float(final_price), 
-                            "status": "filled" if final_status == "filled" else "partially_filled"
-                        }
-                    except Exception as e:
-                        # If re-read fails, return what we had before cancellation
-                        logger.warning(f"Could not re-read order after cancellation: {e}")
-                        return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "partially_filled"}
+                    # Poll until order reaches terminal state (not just one re-read)
+                    terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
+                    poll_start = datetime.now()
+                    max_post_cancel_poll = 5  # Max 5 seconds of post-cancellation polling
+                    
+                    while (datetime.now() - poll_start).total_seconds() < max_post_cancel_poll:
+                        time.sleep(0.5)
+                        try:
+                            response = self.session.get(url, timeout=10)
+                            response.raise_for_status()
+                            final_order = response.json()
+                            final_status = final_order.get("status", "unknown")
+                            
+                            if final_status in terminal_states:
+                                final_qty = float(final_order.get("filled_qty", filled_qty))
+                                final_price = final_order.get("filled_avg_price", filled_avg_price)
+                                
+                                if final_qty > filled_qty:
+                                    logger.info(f"Additional fill during cancellation: {final_qty - filled_qty} shares")
+                                
+                                return {
+                                    "order_id": order_id, 
+                                    "filled_qty": final_qty, 
+                                    "filled_avg_price": float(final_price), 
+                                    "status": "filled" if final_status == "filled" else "partially_filled"
+                                }
+                        except Exception as e:
+                            logger.warning(f"Error polling after cancellation: {e}")
+                            break
+                    
+                    # If we exhausted polling without terminal state, return what we have
+                    logger.warning(f"Order {order_id} did not reach terminal state after cancellation - returning best known fill")
+                    return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "partially_filled"}
                 
                 if status in ("canceled", "expired", "rejected"):
                     # Return any fills even if order was canceled/rejected
@@ -171,18 +183,52 @@ class PositionManager:
                 logger.error(f"Error polling order {order_id}: {e}")
                 return None
 
-        # Timeout check - return partial fills if any, then cancel residual
+        # Timeout check - return partial fills if any, then cancel residual with polling
         try:
             response = self.session.get(url, timeout=10)
+            response.raise_for_status()
             order = response.json()
             filled_qty = float(order.get("filled_qty", 0))
             filled_avg_price = order.get("filled_avg_price")
             if filled_qty > 0 and filled_avg_price:
                 logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - canceling residual")
-                self._cancel_order(order_id)
+                cancel_success = self._cancel_order(order_id)
+                if not cancel_success:
+                    logger.error(f"Failed to cancel order {order_id} after timeout - order may still be working")
+                
+                # Same post-cancel polling as partial_filled branch
+                terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
+                poll_start = datetime.now()
+                max_poll = 5
+                
+                while (datetime.now() - poll_start).total_seconds() < max_poll:
+                    time.sleep(0.5)
+                    try:
+                        response = self.session.get(url, timeout=10)
+                        response.raise_for_status()
+                        final_order = response.json()
+                        final_status = final_order.get("status", "unknown")
+                        
+                        if final_status in terminal_states:
+                            final_qty = float(final_order.get("filled_qty", filled_qty))
+                            final_price = final_order.get("filled_avg_price", filled_avg_price)
+                            
+                            if final_qty > filled_qty:
+                                logger.info(f"Additional fill during timeout cancellation: {final_qty - filled_qty} shares")
+                            
+                            return {
+                                "order_id": order_id, 
+                                "filled_qty": final_qty, 
+                                "filled_avg_price": float(final_price), 
+                                "status": "filled" if final_status == "filled" else "timeout_with_fill"
+                            }
+                    except requests.exceptions.RequestException as e:
+                        logger.warning(f"Error polling after timeout cancellation: {e}")
+                        break
+                
                 return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
-        except:
-            pass
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Timeout check request failed for {order_id}: {e}")
             
         logger.warning(f"Order {order_id} did not fill within {max_wait} seconds")
         return None
@@ -206,7 +252,7 @@ class PositionManager:
             response.raise_for_status()
             account_data = response.json()
             cash = float(account_data.get("cash", equity))
-        except:
+        except requests.exceptions.RequestException:
             cash = equity
         
         # CRITICAL FIX: Track remaining cash and slots dynamically
@@ -394,7 +440,9 @@ class PositionManager:
     def _exit_position(self, symbol: str, reason: str):
         """
         Exit a position with market order.
-        CRITICAL FIX: Handles partial fills by reducing quantity and canceling residual order.
+        Order state finalization (cancellation, polling for terminal state) is handled 
+        inside get_order_fill(). This method receives the final fill result and updates
+        local position state accordingly.
         """
         position = self.positions.get(symbol)
         if not position:
@@ -415,10 +463,6 @@ class PositionManager:
         
         pnl = (exit_price - position.entry_price) * filled_qty
         pnl_pct = ((exit_price / position.entry_price) - 1) * 100
-
-        # CRITICAL FIX: Handle partial exits - cancel residual order first
-        if "partial" in fill_status or "timeout" in fill_status:
-            self._cancel_order(order_id)
 
         remaining = position.quantity - filled_qty
         
