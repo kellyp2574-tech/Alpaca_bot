@@ -85,6 +85,25 @@ class PositionManager:
         quantity = int(position_dollars / current_price)
         return max(0, quantity)
 
+    def _cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order. Returns True if successfully canceled or already complete."""
+        url = f"{self.base_url}/v2/orders/{order_id}"
+        try:
+            response = self.session.delete(url, timeout=10)
+            if response.status_code in (200, 204):
+                logger.info(f"Canceled order {order_id}")
+                return True
+            elif response.status_code == 422:
+                # Order already filled or canceled
+                logger.debug(f"Order {order_id} already complete (422)")
+                return True
+            else:
+                logger.warning(f"Failed to cancel order {order_id}: HTTP {response.status_code}")
+                return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error canceling order {order_id}: {e}")
+            return False
+
     def get_order_fill(self, order_id: str, max_wait: int = 30) -> Optional[dict]:
         """
         Poll order until filled, partially filled, or timeout.
@@ -126,14 +145,16 @@ class PositionManager:
                 logger.error(f"Error polling order {order_id}: {e}")
                 return None
 
-        # Timeout check - return partial fills if any
+        # Timeout check - return partial fills if any, then cancel residual
         try:
             response = self.session.get(url, timeout=10)
             order = response.json()
             filled_qty = float(order.get("filled_qty", 0))
             filled_avg_price = order.get("filled_avg_price")
             if filled_qty > 0 and filled_avg_price:
-                logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - using partial")
+                logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - canceling residual")
+                # Cancel any remaining unfilled portion
+                self._cancel_order(order_id)
                 return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
         except:
             pass
@@ -142,7 +163,10 @@ class PositionManager:
         return None
 
     def enter_positions(self, candidates: List, vix_level: float) -> List[Position]:
-        """Enter market orders with equal capital deployment."""
+        """
+        Enter market orders with equal capital deployment.
+        CRITICAL FIX: Dynamic cash/slots recomputation after each partial fill.
+        """
         equity = self.get_account_equity()
         if equity <= 0:
             logger.error("Cannot enter positions: no equity")
@@ -160,20 +184,30 @@ class PositionManager:
         except:
             cash = equity
         
-        num_positions = min(len(candidates), config.MAX_POSITIONS)
-        selected_candidates = candidates[:num_positions]
-        target_per_position = cash / num_positions if num_positions > 0 else 0
+        # CRITICAL FIX: Track remaining cash and slots dynamically
+        remaining_cash = cash
+        remaining_slots = min(len(candidates), config.MAX_POSITIONS)
+        selected_candidates = candidates[:remaining_slots]
         
-        logger.info(f"Portfolio plan: {num_positions} positions, ${target_per_position:,.2f} per position")
+        logger.info(f"Portfolio plan: {remaining_slots} positions, starting with ${cash:,.2f} cash")
         
         entered = []
         total_allocated = 0.0
         
-        for candidate in selected_candidates:
+        for i, candidate in enumerate(selected_candidates):
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
+            # CRITICAL FIX: Recompute target per position dynamically
+            slots_left = remaining_slots - len(entered)
+            if slots_left <= 0:
+                logger.info(f"No slots remaining, skipping remaining candidates")
+                break
+                
+            target_per_position = remaining_cash / slots_left if slots_left > 0 else 0
+            
             if target_per_position <= 0:
+                logger.debug(f"Skipping {symbol}: zero target allocation")
                 continue
             
             quantity = self.calculate_position_size(target_per_position, candidate.adv_estimate, expected_price)
@@ -200,6 +234,7 @@ class PositionManager:
             
             actual_allocated = actual_price * actual_qty
             total_allocated += actual_allocated
+            remaining_cash -= actual_allocated  # CRITICAL: Update remaining cash
             
             position = Position(
                 symbol=symbol,
@@ -214,13 +249,17 @@ class PositionManager:
             self.positions[symbol] = position
             entered.append(position)
             
-            slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
+            # CRITICAL FIX: Cancel residual order if partial fill
             if "partial" in fill_status or "timeout" in fill_status:
-                logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (PARTIAL FILL - {fill_status})")
+                self._cancel_order(order_id)
+                logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, PARTIAL FILL - {fill_status}) [VIX={vix_level:.1f}]")
             else:
-                logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (slippage: {slippage:+.2f}%) [VIX={vix_level:.1f}]")
+                slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
+                logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, slippage: {slippage:+.2f}%) [VIX={vix_level:.1f}]")
+            
+            logger.debug(f"Remaining cash: ${remaining_cash:,.2f}, slots left: {slots_left - 1}")
         
-        logger.info(f"Entry complete: {len(entered)} positions, total allocated=${total_allocated:,.2f}")
+        logger.info(f"Entry complete: {len(entered)} positions, total allocated=${total_allocated:,.2f}, remaining cash=${remaining_cash:,.2f}")
         return entered
 
     def _submit_market_order(self, symbol: str, quantity: int, side: str) -> Optional[str]:
@@ -330,7 +369,7 @@ class PositionManager:
     def _exit_position(self, symbol: str, reason: str):
         """
         Exit a position with market order.
-        CRITICAL FIX: Handles partial fills by reducing quantity instead of deleting.
+        CRITICAL FIX: Handles partial fills by reducing quantity and canceling residual order.
         """
         position = self.positions.get(symbol)
         if not position:
@@ -352,7 +391,10 @@ class PositionManager:
         pnl = (exit_price - position.entry_price) * filled_qty
         pnl_pct = ((exit_price / position.entry_price) - 1) * 100
 
-        # CRITICAL FIX: Handle partial exits - reduce quantity instead of deleting
+        # CRITICAL FIX: Handle partial exits - cancel residual order first
+        if "partial" in fill_status or "timeout" in fill_status:
+            self._cancel_order(order_id)
+
         remaining = position.quantity - filled_qty
         
         if remaining > 0:

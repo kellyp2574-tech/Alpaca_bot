@@ -266,8 +266,9 @@ class GapMomentumBot:
             if massive_data.get("prev_close"):
                 merged[symbol]["prev_close"] = massive_data["prev_close"]
             
-            if not merged[symbol].get("price") and massive_data.get("price"):
-                merged[symbol]["price"] = massive_data["price"]
+            # Fallback: Use Massive price as last_price if Alpaca doesn't have it
+            if not merged[symbol].get("last_price") and massive_data.get("price"):
+                merged[symbol]["last_price"] = massive_data["price"]
 
         logger.info(f"Merged Massive data into {len(merged)} Alpaca snapshots")
         return merged
@@ -377,9 +378,11 @@ class GapMomentumBot:
         self._save_pre_trade_state()
 
     def _save_pre_trade_state(self):
-        """Save universe, candidates, and Massive snapshots for recovery"""
+        """Save universe, candidates, and Massive snapshots for recovery with date"""
         pre_trade_file = os.path.join(config.STATE_DIR, "pre_trade_state.json")
+        today = datetime.now().strftime("%Y-%m-%d")
         state = {
+            "date": today,
             "universe": self.universe,
             "massive_snapshots": self.massive_snapshots,
         }
@@ -402,13 +405,22 @@ class GapMomentumBot:
             logger.error(f"Error saving pre-trade state: {e}")
 
     def _load_pre_trade_state(self) -> Optional[dict]:
-        """Load universe and Massive data for recovery"""
+        """Load universe and Massive data for recovery with date validation"""
         pre_trade_file = os.path.join(config.STATE_DIR, "pre_trade_state.json")
         if not os.path.exists(pre_trade_file):
             return None
         try:
             with open(pre_trade_file, 'r') as f:
-                return json.load(f)
+                state = json.load(f)
+            
+            # Validate date - don't use stale pre-trade state
+            today = datetime.now().strftime("%Y-%m-%d")
+            state_date = state.get("date")
+            if state_date != today:
+                logger.warning(f"Pre-trade state from {state_date} is stale (today: {today}) - ignoring")
+                return None
+            
+            return state
         except Exception as e:
             logger.error(f"Error loading pre-trade state: {e}")
             return None
