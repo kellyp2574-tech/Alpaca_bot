@@ -148,3 +148,47 @@ class StateManager:
                 json.dump(logs, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving daily log: {e}")
+
+    def save_pre_trade_state(self, universe: List[str], massive_snapshots: Dict[str, dict], candidates: List = None):
+        """Save universe and Massive data for recovery (call after Step 1/2)"""
+        pre_trade_file = self.positions_file.replace("positions.json", "pre_trade_state.json")
+        state = {
+            "universe": universe,
+            "massive_snapshots": massive_snapshots,
+        }
+        if candidates:
+            # Convert GapCandidate objects to serializable dicts
+            state["candidates"] = [
+                {
+                    "symbol": c.symbol,
+                    "gap_pct": c.gap_pct,
+                    "open_price": c.open_price,
+                    "prev_close": c.prev_close,
+                    "adv_estimate": c.adv_estimate,
+                    "price": c.price,
+                }
+                for c in candidates
+            ]
+        try:
+            with open(pre_trade_file, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving pre-trade state: {e}")
+
+    def load_pre_trade_state(self) -> Optional[dict]:
+        """Load universe and Massive data for recovery"""
+        pre_trade_file = self.positions_file.replace("positions.json", "pre_trade_state.json")
+        if not os.path.exists(pre_trade_file):
+            return None
+        try:
+            with open(pre_trade_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading pre-trade state: {e}")
+            return None
+
+    def clear_pre_trade_state(self):
+        """Clear pre-trade state file"""
+        pre_trade_file = self.positions_file.replace("positions.json", "pre_trade_state.json")
+        if os.path.exists(pre_trade_file):
+            os.remove(pre_trade_file)
