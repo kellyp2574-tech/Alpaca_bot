@@ -1,5 +1,6 @@
 """Position manager for gap momentum strategy with VIX-conditioned exits"""
 import logging
+import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
@@ -107,7 +108,9 @@ class PositionManager:
     def get_order_fill(self, order_id: str, max_wait: int = 30) -> Optional[dict]:
         """
         Poll order until filled, partially filled, or timeout.
-        CRITICAL FIX: Returns partial fill data even if order didn't fully fill.
+        SAFER PATTERN: On partial fill, cancel residual immediately inside this function,
+        then re-read order state to return final filled quantity. This prevents the race
+        window where remaining shares could fill before caller cancels.
         """
         url = f"{self.base_url}/v2/orders/{order_id}"
         start_time = datetime.now()
@@ -125,10 +128,34 @@ class PositionManager:
                 if status == "filled" and filled_qty > 0 and filled_avg_price:
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "filled"}
                 
-                # CRITICAL: Handle partial fills - return what we have
+                # SAFER PATTERN: On partial fill, cancel immediately and re-read state
                 if status == "partially_filled" and filled_qty > 0 and filled_avg_price:
-                    logger.warning(f"Order {order_id} partially filled: {filled_qty} shares")
-                    return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "partially_filled"}
+                    logger.warning(f"Order {order_id} partially filled: {filled_qty} shares - canceling residual immediately")
+                    self._cancel_order(order_id)
+                    
+                    # Re-read order state to get final filled quantity after cancellation
+                    time.sleep(0.3)  # Brief delay for cancellation to settle
+                    try:
+                        response = self.session.get(url, timeout=10)
+                        final_order = response.json()
+                        final_qty = float(final_order.get("filled_qty", filled_qty))
+                        final_price = final_order.get("filled_avg_price", filled_avg_price)
+                        final_status = final_order.get("status", "partially_filled")
+                        
+                        # If more filled during cancellation window, use that
+                        if final_qty > filled_qty:
+                            logger.info(f"Additional fill during cancellation: {final_qty - filled_qty} shares")
+                        
+                        return {
+                            "order_id": order_id, 
+                            "filled_qty": final_qty, 
+                            "filled_avg_price": float(final_price), 
+                            "status": "filled" if final_status == "filled" else "partially_filled"
+                        }
+                    except Exception as e:
+                        # If re-read fails, return what we had before cancellation
+                        logger.warning(f"Could not re-read order after cancellation: {e}")
+                        return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "partially_filled"}
                 
                 if status in ("canceled", "expired", "rejected"):
                     # Return any fills even if order was canceled/rejected
@@ -138,7 +165,6 @@ class PositionManager:
                     logger.error(f"Order {order_id} failed with status: {status}")
                     return None
 
-                import time
                 time.sleep(0.5)
 
             except requests.exceptions.RequestException as e:
@@ -153,7 +179,6 @@ class PositionManager:
             filled_avg_price = order.get("filled_avg_price")
             if filled_qty > 0 and filled_avg_price:
                 logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - canceling residual")
-                # Cancel any remaining unfilled portion
                 self._cancel_order(order_id)
                 return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
         except:
@@ -249,13 +274,13 @@ class PositionManager:
             self.positions[symbol] = position
             entered.append(position)
             
-            # CRITICAL FIX: Cancel residual order if partial fill
-            if "partial" in fill_status or "timeout" in fill_status:
-                self._cancel_order(order_id)
-                logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, PARTIAL FILL - {fill_status}) [VIX={vix_level:.1f}]")
-            else:
+            # SAFER PATTERN: get_order_fill() already cancels residual on partial fill,
+            # so we just need to log appropriately
+            if fill_status == "filled":
                 slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
                 logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, slippage: {slippage:+.2f}%) [VIX={vix_level:.1f}]")
+            else:
+                logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, PARTIAL FILL - {fill_status}) [VIX={vix_level:.1f}]")
             
             logger.debug(f"Remaining cash: ${remaining_cash:,.2f}, slots left: {slots_left - 1}")
         
