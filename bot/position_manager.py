@@ -142,14 +142,10 @@ class PositionManager:
         self, candidates: List, vix_level: float
     ) -> List[Position]:
         """
-        Enter market orders at 9:30 AM open with portfolio-level allocation.
+        Enter market orders at 9:30 AM open with equal capital deployment.
         
-        Portfolio construction process:
-        1. Classify all candidates into price buckets (pre-trade)
-        2. Calculate weighted target allocations based on multipliers
-        3. Apply low bucket daily cap and redistribute excess to other buckets
-        4. Apply liquidity caps per position
-        5. Execute all orders (path-independent)
+        Strategy: Deploy equal capital across all qualifying trades.
+        Position size = (Account Cash / Number of candidates) capped at 0.3% ADV.
         
         Returns list of successfully entered positions.
         """
@@ -161,116 +157,39 @@ class PositionManager:
         if not candidates:
             return []
         
-        # STEP 1: Classify all candidates into buckets (pre-trade classification)
-        bucketed_candidates = {"low": [], "mid": [], "high": []}
-        for c in candidates:
-            price = c.open_price
-            if price < config.PRICE_BUCKET_LOW_MAX:
-                bucketed_candidates["low"].append(c)
-            elif price < config.PRICE_BUCKET_MID_MAX:
-                bucketed_candidates["mid"].append(c)
-            else:
-                bucketed_candidates["high"].append(c)
+        # Get actual cash available for trading
+        url = f"{self.base_url}/v2/account"
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            account_data = response.json()
+            cash = float(account_data.get("cash", equity))  # Use cash, not equity
+        except:
+            cash = equity  # Fallback to equity if cash fetch fails
         
-        # Calculate total multipliers per bucket
-        bucket_multipliers = {
-            "low": len(bucketed_candidates["low"]) * config.PRICE_BUCKET_LOW_MULTIPLIER,
-            "mid": len(bucketed_candidates["mid"]) * config.PRICE_BUCKET_MID_MULTIPLIER,
-            "high": len(bucketed_candidates["high"]) * config.PRICE_BUCKET_HIGH_MULTIPLIER
-        }
-        total_multiplier_sum = sum(bucket_multipliers.values())
+        # Limit to max positions (user set to 100)
+        num_positions = min(len(candidates), config.MAX_POSITIONS)
+        selected_candidates = candidates[:num_positions]
         
-        if total_multiplier_sum == 0:
-            logger.error("No valid candidates with multipliers")
-            return []
+        # Equal capital deployment: cash / number of positions
+        target_per_position = cash / num_positions if num_positions > 0 else 0
         
-        # STEP 2: Calculate initial target allocations
-        # Deploy up to 100% of equity (no Kelly cap)
-        deployable_capital = equity
+        logger.info(f"Portfolio plan: {num_positions} positions, ${target_per_position:,.2f} per position (from ${cash:,.2f} cash)")
         
-        position_plan = []  # List of (candidate, target_dollars, bucket)
-        bucket_target = {"low": 0.0, "mid": 0.0, "high": 0.0}
-        
-        for bucket, bucket_candidates in bucketed_candidates.items():
-            if bucket == "low":
-                multiplier = config.PRICE_BUCKET_LOW_MULTIPLIER
-            elif bucket == "mid":
-                multiplier = config.PRICE_BUCKET_MID_MULTIPLIER
-            else:
-                multiplier = config.PRICE_BUCKET_HIGH_MULTIPLIER
-            
-            for c in bucket_candidates:
-                # Weighted allocation: (multiplier / total_sum) * deployable_capital
-                target_dollars = (multiplier / total_multiplier_sum) * deployable_capital
-                position_plan.append((c, target_dollars, bucket))
-                bucket_target[bucket] += target_dollars
-        
-        # STEP 3: Apply low bucket daily cap and redistribute excess
-        low_bucket_cap = equity * config.PRICE_BUCKET_LOW_EQUITY_CAP
-        if bucket_target["low"] > low_bucket_cap:
-            # Low bucket exceeds cap - scale down and redistribute
-            excess = bucket_target["low"] - low_bucket_cap
-            bucket_target["low"] = low_bucket_cap
-            
-            # Redistribute excess to mid and high proportionally
-            mid_high_total = bucket_multipliers["mid"] + bucket_multipliers["high"]
-            if mid_high_total > 0:
-                mid_ratio = bucket_multipliers["mid"] / mid_high_total
-                high_ratio = bucket_multipliers["high"] / mid_high_total
-                bucket_target["mid"] += excess * mid_ratio
-                bucket_target["high"] += excess * high_ratio
-            
-            # Recalculate individual position targets
-            new_plan = []
-            for c, old_target, bucket in position_plan:
-                if bucket == "low":
-                    # Scale down low bucket positions proportionally
-                    if bucket_target["low"] > 0:
-                        scale = bucket_target["low"] / (bucket_multipliers["low"] / total_multiplier_sum * deployable_capital)
-                        new_target = old_target * scale
-                    else:
-                        new_target = 0
-                elif bucket == "mid":
-                    # Scale up mid bucket positions
-                    if bucket_multipliers["mid"] > 0:
-                        base_target = (config.PRICE_BUCKET_MID_MULTIPLIER / total_multiplier_sum) * deployable_capital
-                        scale = bucket_target["mid"] / (bucket_multipliers["mid"] / total_multiplier_sum * deployable_capital)
-                        new_target = base_target * scale
-                    else:
-                        new_target = old_target
-                else:  # high
-                    # Scale up high bucket positions
-                    if bucket_multipliers["high"] > 0:
-                        base_target = (config.PRICE_BUCKET_HIGH_MULTIPLIER / total_multiplier_sum) * deployable_capital
-                        scale = bucket_target["high"] / (bucket_multipliers["high"] / total_multiplier_sum * deployable_capital)
-                        new_target = base_target * scale
-                    else:
-                        new_target = old_target
-                
-                new_plan.append((c, new_target, bucket))
-            
-            position_plan = new_plan
-            logger.info(f"Low bucket capped at ${low_bucket_cap:,.0f}, excess ${excess:,.0f} redistributed to mid/high")
-        
-        logger.info(f"Portfolio plan: {len(position_plan)} positions, "
-                   f"low=${bucket_target['low']:,.0f}, mid=${bucket_target['mid']:,.0f}, high=${bucket_target['high']:,.0f}, "
-                   f"total=${sum(bucket_target.values()):,.0f}")
-        
-        # STEP 4 & 5: Execute position plan
         entered = []
-        bucket_allocated = {"low": 0.0, "mid": 0.0, "high": 0.0}
+        total_allocated = 0.0
         
-        for candidate, target_dollars, bucket in position_plan:
+        for candidate in selected_candidates:
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
-            if target_dollars <= 0:
+            if target_per_position <= 0:
                 logger.debug(f"Skipping {symbol}: zero target allocation")
                 continue
             
-            # Calculate final size with liquidity cap
+            # Calculate final size with liquidity cap (max 0.3% of ADV)
             quantity = self.calculate_position_size(
-                target_dollars,
+                target_per_position,
                 candidate.adv_estimate,
                 expected_price
             )
@@ -299,8 +218,8 @@ class PositionManager:
                 logger.error(f"No shares filled for {symbol}")
                 continue
             
-            # Track allocation using pre-trade bucket (for consistency)
-            bucket_allocated[bucket] += actual_price * actual_qty
+            actual_allocated = actual_price * actual_qty
+            total_allocated += actual_allocated
             
             position = Position(
                 symbol=symbol,
@@ -316,13 +235,10 @@ class PositionManager:
             entered.append(position)
             
             slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
-            logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} ({bucket} bucket, slippage: {slippage:+.2f}%, gap: {candidate.gap_pct:.1f}%) [VIX={vix_level:.1f}]")
+            logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, slippage: {slippage:+.2f}%, gap: {candidate.gap_pct:.1f}%) [VIX={vix_level:.1f}]")
         
         # Log summary
-        total_deployed = sum(bucket_allocated.values())
-        logger.info(f"Entry complete: {len(entered)} positions, "
-                   f"low=${bucket_allocated['low']:,.0f}, mid=${bucket_allocated['mid']:,.0f}, high=${bucket_allocated['high']:,.0f}, "
-                   f"total=${total_deployed:,.0f} ({total_deployed/equity*100:.1f}% of equity)")
+        logger.info(f"Entry complete: {len(entered)} positions, total allocated=${total_allocated:,.2f} ({total_allocated/cash*100:.1f}% of cash)")
         
         return entered
 
