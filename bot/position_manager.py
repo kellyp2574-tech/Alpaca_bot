@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import requests
 from bot import config
 from bot.market_data import AlpacaDataClient
@@ -27,6 +27,16 @@ class Position:
     current_price: float = field(default=0.0)
 
 
+@dataclass
+class ExitSlicerState:
+    """Tracks state for a time-based exit slicer"""
+    symbol: str
+    slices_remaining: int
+    next_slice_time: datetime
+    seconds_between_slices: int
+    reason: str
+
+
 class PositionManager:
     """Manages positions, entries, and VIX-conditioned exits"""
 
@@ -43,7 +53,7 @@ class PositionManager:
             "APCA-API-SECRET-KEY": self.secret_key,
         })
 
-        self.timed_exit_scheduled: Dict[str, datetime] = {}
+        self.exit_slicers: Dict[str, ExitSlicerState] = {}
 
     def load_positions(self, saved_positions: Dict):
         """Restore positions from saved state"""
@@ -105,12 +115,16 @@ class PositionManager:
             logger.error(f"Error canceling order {order_id}: {e}")
             return False
 
-    def get_order_fill(self, order_id: str, max_wait: int = 30) -> Optional[dict]:
+    def get_order_fill(self, order_id: str, max_wait: int = 30, allow_partial_cancel: bool = True) -> Optional[dict]:
         """
         Poll order until filled, partially filled, or timeout.
         SAFER PATTERN: On partial fill, cancel residual immediately inside this function,
         then re-read order state to return final filled quantity. This prevents the race
         window where remaining shares could fill before caller cancels.
+        
+        Args:
+            allow_partial_cancel: If False (for MOO orders), don't aggressively cancel
+                on partial fills - let the order ride to terminal state.
         """
         url = f"{self.base_url}/v2/orders/{order_id}"
         start_time = datetime.now()
@@ -128,8 +142,14 @@ class PositionManager:
                 if status == "filled" and filled_qty > 0 and filled_avg_price:
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "filled"}
                 
-                # SAFER PATTERN: On partial fill, cancel immediately and poll until terminal state
+                # On partial fill, optionally cancel immediately and poll until terminal state
                 if status == "partially_filled" and filled_qty > 0 and filled_avg_price:
+                    if not allow_partial_cancel:
+                        # For MOO orders: don't cancel aggressively, just wait for terminal state
+                        logger.info(f"Order {order_id} partially filled: {filled_qty} shares - waiting for terminal state (allow_partial_cancel=False)")
+                        time.sleep(0.5)
+                        continue
+                    
                     logger.warning(f"Order {order_id} partially filled: {filled_qty} shares - canceling residual immediately")
                     cancel_success = self._cancel_order(order_id)
                     if not cancel_success:
@@ -183,7 +203,7 @@ class PositionManager:
                 logger.error(f"Error polling order {order_id}: {e}")
                 return None
 
-        # Timeout check - return partial fills if any, then cancel residual with polling
+        # Timeout check - optionally return partial fills if any, then cancel residual with polling
         try:
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
@@ -191,6 +211,11 @@ class PositionManager:
             filled_qty = float(order.get("filled_qty", 0))
             filled_avg_price = order.get("filled_avg_price")
             if filled_qty > 0 and filled_avg_price:
+                if not allow_partial_cancel:
+                    # For MOO orders: don't cancel on timeout, just return what we have
+                    logger.info(f"Order {order_id} timeout with {filled_qty} shares filled (allow_partial_cancel=False)")
+                    return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
+                
                 logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - canceling residual")
                 cancel_success = self._cancel_order(order_id)
                 if not cancel_success:
@@ -233,10 +258,11 @@ class PositionManager:
         logger.warning(f"Order {order_id} did not fill within {max_wait} seconds")
         return None
 
-    def enter_positions(self, candidates: List, vix_level: float) -> List[Position]:
+    def enter_positions_moo(self, candidates: List, vix_level: float) -> List[Position]:
         """
-        Enter market orders with equal capital deployment.
-        CRITICAL FIX: Dynamic cash/slots recomputation after each partial fill.
+        Enter MOO (Market On Open) orders with two-pass process:
+        1. Submit all orders before 9:28 cutoff
+        2. Poll fills after 9:30 auction
         """
         equity = self.get_account_equity()
         if equity <= 0:
@@ -255,44 +281,52 @@ class PositionManager:
         except requests.exceptions.RequestException:
             cash = equity
         
-        # CRITICAL FIX: Track remaining cash and slots dynamically
-        remaining_cash = cash
-        remaining_slots = min(len(candidates), config.MAX_POSITIONS)
-        selected_candidates = candidates[:remaining_slots]
+        # FIXED: Use stable per-slot budget instead of dynamic remaining_cash
+        planned_slots = min(len(candidates), config.MAX_POSITIONS)
+        per_position_budget = cash / planned_slots if planned_slots > 0 else 0
+        selected_candidates = candidates[:planned_slots]
         
-        logger.info(f"Portfolio plan: {remaining_slots} positions, starting with ${cash:,.2f} cash")
+        logger.info(f"MOO Portfolio plan: {planned_slots} positions, ${cash:,.2f} cash, ${per_position_budget:,.2f} per position")
         
-        entered = []
-        total_allocated = 0.0
+        # PHASE 1: Submit all MOO orders before cutoff
+        submitted = []  # List of (candidate, expected_qty, order_id)
         
         for i, candidate in enumerate(selected_candidates):
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
-            # CRITICAL FIX: Recompute target per position dynamically
-            slots_left = remaining_slots - len(entered)
-            if slots_left <= 0:
-                logger.info(f"No slots remaining, skipping remaining candidates")
-                break
-                
-            target_per_position = remaining_cash / slots_left if slots_left > 0 else 0
-            
-            if target_per_position <= 0:
-                logger.debug(f"Skipping {symbol}: zero target allocation")
+            # Use fixed budget per position (stable for auction orders)
+            if per_position_budget <= 0:
+                logger.debug(f"Skipping {symbol}: zero budget")
                 continue
             
-            quantity = self.calculate_position_size(target_per_position, candidate.adv_estimate, expected_price)
+            quantity = self.calculate_position_size(per_position_budget, candidate.adv_estimate, expected_price)
             if quantity <= 0:
                 logger.warning(f"Skipping {symbol}: liquidity cap prevents allocation")
                 continue
             
-            order_id = self._submit_market_order(symbol, quantity, "buy")
+            # Submit MOO order
+            order_id = self._submit_moo_order(symbol, quantity, "buy")
             if not order_id:
                 continue
             
-            fill = self.get_order_fill(order_id, max_wait=30)
+            submitted.append((candidate, quantity, order_id))
+            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares")
+        
+        logger.info(f"MOO submission phase complete: {len(submitted)} orders submitted")
+        
+        # PHASE 2: Poll fills for all submitted orders
+        entered = []
+        total_allocated = 0.0
+        
+        for candidate, expected_qty, order_id in submitted:
+            symbol = candidate.symbol
+            expected_price = candidate.open_price
+            
+            # MOO orders sit until 9:30 auction - use longer timeout (5 min), don't aggressively cancel
+            fill = self.get_order_fill(order_id, max_wait=300, allow_partial_cancel=False)
             if not fill:
-                logger.error(f"Failed to get fill for {symbol}")
+                logger.error(f"MOO fill failed for {symbol} (order_id={order_id})")
                 continue
             
             actual_price = fill["filled_avg_price"]
@@ -305,7 +339,6 @@ class PositionManager:
             
             actual_allocated = actual_price * actual_qty
             total_allocated += actual_allocated
-            remaining_cash -= actual_allocated  # CRITICAL: Update remaining cash
             
             position = Position(
                 symbol=symbol,
@@ -320,21 +353,20 @@ class PositionManager:
             self.positions[symbol] = position
             entered.append(position)
             
-            # SAFER PATTERN: get_order_fill() already cancels residual on partial fill,
-            # so we just need to log appropriately
             if fill_status == "filled":
-                slippage = ((actual_price / expected_price) - 1) * 100 if expected_price > 0 else 0
-                logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, slippage: {slippage:+.2f}%) [VIX={vix_level:.1f}]")
+                # slippage = (fill_price - expected_price) / expected_price
+                slippage = ((actual_price - expected_price) / expected_price) if expected_price > 0 else 0
+                slippage_bps = slippage * 10000  # convert to basis points for readability
+                logger.info(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (expected: {expected_price:.2f}, slippage: {slippage:+.4f} / {slippage_bps:+.0f}bps vs Massive open proxy) [VIX={vix_level:.1f}]")
             else:
                 logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, PARTIAL FILL - {fill_status}) [VIX={vix_level:.1f}]")
-            
-            logger.debug(f"Remaining cash: ${remaining_cash:,.2f}, slots left: {slots_left - 1}")
         
-        logger.info(f"Entry complete: {len(entered)} positions, total allocated=${total_allocated:,.2f}, remaining cash=${remaining_cash:,.2f}")
+        remaining_cash = cash - total_allocated
+        logger.info(f"MOO entry complete: {len(entered)}/{len(submitted)} filled, total=${total_allocated:,.2f}, remaining=${remaining_cash:,.2f}")
         return entered
 
     def _submit_market_order(self, symbol: str, quantity: int, side: str) -> Optional[str]:
-        """Submit market order to Alpaca"""
+        """Submit regular market order (day) for exits"""
         url = f"{self.base_url}/v2/orders"
         order_data = {
             "symbol": symbol,
@@ -348,10 +380,31 @@ class PositionManager:
             response.raise_for_status()
             data = response.json()
             order_id = data.get("id")
-            logger.info(f"Order submitted: {symbol} {side} {quantity} (ID: {order_id})")
+            logger.info(f"Market order submitted: {symbol} {side} {quantity} (ID: {order_id})")
             return order_id
         except requests.exceptions.RequestException as e:
-            logger.error(f"Order error for {symbol}: {e}")
+            logger.error(f"Market order error for {symbol}: {e}")
+            return None
+
+    def _submit_moo_order(self, symbol: str, quantity: int, side: str) -> Optional[str]:
+        """Submit Market On Open (MOO) order to Alpaca for auction execution"""
+        url = f"{self.base_url}/v2/orders"
+        order_data = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": side,
+            "type": "market",
+            "time_in_force": "opg",  # MOO - executes at market open auction
+        }
+        try:
+            response = self.session.post(url, json=order_data, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            logger.info(f"MOO order submitted: {symbol} {side} {quantity} (ID: {order_id}) - will execute at 9:30 open")
+            return order_id
+        except requests.exceptions.RequestException as e:
+            logger.error(f"MOO order error for {symbol}: {e}")
             return None
 
     def update_positions(self):
@@ -391,9 +444,10 @@ class PositionManager:
         return current_prices
 
     def check_exits(self, current_time: time, vix_level: float, current_prices: Dict[str, float]) -> List[str]:
-        """Check if positions should be exited based on trailing stops or time"""
+        """Check if positions should be exited based on trailing stops (full) or time (sliced)"""
         exited = []
 
+        # Determine exit window based on VIX regime
         if vix_level < config.VIX_LOW_THRESHOLD:
             target_exit = datetime.strptime(config.EXIT_TIME_LOW_VIX, "%H:%M").time()
         elif vix_level > config.VIX_HIGH_THRESHOLD:
@@ -405,37 +459,115 @@ class PositionManager:
         exit_window_start = (target_dt - timedelta(minutes=1)).time()
         exit_window_end = (target_dt + timedelta(minutes=1)).time()
 
-        for symbol, position in list(self.positions.items()):
-            should_exit = False
-            exit_reason = ""
+        current_dt = datetime.combine(datetime.today(), current_time)
 
+        for symbol, position in list(self.positions.items()):
+            # TRAILING STOP: Full instant exit (no slicing)
             if config.VIX_LOW_THRESHOLD <= vix_level <= config.VIX_HIGH_THRESHOLD:
                 if position.is_trailing_active and position.trailing_stop_price > 0:
                     current_price = current_prices.get(symbol, position.current_price)
                     if current_price and current_price <= position.trailing_stop_price:
-                        should_exit = True
-                        exit_reason = f"trailing_stop"
+                        self._exit_position(symbol, "trailing_stop")
+                        exited.append(symbol)
+                        self.exit_slicers.pop(symbol, None)  # Cancel any active slicer
+                        continue
 
-            if not should_exit:
-                if exit_window_start <= current_time <= exit_window_end:
-                    if symbol not in self.timed_exit_scheduled:
-                        stagger_seconds = sum(ord(c) for c in symbol) % 120
-                        target_dt = datetime.combine(datetime.today(), exit_window_start)
-                        scheduled_time = target_dt + timedelta(seconds=stagger_seconds)
-                        self.timed_exit_scheduled[symbol] = scheduled_time
+            # TIMED EXIT: Sliced gradual exit
+            in_exit_window = exit_window_start <= current_time <= exit_window_end
+            has_active_slicer = symbol in self.exit_slicers
 
-                    scheduled = self.timed_exit_scheduled.get(symbol)
-                    current_dt = datetime.combine(datetime.today(), current_time)
-                    if scheduled and current_dt >= scheduled:
-                        should_exit = True
-                        exit_reason = f"time_exit (VIX={vix_level:.1f})"
+            if in_exit_window or has_active_slicer:
+                # Start slicer if not already active and we're in the window
+                if not has_active_slicer and in_exit_window:
+                    self._start_exit_slicer(symbol, current_time, vix_level, f"time_exit (VIX={vix_level:.1f})")
 
-            if should_exit:
-                self._exit_position(symbol, exit_reason)
-                exited.append(symbol)
-                self.timed_exit_scheduled.pop(symbol, None)
+                # Execute slice if it's time
+                slicer = self.exit_slicers.get(symbol)
+                if slicer and current_dt >= slicer.next_slice_time:
+                    success = self._execute_exit_slice(symbol)
+                    if success and symbol not in self.positions:
+                        exited.append(symbol)
 
         return exited
+
+    def _start_exit_slicer(self, symbol: str, current_time: time, vix_level: float, reason: str):
+        """Start a time-based exit slicer for gradual position liquidation"""
+        if symbol in self.exit_slicers:
+            return
+
+        # Determine slice parameters based on VIX regime
+        if vix_level > config.VIX_HIGH_THRESHOLD:
+            total_window_seconds = 6 * 60   # 2:30 regime: 6 minutes
+            slices = 3
+        elif vix_level < config.VIX_LOW_THRESHOLD:
+            total_window_seconds = 10 * 60  # 3:30 regime: 10 minutes
+            slices = 3
+        else:
+            total_window_seconds = 8 * 60
+            slices = 3
+
+        now_dt = datetime.combine(datetime.today(), current_time)
+        self.exit_slicers[symbol] = ExitSlicerState(
+            symbol=symbol,
+            slices_remaining=slices,
+            next_slice_time=now_dt,
+            seconds_between_slices=total_window_seconds // slices,
+            reason=reason,
+        )
+        logger.info(f"Started exit slicer for {symbol}: {slices} slices over {total_window_seconds}s ({reason})")
+
+    def _execute_exit_slice(self, symbol: str) -> bool:
+        """Execute one slice of a gradual exit. Returns True if slice executed successfully."""
+        position = self.positions.get(symbol)
+        slicer = self.exit_slicers.get(symbol)
+
+        if not position or not slicer:
+            self.exit_slicers.pop(symbol, None)
+            return False
+
+        # Calculate slice quantity
+        if slicer.slices_remaining <= 1:
+            qty = position.quantity  # Last slice: sell all remaining
+        else:
+            qty = max(1, position.quantity // slicer.slices_remaining)
+
+        order_id = self._submit_market_order(symbol, qty, "sell")
+        if not order_id:
+            logger.error(f"Failed to submit exit slice for {symbol}")
+            return False
+
+        fill = self.get_order_fill(order_id, max_wait=30)
+        if not fill:
+            logger.error(f"Failed to fill exit slice for {symbol}")
+            return False
+
+        exit_price = fill["filled_avg_price"]
+        filled_qty = int(fill["filled_qty"])
+        fill_status = fill.get("status", "unknown")
+
+        pnl = (exit_price - position.entry_price) * filled_qty
+        pnl_pct = ((exit_price / position.entry_price) - 1) * 100
+
+        remaining = position.quantity - filled_qty
+
+        if remaining > 0:
+            position.quantity = remaining
+            slicer.slices_remaining -= 1
+            slicer.next_slice_time = slicer.next_slice_time + timedelta(seconds=slicer.seconds_between_slices)
+            logger.info(
+                f"EXIT SLICE {symbol}: {filled_qty} @ {exit_price:.2f} "
+                f"(P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - remaining {remaining}, "
+                f"slices left {slicer.slices_remaining}, status={fill_status}"
+            )
+        else:
+            logger.info(
+                f"FINAL EXIT {symbol}: {filled_qty} @ {exit_price:.2f} "
+                f"(P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - {slicer.reason}, status={fill_status}"
+            )
+            del self.positions[symbol]
+            self.exit_slicers.pop(symbol, None)
+
+        return True
 
     def _exit_position(self, symbol: str, reason: str):
         """
@@ -480,4 +612,5 @@ class PositionManager:
     def force_exit_all(self, reason: str = "force"):
         logger.warning(f"Force exiting all positions: {reason}")
         for symbol in list(self.positions.keys()):
+            self.exit_slicers.pop(symbol, None)  # Clear any active slicer
             self._exit_position(symbol, reason)

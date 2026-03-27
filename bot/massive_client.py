@@ -53,9 +53,24 @@ class MassiveClient:
                 if price is not None:
                     day_data = item.get("day", {})
                     prev_day = item.get("prevDay", {})
+                    
+                    # Extract open/high/low for gap calculation
+                    # Fallback: if open not available, use last trade price as proxy
+                    open_price = day_data.get("o")
+                    if not open_price:
+                        open_price = last_trade.get("p")
+                        if open_price:
+                            logger.debug(f"{symbol}: using last_trade as open proxy (no day.o yet)")
+                    if not open_price:
+                        open_price = price  # final fallback
+                        logger.debug(f"{symbol}: using price as open proxy (no day.o and no last_trade)")
+                    
                     snapshots[symbol] = {
                         "symbol": symbol,
                         "price": price,
+                        "open": open_price,  # critical for gap calc - fallback chain above
+                        "high": day_data.get("h"),
+                        "low": day_data.get("l"),
                         "volume": day_data.get("v", 0),  # today's volume
                         "prev_volume": prev_day.get("v", 0),  # yesterday's volume for ADV
                         "prev_close": prev_day.get("c", 0),  # yesterday's close for gap calc
