@@ -17,6 +17,11 @@ class GapCandidate:
     volume: int
     adv_estimate: float  # Estimated ADV based on recent data
 
+    @property
+    def price(self) -> float:
+        """Alias for open_price - used by position sizing and state serialization"""
+        return self.open_price
+
 
 class GapCalculator:
     """Calculates overnight gaps and filters candidates"""
@@ -107,6 +112,13 @@ class GapCalculator:
                 if gap_too_large <= 3:
                     logger.info(f"Gap too large: {symbol} - gap={gap_pct:.1f}% (max={self.max_gap}%)")
                 continue
+
+            # Log validation for top candidates to diagnose data issues
+            if len(candidates) < 10:
+                logger.info(
+                    f"{symbol} | open={open_price} prev_close={prev_close} "
+                    f"gap={gap_pct:+.2f}% volume={volume} adv=${adv/1e6:.2f}M"
+                )
 
             candidate = GapCandidate(
                 symbol=symbol,
