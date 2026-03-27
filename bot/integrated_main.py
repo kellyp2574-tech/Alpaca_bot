@@ -282,6 +282,18 @@ class GapMomentumBot:
             self.stage_entry_done = True
             return
 
+        # CRITICAL FIX: Execution guard - prevent duplicate entries on crash/restart
+        # Check if we already have positions (entry already completed)
+        if self.position_mgr.get_position_count() > 0:
+            logger.warning(f"Execution guard: {self.position_mgr.get_position_count()} positions already exist - skipping entry")
+            self.stage_entry_done = True
+            return
+
+        # Check if entry was already completed (stage flag)
+        if self.stage_entry_done:
+            logger.info("Execution guard: stage_entry_done flag is True - skipping entry")
+            return
+
         try:
             positions = self.position_mgr.enter_positions(self.candidates, self.vix_level)
 
@@ -390,11 +402,11 @@ class GapMomentumBot:
             state["candidates"] = [
                 {
                     "symbol": c.symbol,
-                    "gap_pct": c.gap_pct,
                     "open_price": c.open_price,
                     "prev_close": c.prev_close,
+                    "gap_pct": c.gap_pct,
+                    "volume": c.volume,
                     "adv_estimate": c.adv_estimate,
-                    "price": c.price,
                 }
                 for c in self.candidates
             ]

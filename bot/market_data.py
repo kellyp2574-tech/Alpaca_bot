@@ -80,21 +80,44 @@ class AlpacaDataClient:
         latest_quote = data.get("latestQuote", {})
         latest_trade = data.get("latestTrade", {})
 
+        # Extract fields with detailed logging for diagnostics
+        open_price = daily_bar.get("o")
+        prev_close = prev_daily_bar.get("c")
+        last_price = latest_trade.get("p")
+        
+        # DIAGNOSTIC: Log suspicious data for key symbols or when fields are missing
+        if symbol in ["SNAP", "FLY", "AAPL", "TSLA"] or open_price is None or prev_close is None:
+            logger.info(
+                f"SNAPSHOT DIAGNOSTIC {symbol}: "
+                f"dailyBar={daily_bar}, "
+                f"prevDailyBar={prev_daily_bar}, "
+                f"latestTrade={latest_trade}"
+            )
+        
+        # VALIDATION: Warn if dailyBar appears stale (open == close with zero volume)
+        daily_volume = daily_bar.get("v", 0) if daily_bar else 0
+        daily_close = daily_bar.get("c") if daily_bar else None
+        if open_price and daily_close and open_price == daily_close and daily_volume == 0:
+            logger.warning(
+                f"STALE BAR WARNING {symbol}: open={open_price}, close={daily_close}, volume=0 - "
+                f"dailyBar may not be populated yet (premarket or no trades)"
+            )
+
         return {
             "symbol": symbol,
-            "open": daily_bar.get("o"),
+            "open": open_price,
             "high": daily_bar.get("h"),
             "low": daily_bar.get("l"),
-            "close": daily_bar.get("c"),
-            "volume": daily_bar.get("v"),
+            "close": daily_close,
+            "volume": daily_volume,
             "vwap": daily_bar.get("vw"),
-            "prev_close": prev_daily_bar.get("c"),
+            "prev_close": prev_close,
             "prev_volume": prev_daily_bar.get("v"),
             "bid": latest_quote.get("bp"),
             "ask": latest_quote.get("ap"),
             "bid_size": latest_quote.get("bs"),
             "ask_size": latest_quote.get("as"),
-            "last_price": latest_trade.get("p"),
+            "last_price": last_price,
             "last_size": latest_trade.get("s"),
             "timestamp": latest_trade.get("t"),
         }
@@ -118,6 +141,34 @@ class AlpacaDataClient:
             }
         except requests.exceptions.RequestException as e:
             logger.error(f"Error getting latest trade for {symbol}: {e}")
+            return None
+
+    def get_regular_session_open(self, symbol: str) -> Optional[float]:
+        """
+        Get the true regular-session (9:30 AM ET) opening price for a symbol.
+        Uses Alpaca's quotes endpoint with limit=1 to get the first RTH quote.
+        This is more reliable than dailyBar.o at 9:30 which may include pre-market data.
+        """
+        url = f"{self.data_url}/v2/stocks/{symbol}/quotes"
+        params = {
+            "feed": self.feed,
+            "limit": 1,
+        }
+        try:
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            quotes = data.get("quotes", [])
+            if quotes:
+                # First quote after 9:30 should be the opening quote
+                first_quote = quotes[0]
+                # Use ask price (offer) as the opening price - what you'd pay to enter
+                open_price = first_quote.get("ap")
+                logger.debug(f"Regular session open for {symbol}: ${open_price} (from first quote)")
+                return open_price
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error getting regular session open for {symbol}: {e}")
             return None
 
     def get_tradable_assets(self) -> List[str]:

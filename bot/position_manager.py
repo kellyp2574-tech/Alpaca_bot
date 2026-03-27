@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 import requests
 from bot import config
 from bot.market_data import AlpacaDataClient
