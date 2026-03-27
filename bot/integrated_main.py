@@ -2,8 +2,8 @@
 
 Daily Schedule (ET):
 - 09:00: Pull full market snapshot from Massive, filter by price ($1-$2)
-- 09:29: Fetch Alpaca IEX snapshots, compute gaps, build candidate list
-- 09:30: Enter market orders for qualifying candidates
+- 09:25: Compute gaps from Massive data, build candidate list
+- 09:27: Submit MOO (Market On Open) orders for qualifying candidates
 - Variable exit: VIX-conditioned exits (2:30 PM, 3:30 PM, or trailing stop)
 """
 import logging
@@ -61,10 +61,10 @@ class GapMomentumBot:
         self.universe_retry_count = 0
         self.max_universe_retries = 3
 
-        # Timing
+        # Timing - MOO orders at 9:27 (cutoff ~9:28), candidates at 9:25
         self.target_universe = dt_time(9, 0)
-        self.target_candidates = dt_time(9, 29)
-        self.target_entry = dt_time(9, 30)
+        self.target_candidates = dt_time(9, 25)
+        self.target_entry = dt_time(9, 27)
         self.market_close = dt_time(16, 0)
 
     def run(self):
@@ -97,13 +97,9 @@ class GapMomentumBot:
                     logger.warning("Skipped Step 2 - past entry window")
                     self.stage_candidates_done = True
 
-            # Step 3: Market entry
+            # Step 3: Market entry (MOO orders must submit before 9:28 cutoff)
             if not self.stage_entry_done and current_time >= self.target_entry:
-                if current_time < dt_time(10, 0):
-                    self._step3_enter_positions()
-                else:
-                    logger.warning("Skipped Step 3 - past entry retry window")
-                    self.stage_entry_done = True
+                self._step3_enter_positions()
 
             # Step 4: Manage exits
             if self.stage_entry_done and not self.stage_exit_done:
@@ -210,8 +206,8 @@ class GapMomentumBot:
             self.stage_universe_done = True
 
     def _step2_find_candidates(self):
-        """Step 2: Fetch Alpaca snapshots, merge Massive data, compute gaps, find candidates"""
-        logger.info("STEP 2: Finding gap candidates via Alpaca")
+        """Step 2: Compute gaps from Massive data only, find candidates"""
+        logger.info("STEP 2: Finding gap candidates via Massive (no Alpaca dependency)")
 
         if not self.universe:
             logger.error("No universe available for Step 2")
@@ -219,18 +215,27 @@ class GapMomentumBot:
             return
 
         try:
-            snapshots = self.alpaca.get_snapshots(self.universe)
-            if not snapshots:
-                logger.error("Failed to get Alpaca snapshots - will retry in 5 seconds")
+            # CRITICAL: Refresh Massive snapshot at 9:25 (don't use stale 9:00 data)
+            logger.info("Refreshing Massive snapshot for candidate selection...")
+            fresh_snapshots = self.massive.get_full_market_snapshot()
+            if not fresh_snapshots:
+                logger.error("Failed to refresh Massive snapshot - will retry")
                 time.sleep(5)
                 return
 
-            # Merge Massive data (prev_volume, prev_close) into Alpaca snapshots
-            enriched_snapshots = self._merge_massive_into_alpaca(snapshots)
+            # Filter to universe only (critical fix - was using full snapshot before)
+            filtered_snapshots = {
+                symbol: fresh_snapshots[symbol]
+                for symbol in self.universe
+                if symbol in fresh_snapshots
+            }
+            logger.info(f"Filtered to {len(filtered_snapshots)} universe symbols from Massive")
 
-            self.candidates = self.gap_calc.find_candidates(enriched_snapshots)
+            # Store for pre-trade state save
+            self.massive_snapshots = filtered_snapshots
 
-            # FIX: Use config.MAX_POSITIONS instead of hardcoded 20
+            self.candidates = self.gap_calc.find_candidates(filtered_snapshots)
+
             self.candidates = self.gap_calc.select_by_liquidity_and_gap(
                 self.candidates, max_positions=config.MAX_POSITIONS
             )
@@ -248,34 +253,16 @@ class GapMomentumBot:
             logger.error(f"Error in Step 2: {e}")
             time.sleep(5)
 
-    def _merge_massive_into_alpaca(self, alpaca_snapshots: Dict[str, dict]) -> Dict[str, dict]:
-        """Merge Massive prev_volume and prev_close into Alpaca snapshots."""
-        if not self.massive_snapshots:
-            logger.warning("No Massive snapshots available for merging - using Alpaca data only")
-            return alpaca_snapshots
-
-        merged = {}
-        for symbol, alpaca_data in alpaca_snapshots.items():
-            massive_data = self.massive_snapshots.get(symbol, {})
-            
-            merged[symbol] = dict(alpaca_data)
-            
-            # Override with Massive prev_volume and prev_close if available
-            if massive_data.get("prev_volume"):
-                merged[symbol]["prev_volume"] = massive_data["prev_volume"]
-            if massive_data.get("prev_close"):
-                merged[symbol]["prev_close"] = massive_data["prev_close"]
-            
-            # Fallback: Use Massive price as last_price if Alpaca doesn't have it
-            if not merged[symbol].get("last_price") and massive_data.get("price"):
-                merged[symbol]["last_price"] = massive_data["price"]
-
-        logger.info(f"Merged Massive data into {len(merged)} Alpaca snapshots")
-        return merged
-
     def _step3_enter_positions(self):
-        """Step 3: Enter market orders for candidates"""
-        logger.info("STEP 3: Entering positions")
+        """Step 3: Submit MOO orders for candidates (must complete before 9:28 cutoff)"""
+        logger.info("STEP 3: Entering positions via MOO orders")
+
+        # HARD CUTOFF: Alpaca OPG cutoff is ~9:28, use 9:27:30 for 30s safety buffer
+        current_time = datetime.now().time()
+        if current_time >= dt_time(9, 27, 30):
+            logger.error(f"Past OPG cutoff (9:27:30 buffer); current time {current_time}. Skipping entry stage.")
+            self.stage_entry_done = True
+            return
 
         if not self.candidates:
             logger.info("No candidates to enter")
@@ -283,19 +270,17 @@ class GapMomentumBot:
             return
 
         # CRITICAL FIX: Execution guard - prevent duplicate entries on crash/restart
-        # Check if we already have positions (entry already completed)
         if self.position_mgr.get_position_count() > 0:
             logger.warning(f"Execution guard: {self.position_mgr.get_position_count()} positions already exist - skipping entry")
             self.stage_entry_done = True
             return
 
-        # Check if entry was already completed (stage flag)
         if self.stage_entry_done:
             logger.info("Execution guard: stage_entry_done flag is True - skipping entry")
             return
 
         try:
-            positions = self.position_mgr.enter_positions(self.candidates, self.vix_level)
+            positions = self.position_mgr.enter_positions_moo(self.candidates, self.vix_level)
 
             logger.info(f"Entered {len(positions)} positions")
             for pos in positions:
