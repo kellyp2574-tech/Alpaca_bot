@@ -281,45 +281,59 @@ class PositionManager:
         except requests.exceptions.RequestException:
             cash = equity
         
-        # FIXED: Use stable per-slot budget instead of dynamic remaining_cash
-        planned_slots = min(len(candidates), config.MAX_POSITIONS)
-        per_position_budget = cash / planned_slots if planned_slots > 0 else 0
-        selected_candidates = candidates[:planned_slots]
+        # Sort candidates by ADV (lowest first) so liquidity-constrained names get allocated first
+        # This allows spare funds to carry over to higher ADV candidates
+        sorted_candidates = sorted(candidates, key=lambda c: c.adv_estimate)
+        planned_slots = min(len(sorted_candidates), config.MAX_POSITIONS)
+        selected_candidates = sorted_candidates[:planned_slots]
         
-        logger.info(f"MOO Portfolio plan: {planned_slots} positions, ${cash:,.2f} cash, ${per_position_budget:,.2f} per position")
+        logger.info(f"MOO Portfolio plan: {planned_slots} positions, ${cash:,.2f} cash, sorted by ADV (lowest first)")
         
         # PHASE 1: Submit all MOO orders before cutoff
-        submitted = []  # List of (candidate, expected_qty, order_id)
+        submitted = []  # List of (candidate, expected_qty, order_id, budget_used)
+        remaining_cash = cash
+        remaining_slots = planned_slots
         
         for i, candidate in enumerate(selected_candidates):
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
-            # Use fixed budget per position (stable for auction orders)
+            # Dynamic budget: remaining cash / remaining slots
+            # This allows spare funds from liquidity-capped candidates to carry over
+            per_position_budget = remaining_cash / remaining_slots if remaining_slots > 0 else 0
+            
             if per_position_budget <= 0:
-                logger.debug(f"Skipping {symbol}: zero budget")
+                logger.debug(f"Skipping {symbol}: zero budget remaining")
                 continue
             
+            # Calculate position size (may be capped by liquidity)
             quantity = self.calculate_position_size(per_position_budget, candidate.adv_estimate, expected_price)
             if quantity <= 0:
-                logger.warning(f"Skipping {symbol}: liquidity cap prevents allocation")
+                logger.warning(f"Skipping {symbol}: liquidity cap prevents allocation (ADV=${candidate.adv_estimate:,.0f})")
+                remaining_slots -= 1  # Still consume a slot, but cash remains available
                 continue
+            
+            # Track actual budget used (may be less than per_position_budget due to rounding/price)
+            actual_budget_used = quantity * expected_price
             
             # Submit MOO order
             order_id = self._submit_moo_order(symbol, quantity, "buy")
             if not order_id:
+                remaining_slots -= 1
                 continue
             
-            submitted.append((candidate, quantity, order_id))
-            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares")
+            submitted.append((candidate, quantity, order_id, actual_budget_used))
+            remaining_cash -= actual_budget_used
+            remaining_slots -= 1
+            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares @ ${expected_price:.2f} (budget: ${per_position_budget:,.2f}, used: ${actual_budget_used:,.2f}, remaining: ${remaining_cash:,.2f})")
         
-        logger.info(f"MOO submission phase complete: {len(submitted)} orders submitted")
+        logger.info(f"MOO submission phase complete: {len(submitted)}/{planned_slots} orders submitted, ${remaining_cash:,.2f} unallocated")
         
         # PHASE 2: Poll fills for all submitted orders
         entered = []
         total_allocated = 0.0
         
-        for candidate, expected_qty, order_id in submitted:
+        for candidate, expected_qty, order_id, budget_used in submitted:
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
