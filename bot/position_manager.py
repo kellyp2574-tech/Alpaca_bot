@@ -313,8 +313,10 @@ class PositionManager:
                 remaining_slots -= 1  # Still consume a slot, but cash remains available
                 continue
             
-            # Track actual budget used (may be less than per_position_budget due to rounding/price)
-            actual_budget_used = quantity * expected_price
+            # Track actual budget used with conservative reservation for slippage
+            # Reserve 2% extra to account for potential price movement between expected and actual fill
+            expected_budget = quantity * expected_price
+            reserved_budget = expected_budget * 1.02  # 2% slippage buffer
             
             # Submit MOO order
             order_id = self._submit_moo_order(symbol, quantity, "buy")
@@ -322,10 +324,10 @@ class PositionManager:
                 remaining_slots -= 1
                 continue
             
-            submitted.append((candidate, quantity, order_id, actual_budget_used))
-            remaining_cash -= actual_budget_used
+            submitted.append((candidate, quantity, order_id, reserved_budget, expected_budget))
+            remaining_cash -= reserved_budget
             remaining_slots -= 1
-            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares @ ${expected_price:.2f} (budget: ${per_position_budget:,.2f}, used: ${actual_budget_used:,.2f}, remaining: ${remaining_cash:,.2f})")
+            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares @ ${expected_price:.2f} (expected: ${expected_budget:,.2f}, reserved: ${reserved_budget:,.2f}, remaining: ${remaining_cash:,.2f})")
         
         logger.info(f"MOO submission phase complete: {len(submitted)}/{planned_slots} orders submitted, ${remaining_cash:,.2f} unallocated")
         
@@ -333,7 +335,7 @@ class PositionManager:
         entered = []
         total_allocated = 0.0
         
-        for candidate, expected_qty, order_id, budget_used in submitted:
+        for candidate, expected_qty, order_id, reserved_budget, expected_budget in submitted:
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
