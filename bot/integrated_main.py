@@ -11,7 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime, time as dt_time, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any, Tuple
 import json
 
 from bot import config
@@ -48,8 +48,10 @@ class GapMomentumBot:
 
         self.universe: List[str] = []
         self.candidates: List[GapCandidate] = []
-        self.vix_level: float = 0.0
-        self.massive_snapshots: Dict[str, dict] = {}
+        self.core_candidates: List[GapCandidate] = []  # 4%+ gaps
+        self.filler_candidates: List[GapCandidate] = []  # 3-4% gaps
+        self.massive_snapshots: Dict[str, Any] = {}
+        self.vix_level: float = 15.0
 
         # Stage flags
         self.stage_universe_done = False
@@ -236,14 +238,30 @@ class GapMomentumBot:
 
             self.candidates = self.gap_calc.find_candidates(filtered_snapshots)
 
-            self.candidates = self.gap_calc.select_by_liquidity_and_gap(
-                self.candidates, max_positions=config.MAX_POSITIONS
+            # Split candidates: core (4%+) vs filler (3-4%)
+            all_candidates = self.candidates
+            core_candidates = [c for c in all_candidates if c.gap_pct >= 4.0]
+            filler_candidates = [c for c in all_candidates if 3.0 <= c.gap_pct < 4.0]
+
+            # Apply liquidity filter separately
+            core_candidates = self.gap_calc.select_by_liquidity_and_gap(
+                core_candidates, max_positions=config.MAX_POSITIONS
             )
+            filler_candidates = self.gap_calc.select_by_liquidity_and_gap(
+                filler_candidates, max_positions=config.MAX_POSITIONS
+            )
+
+            # Store both lists
+            self.core_candidates = core_candidates
+            self.filler_candidates = filler_candidates
+            # Combined for backwards compatibility
+            self.candidates = core_candidates + filler_candidates
 
             self.vix_level = self.vix_fetcher.get_vix_level() or 15.0
 
-            logger.info(f"Candidates found: {len(self.candidates)}")
-            for c in self.candidates[:5]:
+            logger.info(f"Candidates found: {len(self.candidates)} (core: {len(self.core_candidates)}, filler: {len(self.filler_candidates)})")
+            logger.info(f"Core candidates (4%+):")
+            for c in self.core_candidates[:5]:
                 logger.info(f"  {c.symbol}: {c.gap_pct:+.1f}% gap, ${c.adv_estimate/1e6:.1f}M ADV")
 
             self.stage_candidates_done = True
@@ -280,9 +298,58 @@ class GapMomentumBot:
             return
 
         try:
-            positions = self.position_mgr.enter_positions_moo(self.candidates, self.vix_level)
-
-            logger.info(f"Entered {len(positions)} positions")
+            # Fetch total capital ONCE before deployment for consistent calculations
+            total_capital = self.position_mgr.get_total_capital()
+            
+            # PHASE 1: Deploy to core candidates (4%+ gaps)
+            logger.info(f"PHASE 1: Deploying to {len(self.core_candidates)} core candidates (4%+ gaps) using ${total_capital:,.2f} total capital")
+            positions_core, used_capital = self.position_mgr.enter_positions_moo(
+                self.core_candidates, self.vix_level, capital_override=total_capital
+            )
+            
+            # PHASE 2: Compute deployment metrics using the ORIGINAL total_capital
+            deployment_ratio = used_capital / total_capital if total_capital > 0 else 0
+            remaining_capital = total_capital - used_capital
+            
+            logger.info(f"Phase 1 complete: {len(positions_core)} positions, "
+                       f"${used_capital:,.2f} used, "
+                       f"{deployment_ratio*100:.1f}% deployed, "
+                       f"${remaining_capital:,.2f} remaining")
+            
+            # PHASE 3: Conditionally unlock filler candidates (3-4% gaps)
+            positions_filler = []
+            MIN_FILL_CAPITAL = 1000  # Minimum capital needed to enter filler positions
+            
+            # Enforce global position cap: filler can only use remaining slots after core
+            core_position_count = len(positions_core)
+            remaining_slots = max(0, config.MAX_POSITIONS - core_position_count)
+            
+            if deployment_ratio < 0.8 and remaining_capital > MIN_FILL_CAPITAL and self.filler_candidates and remaining_slots > 0:
+                # Limit filler candidates to remaining slots
+                filler_to_use = self.filler_candidates[:remaining_slots]
+                logger.info(f"PHASE 3: Unlocking filler candidates (3-4% gaps) - "
+                           f"deployment {deployment_ratio*100:.1f}% < 80%, "
+                           f"${remaining_capital:,.2f} available, "
+                           f"{remaining_slots} slots remaining for filler")
+                positions_filler, _ = self.position_mgr.enter_positions_moo(
+                    filler_to_use,
+                    self.vix_level,
+                    capital_override=remaining_capital
+                )
+            else:
+                if deployment_ratio >= 0.8:
+                    logger.info(f"Phase 3 skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
+                elif remaining_capital <= MIN_FILL_CAPITAL:
+                    logger.info(f"Phase 3 skipped: remaining capital ${remaining_capital:,.2f} <= minimum ${MIN_FILL_CAPITAL}")
+                elif remaining_slots <= 0:
+                    logger.info(f"Phase 3 skipped: no remaining slots (core filled {core_position_count}/{config.MAX_POSITIONS})")
+                else:
+                    logger.info(f"Phase 3 skipped: no filler candidates available")
+            
+            # Combine results
+            positions = positions_core + positions_filler
+            
+            logger.info(f"Entered {len(positions)} total positions ({len(positions_core)} core, {len(positions_filler)} filler)")
             for pos in positions:
                 logger.info(f"  {pos.symbol}: {pos.quantity} shares @ ${pos.entry_price:.2f}")
 
@@ -336,6 +403,10 @@ class GapMomentumBot:
                     candidates_data = pre_trade.get("candidates", [])
                     if candidates_data:
                         self.candidates = [GapCandidate(**c) for c in candidates_data]
+                        # CRITICAL FIX: Rebuild core/filler split from restored candidates
+                        self.core_candidates = [c for c in self.candidates if c.gap_pct >= 4.0]
+                        self.filler_candidates = [c for c in self.candidates if 3.0 <= c.gap_pct < 4.0]
+                        logger.info(f"Restored {len(self.candidates)} candidates: {len(self.core_candidates)} core, {len(self.filler_candidates)} filler")
                     
                     # Now safe to restore stage flags
                     self.stage_universe_done = bot_state.get("stage_universe_done", False)
