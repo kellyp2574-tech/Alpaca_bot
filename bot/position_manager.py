@@ -1,7 +1,7 @@
 """Position manager for gap momentum strategy with VIX-conditioned exits"""
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time
 import requests
@@ -258,28 +258,34 @@ class PositionManager:
         logger.warning(f"Order {order_id} did not fill within {max_wait} seconds")
         return None
 
-    def enter_positions_moo(self, candidates: List, vix_level: float) -> List[Position]:
+    def enter_positions_moo(self, candidates: List, vix_level: float, capital_override: Optional[float] = None) -> Tuple[List[Position], float]:
         """
         Enter MOO (Market On Open) orders with two-pass process:
         1. Submit all orders before 9:28 cutoff
         2. Poll fills after 9:30 auction
+        
+        Returns: (positions_entered, total_capital_used)
         """
         equity = self.get_account_equity()
         if equity <= 0:
             logger.error("Cannot enter positions: no equity")
-            return []
+            return [], 0.0
         
         if not candidates:
-            return []
+            return [], 0.0
         
         url = f"{self.base_url}/v2/account"
         try:
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
             account_data = response.json()
-            cash = float(account_data.get("cash", equity))
+            # Use buying_power instead of cash to support margin accounts
+            buying_power = float(account_data.get("buying_power", equity))
         except requests.exceptions.RequestException:
-            cash = equity
+            buying_power = equity
+        
+        # If capital_override specified, use it (for filler phase after core deployment)
+        available_capital = capital_override if capital_override is not None else buying_power
         
         # Sort candidates by ADV (lowest first) so liquidity-constrained names get allocated first
         # This allows spare funds to carry over to higher ADV candidates
@@ -287,20 +293,20 @@ class PositionManager:
         planned_slots = min(len(sorted_candidates), config.MAX_POSITIONS)
         selected_candidates = sorted_candidates[:planned_slots]
         
-        logger.info(f"MOO Portfolio plan: {planned_slots} positions, ${cash:,.2f} cash, sorted by ADV (lowest first)")
+        logger.info(f"MOO Portfolio plan: {planned_slots} positions, ${available_capital:,.2f} capital (buying_power), sorted by ADV (lowest first)")
         
         # PHASE 1: Submit all MOO orders before cutoff
-        submitted = []  # List of (candidate, expected_qty, order_id, budget_used)
-        remaining_cash = cash
+        submitted = []  # List of (candidate, expected_qty, order_id, reserved_budget, expected_budget)
+        remaining_capital = available_capital
         remaining_slots = planned_slots
         
         for i, candidate in enumerate(selected_candidates):
             symbol = candidate.symbol
             expected_price = candidate.open_price
             
-            # Dynamic budget: remaining cash / remaining slots
+            # Dynamic budget: remaining capital / remaining slots
             # This allows spare funds from liquidity-capped candidates to carry over
-            per_position_budget = remaining_cash / remaining_slots if remaining_slots > 0 else 0
+            per_position_budget = remaining_capital / remaining_slots if remaining_slots > 0 else 0
             
             if per_position_budget <= 0:
                 logger.debug(f"Skipping {symbol}: zero budget remaining")
@@ -310,7 +316,7 @@ class PositionManager:
             quantity = self.calculate_position_size(per_position_budget, candidate.adv_estimate, expected_price)
             if quantity <= 0:
                 logger.warning(f"Skipping {symbol}: liquidity cap prevents allocation (ADV=${candidate.adv_estimate:,.0f})")
-                remaining_slots -= 1  # Still consume a slot, but cash remains available
+                remaining_slots -= 1  # Still consume a slot, but capital remains available
                 continue
             
             # Track actual budget used with conservative reservation for slippage
@@ -325,11 +331,11 @@ class PositionManager:
                 continue
             
             submitted.append((candidate, quantity, order_id, reserved_budget, expected_budget))
-            remaining_cash -= reserved_budget
+            remaining_capital -= reserved_budget
             remaining_slots -= 1
-            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares @ ${expected_price:.2f} (expected: ${expected_budget:,.2f}, reserved: ${reserved_budget:,.2f}, remaining: ${remaining_cash:,.2f})")
+            logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares @ ${expected_price:.2f} (expected: ${expected_budget:,.2f}, reserved: ${reserved_budget:,.2f}, remaining: ${remaining_capital:,.2f})")
         
-        logger.info(f"MOO submission phase complete: {len(submitted)}/{planned_slots} orders submitted, ${remaining_cash:,.2f} unallocated")
+        logger.info(f"MOO submission phase complete: {len(submitted)}/{planned_slots} orders submitted, ${remaining_capital:,.2f} unallocated")
         
         # PHASE 2: Poll fills for all submitted orders
         entered = []
@@ -377,9 +383,8 @@ class PositionManager:
             else:
                 logger.warning(f"ENTER {symbol}: {actual_qty} shares @ {actual_price:.2f} (${actual_allocated:,.2f}, PARTIAL FILL - {fill_status}) [VIX={vix_level:.1f}]")
         
-        remaining_cash = cash - total_allocated
-        logger.info(f"MOO entry complete: {len(entered)}/{len(submitted)} filled, total=${total_allocated:,.2f}, remaining=${remaining_cash:,.2f}")
-        return entered
+        logger.info(f"MOO entry complete: {len(entered)}/{len(submitted)} filled, total=${total_allocated:,.2f}, capital_remaining=${remaining_capital:,.2f}")
+        return entered, total_allocated
 
     def _submit_market_order(self, symbol: str, quantity: int, side: str) -> Optional[str]:
         """Submit regular market order (day) for exits"""
@@ -624,6 +629,17 @@ class PositionManager:
 
     def get_position_count(self) -> int:
         return len(self.positions)
+
+    def get_total_capital(self) -> float:
+        """Get total buying power from account for deployment tracking"""
+        url = f"{self.base_url}/v2/account"
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            account_data = response.json()
+            return float(account_data.get("buying_power", 0))
+        except requests.exceptions.RequestException:
+            return self.get_account_equity()
 
     def force_exit_all(self, reason: str = "force"):
         logger.warning(f"Force exiting all positions: {reason}")
