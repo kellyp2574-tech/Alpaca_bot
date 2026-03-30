@@ -688,7 +688,10 @@ class PositionManager:
             
             # Apply scale factor based on available buying power
             if scale_factor < 1.0:
-                remaining_qty = max(config.MIN_RESCUE_SHARES, int(remaining_qty * scale_factor))
+                scaled_qty = int(remaining_qty * scale_factor)
+                if scaled_qty < config.MIN_RESCUE_SHARES:
+                    continue  # Skip if scaled quantity too small
+                remaining_qty = scaled_qty
             
             last_price = snapshot.get("last_price") or snapshot.get("close") or plan.expected_open_price
             if not last_price or last_price <= 0:
