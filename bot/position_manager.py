@@ -37,6 +37,28 @@ class ExitSlicerState:
     reason: str
 
 
+@dataclass
+class EntryExecutionPlan:
+    """Tracks staged entry execution: MOO slice + post-open rescue fills"""
+    symbol: str
+    target_qty: int
+    moo_qty: int
+    planned_remaining_qty: int
+    expected_open_price: float
+    gap_pct: float
+    adv_estimate: float
+    moo_order_id: Optional[str] = None
+    moo_filled_qty: int = 0
+    moo_filled_avg_price: float = 0.0
+    market1_order_id: Optional[str] = None
+    market1_filled_qty: int = 0
+    market1_filled_avg_price: float = 0.0
+    market2_order_id: Optional[str] = None
+    market2_filled_qty: int = 0
+    market2_filled_avg_price: float = 0.0
+    finalized: bool = False
+
+
 class PositionManager:
     """Manages positions, entries, and VIX-conditioned exits"""
 
@@ -54,6 +76,9 @@ class PositionManager:
         })
 
         self.exit_slicers: Dict[str, ExitSlicerState] = {}
+        self.entry_plans: Dict[str, EntryExecutionPlan] = {}
+        self.entry_stage1_done = False
+        self.entry_stage2_done = False
 
     def load_positions(self, saved_positions: Dict):
         """Restore positions from saved state"""
@@ -297,11 +322,25 @@ class PositionManager:
         
         # PHASE 1: Submit all MOO orders before cutoff
         submitted = []  # List of (candidate, expected_qty, order_id, reserved_budget, expected_budget)
+        submitted_symbols = set()  # Track symbols submitted in this batch to prevent duplicates
         remaining_capital = available_capital
         remaining_slots = planned_slots
         
         for i, candidate in enumerate(selected_candidates):
             symbol = candidate.symbol
+            
+            # CRITICAL FIX: Skip if we already have a position in this symbol
+            if symbol in self.positions:
+                logger.warning(f"Skipping {symbol}: already have position ({self.positions[symbol].quantity} shares)")
+                remaining_slots -= 1
+                continue
+            
+            # CRITICAL FIX: Skip if already submitted in this batch (duplicate candidate check)
+            if symbol in submitted_symbols:
+                logger.warning(f"Skipping duplicate candidate in same batch: {symbol}")
+                remaining_slots -= 1
+                continue
+            
             expected_price = candidate.open_price
             
             # Dynamic budget: remaining capital / remaining slots
@@ -331,6 +370,7 @@ class PositionManager:
                 continue
             
             submitted.append((candidate, quantity, order_id, reserved_budget, expected_budget))
+            submitted_symbols.add(symbol)  # Track symbol as submitted
             remaining_capital -= reserved_budget
             remaining_slots -= 1
             logger.info(f"MOO submitted [{len(submitted)}/{planned_slots}]: {symbol} {quantity} shares @ ${expected_price:.2f} (expected: ${expected_budget:,.2f}, reserved: ${reserved_budget:,.2f}, remaining: ${remaining_capital:,.2f})")
@@ -427,6 +467,255 @@ class PositionManager:
         except requests.exceptions.RequestException as e:
             logger.error(f"MOO order error for {symbol}: {e}")
             return None
+
+    def _submit_marketable_limit_order(self, symbol: str, quantity: int, side: str, limit_price: float) -> Optional[str]:
+        """Submit aggressive day limit order for post-open entry."""
+        url = f"{self.base_url}/v2/orders"
+        order_data = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": side,
+            "type": "limit",
+            "time_in_force": "day",
+            "limit_price": f"{limit_price:.4f}",
+        }
+        try:
+            response = self.session.post(url, json=order_data, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            logger.info(f"Marketable limit order submitted: {symbol} {side} {quantity} @ {limit_price:.4f} (ID: {order_id})")
+            return order_id
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Marketable limit order error for {symbol}: {e}")
+            return None
+
+    def _get_aggressive_buy_limit(self, symbol: str, fallback_open: float) -> Optional[float]:
+        """
+        Build an aggressive buy limit from live quote/snapshot.
+        Uses ask if available, otherwise last price, with 50 bps buffer.
+        """
+        snapshots = self.client.get_snapshots([symbol])
+        snapshot = snapshots.get(symbol, {}) if snapshots else {}
+
+        ask = snapshot.get("ask_price")
+        last_price = snapshot.get("last_price") or snapshot.get("close") or fallback_open
+
+        ref_price = ask or last_price
+        if not ref_price or ref_price <= 0:
+            return None
+
+        limit_price = ref_price * (1 + config.POST_OPEN_BUY_LIMIT_BUFFER)
+        return limit_price
+
+    def build_entry_plans(self, candidates: List, capital_override: Optional[float] = None) -> Dict[str, EntryExecutionPlan]:
+        """
+        Build target position sizes once, then split into MOO + post-open remainder.
+        Does NOT submit orders yet.
+        """
+        equity = self.get_account_equity()
+        if equity <= 0:
+            logger.error("Cannot build entry plans: no equity")
+            return {}
+
+        if not candidates:
+            return {}
+
+        url = f"{self.base_url}/v2/account"
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            account_data = response.json()
+            buying_power = float(account_data.get("buying_power", equity))
+        except requests.exceptions.RequestException:
+            buying_power = equity
+
+        available_capital = capital_override if capital_override is not None else buying_power
+
+        # Sort candidates by ADV (lowest first) so liquidity-constrained names get allocated first
+        sorted_candidates = sorted(candidates, key=lambda c: c.adv_estimate)
+        planned_slots = min(len(sorted_candidates), config.MAX_POSITIONS)
+        selected_candidates = sorted_candidates[:planned_slots]
+
+        remaining_capital = available_capital
+        remaining_slots = planned_slots
+        plans: Dict[str, EntryExecutionPlan] = {}
+
+        for candidate in selected_candidates:
+            symbol = candidate.symbol
+            expected_price = candidate.open_price
+
+            if symbol in plans or symbol in self.positions:
+                continue
+
+            per_position_budget = remaining_capital / remaining_slots if remaining_slots > 0 else 0
+            if per_position_budget <= 0:
+                break
+
+            target_qty = self.calculate_position_size(
+                per_position_budget,
+                candidate.adv_estimate,
+                expected_price
+            )
+            if target_qty <= 0:
+                remaining_slots -= 1
+                continue
+
+            # Calculate MOO slice - allow 0 to avoid tiny 1-share orders
+            moo_qty = int(target_qty * config.MOO_ENTRY_PCT)
+            if moo_qty <= 0:
+                moo_qty = 0
+            moo_qty = min(moo_qty, target_qty)
+            planned_remaining_qty = target_qty - moo_qty
+
+            expected_budget = target_qty * expected_price
+            reserved_budget = expected_budget * 1.02
+
+            plans[symbol] = EntryExecutionPlan(
+                symbol=symbol,
+                target_qty=target_qty,
+                moo_qty=moo_qty,
+                planned_remaining_qty=planned_remaining_qty,
+                expected_open_price=expected_price,
+                gap_pct=candidate.gap_pct,
+                adv_estimate=candidate.adv_estimate,
+            )
+
+            remaining_capital -= reserved_budget
+            remaining_slots -= 1
+
+        self.entry_plans.update(plans)
+        logger.info(f"Built {len(plans)} staged entry plans")
+        return plans
+
+    def submit_moo_entry_slice(self, plans: Dict[str, EntryExecutionPlan]) -> None:
+        """Submit only the MOO slice for all plans."""
+        for symbol, plan in plans.items():
+            if plan.moo_qty <= 0:
+                continue
+            if symbol in self.positions:
+                continue
+
+            order_id = self._submit_moo_order(symbol, plan.moo_qty, "buy")
+            if order_id:
+                plan.moo_order_id = order_id
+                logger.info(f"MOO slice submitted: {symbol} {plan.moo_qty}/{plan.target_qty}")
+
+    def reconcile_moo_fills(self) -> None:
+        """Read MOO order outcomes and record actual filled quantities."""
+        for symbol, plan in self.entry_plans.items():
+            if not plan.moo_order_id:
+                continue
+            if plan.moo_filled_qty > 0:
+                continue
+
+            fill = self.get_order_fill(plan.moo_order_id, max_wait=5, allow_partial_cancel=False)
+            if fill:
+                plan.moo_filled_qty = int(fill["filled_qty"])
+                plan.moo_filled_avg_price = float(fill["filled_avg_price"])
+                logger.info(f"MOO reconciled: {symbol} filled {plan.moo_filled_qty}/{plan.moo_qty}")
+            else:
+                logger.info(f"MOO reconciled: {symbol} no fill on MOO slice")
+
+    def submit_post_open_rescue_pass(self, pass_name: str = "market1") -> None:
+        """
+        Submit aggressive post-open marketable limits for remaining entry size.
+        pass_name: 'market1' or 'market2'
+        """
+        for symbol, plan in self.entry_plans.items():
+            if plan.finalized:
+                continue
+            if symbol in self.positions:
+                continue
+
+            already_filled = (
+                plan.moo_filled_qty +
+                plan.market1_filled_qty +
+                plan.market2_filled_qty
+            )
+            remaining_qty = plan.target_qty - already_filled
+
+            if remaining_qty < config.MIN_RESCUE_SHARES:
+                continue
+
+            # Optional chase guard
+            snapshots = self.client.get_snapshots([symbol])
+            snapshot = snapshots.get(symbol, {}) if snapshots else {}
+            last_price = snapshot.get("last_price") or snapshot.get("close") or plan.expected_open_price
+            if not last_price or last_price <= 0:
+                continue
+
+            chase_pct = (last_price - plan.expected_open_price) / plan.expected_open_price
+            if chase_pct > config.MAX_CHASE_FROM_OPEN_PCT:
+                logger.warning(f"Skipping rescue for {symbol}: chase {chase_pct:.2%} > max")
+                continue
+
+            if remaining_qty * last_price < config.MIN_RESCUE_NOTIONAL:
+                continue
+
+            limit_price = self._get_aggressive_buy_limit(symbol, plan.expected_open_price)
+            if not limit_price:
+                continue
+
+            order_id = self._submit_marketable_limit_order(symbol, remaining_qty, "buy", limit_price)
+            if not order_id:
+                continue
+
+            fill = self.get_order_fill(order_id, max_wait=10, allow_partial_cancel=True)
+            filled_qty = int(fill["filled_qty"]) if fill else 0
+            filled_avg_price = float(fill["filled_avg_price"]) if fill and fill.get("filled_avg_price") else 0.0
+
+            if pass_name == "market1":
+                plan.market1_order_id = order_id
+                plan.market1_filled_qty = filled_qty
+                plan.market1_filled_avg_price = filled_avg_price
+            else:
+                plan.market2_order_id = order_id
+                plan.market2_filled_qty = filled_qty
+                plan.market2_filled_avg_price = filled_avg_price
+
+            logger.info(
+                f"{pass_name} rescue: {symbol} requested {remaining_qty}, filled {filled_qty}, "
+                f"limit={limit_price:.4f}"
+            )
+
+    def finalize_entry_positions(self) -> List[Position]:
+        """Create final Position objects from all entry fills."""
+        entered = []
+
+        for symbol, plan in self.entry_plans.items():
+            if plan.finalized:
+                continue
+
+            total_qty = plan.moo_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
+            if total_qty <= 0:
+                plan.finalized = True
+                continue
+
+            total_cost = (
+                plan.moo_filled_qty * plan.moo_filled_avg_price +
+                plan.market1_filled_qty * plan.market1_filled_avg_price +
+                plan.market2_filled_qty * plan.market2_filled_avg_price
+            )
+            avg_price = total_cost / total_qty
+
+            position = Position(
+                symbol=symbol,
+                entry_price=avg_price,
+                quantity=total_qty,
+                entry_time=datetime.now(),
+                entry_gap_pct=plan.gap_pct,
+                adv_estimate=plan.adv_estimate,
+                peak_price=avg_price,
+                order_id=plan.market2_order_id or plan.market1_order_id or plan.moo_order_id,
+            )
+            self.positions[symbol] = position
+            entered.append(position)
+            plan.finalized = True
+
+            logger.info(f"FINAL ENTRY {symbol}: {total_qty} shares @ {avg_price:.4f}")
+
+        return entered
 
     def update_positions(self):
         """Update position state with current prices"""

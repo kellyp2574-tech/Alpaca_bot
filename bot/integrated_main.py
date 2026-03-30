@@ -100,7 +100,10 @@ class GapMomentumBot:
                     self.stage_candidates_done = True
 
             # Step 3: Market entry (MOO orders must submit before 9:28 cutoff)
-            if not self.stage_entry_done and current_time >= self.target_entry:
+            # Use staged entry if enabled: MOO slice before open, rescue passes after
+            if config.USE_STAGED_OPEN_ENTRY and not self.stage_entry_done:
+                self._step3_manage_staged_entry(current_time)
+            elif not self.stage_entry_done and current_time >= self.target_entry:
                 self._step3_enter_positions()
 
             # Step 4: Manage exits
@@ -280,22 +283,31 @@ class GapMomentumBot:
         if current_time >= dt_time(9, 27, 30):
             logger.error(f"Past OPG cutoff (9:27:30 buffer); current time {current_time}. Skipping entry stage.")
             self.stage_entry_done = True
+            self._save_state()
             return
 
         if not self.candidates:
             logger.info("No candidates to enter")
             self.stage_entry_done = True
+            self._save_state()
             return
 
-        # CRITICAL FIX: Execution guard - prevent duplicate entries on crash/restart
-        if self.position_mgr.get_position_count() > 0:
-            logger.warning(f"Execution guard: {self.position_mgr.get_position_count()} positions already exist - skipping entry")
-            self.stage_entry_done = True
-            return
-
+        # CRITICAL FIX: Lock stage immediately to prevent re-entry race condition
         if self.stage_entry_done:
             logger.info("Execution guard: stage_entry_done flag is True - skipping entry")
             return
+
+        # Check for existing positions before locking
+        if self.position_mgr.get_position_count() > 0:
+            logger.warning(f"Execution guard: {self.position_mgr.get_position_count()} positions already exist - skipping entry")
+            self.stage_entry_done = True
+            self._save_state()
+            return
+
+        # LOCK IMMEDIATELY - prevents any re-entry
+        self.stage_entry_done = True
+        self._save_state()
+        logger.info("Entry stage locked - stage_entry_done = True")
 
         try:
             # Fetch total capital ONCE before deployment for consistent calculations
@@ -353,12 +365,65 @@ class GapMomentumBot:
             for pos in positions:
                 logger.info(f"  {pos.symbol}: {pos.quantity} shares @ ${pos.entry_price:.2f}")
 
-            self.stage_entry_done = True
             self._save_state()
 
         except Exception as e:
             logger.error(f"Error in Step 3: {e}")
+            # Do NOT unlock - safer to fail than risk duplicate orders
+            # If manual retry is needed, user must clear state manually
             time.sleep(5)
+
+    def _step3_manage_staged_entry(self, current_time: dt_time):
+        """Three-stage entry: pre-open MOO, 9:30:10 rescue, 9:30:30 cleanup."""
+        t1 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_1, "%H:%M:%S").time()
+        t2 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_2, "%H:%M:%S").time()
+
+        # Hard pre-open cutoff
+        if current_time >= dt_time(9, 27, 30) and not self.position_mgr.entry_plans and not self.stage_entry_done:
+            logger.warning("Past MOO cutoff before entry plans were built")
+            self.stage_entry_done = True
+            self._save_state()
+            return
+
+        # Pre-open MOO submission
+        if current_time >= self.target_entry and current_time < t1 and not self.position_mgr.entry_stage1_done:
+            logger.info("STAGED ENTRY PHASE 1: Build plans + submit MOO slice")
+
+            if self.stage_entry_done:
+                return
+
+            self.stage_entry_done = True
+            self._save_state()
+
+            total_capital = self.position_mgr.get_total_capital()
+
+            plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
+            self.position_mgr.submit_moo_entry_slice(plans_core)
+
+            self.position_mgr.entry_stage1_done = True
+            self._save_state()
+            return
+
+        # First rescue pass
+        if current_time >= t1 and current_time < t2 and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
+            logger.info("STAGED ENTRY PHASE 2: reconcile MOO + rescue pass 1")
+            self.position_mgr.reconcile_moo_fills()
+            self.position_mgr.submit_post_open_rescue_pass("market1")
+            self.position_mgr.entry_stage2_done = True
+            self._save_state()
+            return
+
+        # Final rescue + finalize
+        if current_time >= t2 and self.position_mgr.entry_stage2_done:
+            logger.info("STAGED ENTRY PHASE 3: rescue pass 2 + finalize")
+            self.position_mgr.submit_post_open_rescue_pass("market2")
+            positions = self.position_mgr.finalize_entry_positions()
+
+            logger.info(f"Entered {len(positions)} staged positions")
+            for pos in positions:
+                logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
+
+            self._save_state()
 
     def _step4_manage_exits(self, current_time: dt_time):
         """Step 4: Monitor and execute exits based on VIX regime"""
