@@ -80,3 +80,27 @@ MASSIVE_BASE_URL = "https://api.massive.com"
 # Data feed (IEX for free tier)
 DATA_FEED = "iex"
 
+# ═══════════════════════════════════════════════════
+# Staged Entry Execution Model (MOO + Post-Open Rescue)
+# ═══════════════════════════════════════════════════
+
+# Enable staged entry: submit partial MOO before open, aggressive fill remainder after
+USE_STAGED_OPEN_ENTRY = True
+
+# Percent of target size sent as MOO before the open (0.25 = 25%)
+MOO_ENTRY_PCT = 0.25
+
+# Timing for post-open rescue passes
+POST_OPEN_ENTRY_TIME_1 = "09:30:10"
+POST_OPEN_ENTRY_TIME_2 = "09:30:30"
+
+# Aggressive marketable limit buffer for buy orders (0.005 = 50 bps)
+POST_OPEN_BUY_LIMIT_BUFFER = 0.005
+
+# Optionally avoid chasing if price runs too far from expected open (0.03 = 3%)
+MAX_CHASE_FROM_OPEN_PCT = 0.03
+
+# Skip tiny leftovers
+MIN_RESCUE_NOTIONAL = 100.0
+MIN_RESCUE_SHARES = 1
+
