@@ -497,7 +497,13 @@ class PositionManager:
         """
         snapshots = self.client.get_snapshots([symbol])
         snapshot = snapshots.get(symbol, {}) if snapshots else {}
+        return self._get_aggressive_buy_limit_from_snapshot(snapshot, fallback_open)
 
+    def _get_aggressive_buy_limit_from_snapshot(self, snapshot: dict, fallback_open: float) -> Optional[float]:
+        """
+        Build an aggressive buy limit from already-fetched snapshot data.
+        Uses ask if available, otherwise last price, with 50 bps buffer.
+        """
         ask = snapshot.get("ask_price")
         last_price = snapshot.get("last_price") or snapshot.get("close") or fallback_open
 
@@ -505,8 +511,7 @@ class PositionManager:
         if not ref_price or ref_price <= 0:
             return None
 
-        limit_price = ref_price * (1 + config.POST_OPEN_BUY_LIMIT_BUFFER)
-        return limit_price
+        return ref_price * (1 + config.POST_OPEN_BUY_LIMIT_BUFFER)
 
     def build_entry_plans(self, candidates: List, capital_override: Optional[float] = None) -> Dict[str, EntryExecutionPlan]:
         """
@@ -698,12 +703,19 @@ class PositionManager:
             if remaining_qty * last_price < config.MIN_RESCUE_NOTIONAL:
                 continue
             
-            limit_price = self._get_aggressive_buy_limit(symbol, plan.expected_open_price)
+            # FIX: Use snapshot-based helper instead of fetching fresh per-symbol
+            limit_price = self._get_aggressive_buy_limit_from_snapshot(snapshot, plan.expected_open_price)
             if not limit_price:
                 continue
             
             order_id = self._submit_marketable_limit_order(symbol, remaining_qty, "buy", limit_price)
             if order_id:
+                # FIX: Store order ID immediately for recovery safety
+                if pass_name == "market1":
+                    plan.market1_order_id = order_id
+                else:
+                    plan.market2_order_id = order_id
+                
                 submitted_orders.append((symbol, order_id, remaining_qty, limit_price, plan))
                 logger.info(f"{pass_name} order submitted: {symbol} {remaining_qty} shares @ {limit_price:.4f}")
         
@@ -719,18 +731,19 @@ class PositionManager:
             filled_qty = int(fill["filled_qty"]) if fill else 0
             filled_avg_price = float(fill["filled_avg_price"]) if fill and fill.get("filled_avg_price") else 0.0
             
+            # Only store fill quantities (order_id already stored above)
             if pass_name == "market1":
-                plan.market1_order_id = order_id
                 plan.market1_filled_qty = filled_qty
                 plan.market1_filled_avg_price = filled_avg_price
             else:
-                plan.market2_order_id = order_id
                 plan.market2_filled_qty = filled_qty
                 plan.market2_filled_avg_price = filled_avg_price
             
+            # FIX: Corrected logging (invalid f-string format)
+            avg_fill_str = f"{filled_avg_price:.4f}" if filled_avg_price > 0 else "N/A"
             logger.info(
                 f"{pass_name} rescue complete: {symbol} requested {requested_qty}, filled {filled_qty}, "
-                f"limit={limit_price:.4f}, avg_fill={filled_avg_price:.4f if filled_avg_price > 0 else 'N/A'}"
+                f"limit={limit_price:.4f}, avg_fill={avg_fill_str}"
             )
 
     def finalize_entry_positions(self) -> List[Position]:
