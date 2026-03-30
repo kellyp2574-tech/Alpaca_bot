@@ -739,6 +739,7 @@ class PositionManager:
                 "requested_qty": requested_qty,
                 "limit_price": limit_price,
                 "plan": plan,
+                "cancel_requested": False,
             }
             for symbol, order_id, requested_qty, limit_price, plan in submitted_orders
         }
@@ -772,8 +773,10 @@ class PositionManager:
                     }
                     completed.append(order_id)
                 elif status == "partially_filled" and filled_qty > 0:
-                    # Same behavior as existing logic - cancel on partial
-                    self._cancel_order(order_id)
+                    # Same behavior as existing logic - cancel on partial, but only once
+                    if not meta["cancel_requested"]:
+                        self._cancel_order(order_id)
+                        meta["cancel_requested"] = True
             
             for order_id in completed:
                 active_orders.pop(order_id, None)
