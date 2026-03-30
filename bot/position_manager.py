@@ -621,50 +621,104 @@ class PositionManager:
         """
         Submit aggressive post-open marketable limits for remaining entry size.
         pass_name: 'market1' or 'market2'
+        
+        FIXES APPLIED:
+        - Parallel submission: submit all orders first, then poll fills
+        - Buying power check: scale quantities based on actual available capital
+        - Duplicate protection: skip if order_id already exists for this pass
+        - Batched snapshots: fetch all at once instead of per-symbol
         """
-        for symbol, plan in self.entry_plans.items():
-            if plan.finalized:
+        # STEP 1: Check current buying power and calculate scale factor
+        account_capital = self.get_total_capital()
+        
+        # Calculate total planned remaining capital across all plans
+        total_planned_remaining = 0.0
+        for plan in self.entry_plans.values():
+            if plan.finalized or plan.symbol in self.positions:
                 continue
-            if symbol in self.positions:
-                continue
-
-            already_filled = (
-                plan.moo_filled_qty +
-                plan.market1_filled_qty +
-                plan.market2_filled_qty
-            )
+            already_filled = plan.moo_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
             remaining_qty = plan.target_qty - already_filled
-
+            if remaining_qty > 0:
+                # Use expected open price as conservative estimate
+                total_planned_remaining += remaining_qty * plan.expected_open_price
+        
+        # Calculate scale factor (never exceed 1.0, reduce if needed)
+        scale_factor = 1.0
+        if total_planned_remaining > 0 and account_capital > 0:
+            scale_factor = min(1.0, account_capital / total_planned_remaining)
+            if scale_factor < 1.0:
+                logger.warning(f"Rescue pass scaling down to {scale_factor:.1%} due to buying power constraints")
+        
+        # STEP 2: Collect all symbols to process and fetch batched snapshots
+        symbols_to_process = []
+        for symbol, plan in self.entry_plans.items():
+            if plan.finalized or plan.symbol in self.positions:
+                continue
+            # CRITICAL FIX: Skip if already submitted for this pass (duplicate protection)
+            if pass_name == "market1" and plan.market1_order_id:
+                continue
+            if pass_name == "market2" and plan.market2_order_id:
+                continue
+            symbols_to_process.append(symbol)
+        
+        if not symbols_to_process:
+            logger.info(f"No symbols to process for {pass_name} rescue pass")
+            return
+        
+        # Batch fetch snapshots for all symbols at once
+        all_snapshots = self.client.get_snapshots(symbols_to_process)
+        
+        # STEP 3: Submit all orders first (no blocking)
+        submitted_orders = []  # List of (symbol, order_id, remaining_qty, plan)
+        
+        for symbol in symbols_to_process:
+            plan = self.entry_plans[symbol]
+            snapshot = all_snapshots.get(symbol, {}) if all_snapshots else {}
+            
+            already_filled = plan.moo_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
+            remaining_qty = plan.target_qty - already_filled
+            
             if remaining_qty < config.MIN_RESCUE_SHARES:
                 continue
-
-            # Optional chase guard
-            snapshots = self.client.get_snapshots([symbol])
-            snapshot = snapshots.get(symbol, {}) if snapshots else {}
+            
+            # Apply scale factor based on available buying power
+            if scale_factor < 1.0:
+                remaining_qty = max(config.MIN_RESCUE_SHARES, int(remaining_qty * scale_factor))
+            
             last_price = snapshot.get("last_price") or snapshot.get("close") or plan.expected_open_price
             if not last_price or last_price <= 0:
                 continue
-
+            
+            # Chase guard
             chase_pct = (last_price - plan.expected_open_price) / plan.expected_open_price
             if chase_pct > config.MAX_CHASE_FROM_OPEN_PCT:
                 logger.warning(f"Skipping rescue for {symbol}: chase {chase_pct:.2%} > max")
                 continue
-
+            
             if remaining_qty * last_price < config.MIN_RESCUE_NOTIONAL:
                 continue
-
+            
             limit_price = self._get_aggressive_buy_limit(symbol, plan.expected_open_price)
             if not limit_price:
                 continue
-
+            
             order_id = self._submit_marketable_limit_order(symbol, remaining_qty, "buy", limit_price)
-            if not order_id:
-                continue
-
+            if order_id:
+                submitted_orders.append((symbol, order_id, remaining_qty, limit_price, plan))
+                logger.info(f"{pass_name} order submitted: {symbol} {remaining_qty} shares @ {limit_price:.4f}")
+        
+        if not submitted_orders:
+            logger.info(f"No orders submitted for {pass_name} rescue pass")
+            return
+        
+        # STEP 4: Poll fills for all submitted orders (now parallel)
+        logger.info(f"{pass_name}: Polling fills for {len(submitted_orders)} orders...")
+        
+        for symbol, order_id, requested_qty, limit_price, plan in submitted_orders:
             fill = self.get_order_fill(order_id, max_wait=10, allow_partial_cancel=True)
             filled_qty = int(fill["filled_qty"]) if fill else 0
             filled_avg_price = float(fill["filled_avg_price"]) if fill and fill.get("filled_avg_price") else 0.0
-
+            
             if pass_name == "market1":
                 plan.market1_order_id = order_id
                 plan.market1_filled_qty = filled_qty
@@ -673,10 +727,10 @@ class PositionManager:
                 plan.market2_order_id = order_id
                 plan.market2_filled_qty = filled_qty
                 plan.market2_filled_avg_price = filled_avg_price
-
+            
             logger.info(
-                f"{pass_name} rescue: {symbol} requested {remaining_qty}, filled {filled_qty}, "
-                f"limit={limit_price:.4f}"
+                f"{pass_name} rescue complete: {symbol} requested {requested_qty}, filled {filled_qty}, "
+                f"limit={limit_price:.4f}, avg_fill={filled_avg_price:.4f if filled_avg_price > 0 else 'N/A'}"
             )
 
     def finalize_entry_positions(self) -> List[Position]:
