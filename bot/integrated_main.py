@@ -59,6 +59,9 @@ class GapMomentumBot:
         self.stage_entry_done = False
         self.stage_exit_done = False
 
+        # Staged entry control (prevents duplicate MOO submission, NOT same as stage_entry_done)
+        self.entry_submission_locked = False
+
         # Retry counters
         self.universe_retry_count = 0
         self.max_universe_retries = 3
@@ -101,7 +104,7 @@ class GapMomentumBot:
 
             # Step 3: Market entry (MOO orders must submit before 9:28 cutoff)
             # Use staged entry if enabled: MOO slice before open, rescue passes after
-            if config.USE_STAGED_OPEN_ENTRY and not self.stage_entry_done:
+            if config.USE_STAGED_OPEN_ENTRY:
                 self._step3_manage_staged_entry(current_time)
             elif not self.stage_entry_done and current_time >= self.target_entry:
                 self._step3_enter_positions()
@@ -389,10 +392,10 @@ class GapMomentumBot:
         if current_time >= self.target_entry and current_time < t1 and not self.position_mgr.entry_stage1_done:
             logger.info("STAGED ENTRY PHASE 1: Build plans + submit MOO slice")
 
-            if self.stage_entry_done:
+            if self.entry_submission_locked:
                 return
 
-            self.stage_entry_done = True
+            self.entry_submission_locked = True
             self._save_state()
 
             total_capital = self.position_mgr.get_total_capital()
@@ -414,7 +417,7 @@ class GapMomentumBot:
             return
 
         # Final rescue + finalize
-        if current_time >= t2 and self.position_mgr.entry_stage2_done:
+        if current_time >= t2 and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
             logger.info("STAGED ENTRY PHASE 3: rescue pass 2 + finalize")
             self.position_mgr.submit_post_open_rescue_pass("market2")
             positions = self.position_mgr.finalize_entry_positions()
@@ -423,6 +426,8 @@ class GapMomentumBot:
             for pos in positions:
                 logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
 
+            # NOW entry is truly complete - set stage_entry_done
+            self.stage_entry_done = True
             self._save_state()
 
     def _step4_manage_exits(self, current_time: dt_time):
@@ -458,6 +463,19 @@ class GapMomentumBot:
             saved_date = bot_state.get("date")
             if saved_date == today:
                 self.vix_level = bot_state.get("vix_level", self.vix_level)
+                
+                # CRITICAL FIX: Always restore staged entry state if available (independent of pre_trade)
+                self.entry_submission_locked = bot_state.get("entry_submission_locked", False)
+                self.position_mgr.entry_stage1_done = bot_state.get("entry_stage1_done", False)
+                self.position_mgr.entry_stage2_done = bot_state.get("entry_stage2_done", False)
+                
+                # Restore entry plans if saved
+                entry_plans_data = bot_state.get("entry_plans", {})
+                if entry_plans_data:
+                    from bot.position_manager import EntryExecutionPlan
+                    for symbol, plan_data in entry_plans_data.items():
+                        self.position_mgr.entry_plans[symbol] = EntryExecutionPlan(**plan_data)
+                    logger.info(f"Restored {len(entry_plans_data)} entry plans")
                 
                 # CRITICAL FIX: Only restore stage flags if we also restore the underlying data
                 # Check if we have pre-trade state saved
@@ -498,6 +516,30 @@ class GapMomentumBot:
         self.state_mgr.save_positions(self.position_mgr.positions)
         
         today = datetime.now().strftime("%Y-%m-%d")
+        
+        # Serialize entry plans for persistence
+        entry_plans_data = {}
+        for symbol, plan in self.position_mgr.entry_plans.items():
+            entry_plans_data[symbol] = {
+                "symbol": plan.symbol,
+                "target_qty": plan.target_qty,
+                "moo_qty": plan.moo_qty,
+                "planned_remaining_qty": plan.planned_remaining_qty,
+                "expected_open_price": plan.expected_open_price,
+                "gap_pct": plan.gap_pct,
+                "adv_estimate": plan.adv_estimate,
+                "moo_order_id": plan.moo_order_id,
+                "moo_filled_qty": plan.moo_filled_qty,
+                "moo_filled_avg_price": plan.moo_filled_avg_price,
+                "market1_order_id": plan.market1_order_id,
+                "market1_filled_qty": plan.market1_filled_qty,
+                "market1_filled_avg_price": plan.market1_filled_avg_price,
+                "market2_order_id": plan.market2_order_id,
+                "market2_filled_qty": plan.market2_filled_qty,
+                "market2_filled_avg_price": plan.market2_filled_avg_price,
+                "finalized": plan.finalized,
+            }
+        
         self.state_mgr.save_bot_state({
             "date": today,
             "vix_level": self.vix_level,
@@ -505,6 +547,11 @@ class GapMomentumBot:
             "stage_candidates_done": self.stage_candidates_done,
             "stage_entry_done": self.stage_entry_done,
             "stage_exit_done": self.stage_exit_done,
+            # Staged entry state
+            "entry_submission_locked": self.entry_submission_locked,
+            "entry_stage1_done": self.position_mgr.entry_stage1_done,
+            "entry_stage2_done": self.position_mgr.entry_stage2_done,
+            "entry_plans": entry_plans_data,
         })
         
         # CRITICAL FIX: Also save pre-trade state (universe, candidates, Massive snapshots)
