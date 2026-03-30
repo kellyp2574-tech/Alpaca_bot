@@ -726,13 +726,89 @@ class PositionManager:
             logger.info(f"No orders submitted for {pass_name} rescue pass")
             return
         
-        # STEP 4: Poll fills for all submitted orders (now parallel)
+        # STEP 4: True parallel-style polling for all submitted orders
         logger.info(f"{pass_name}: Polling fills for {len(submitted_orders)} orders...")
         
+        # Setup parallel polling structure
+        start_time = datetime.now()
+        max_wait = 10
+        
+        active_orders = {
+            order_id: {
+                "symbol": symbol,
+                "requested_qty": requested_qty,
+                "limit_price": limit_price,
+                "plan": plan,
+            }
+            for symbol, order_id, requested_qty, limit_price, plan in submitted_orders
+        }
+        
+        results = {}
+        terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
+        
+        while active_orders and (datetime.now() - start_time).total_seconds() < max_wait:
+            completed = []
+            
+            for order_id, meta in list(active_orders.items()):
+                url = f"{self.base_url}/v2/orders/{order_id}"
+                
+                try:
+                    response = self.session.get(url, timeout=5)
+                    response.raise_for_status()
+                    order = response.json()
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Polling error {order_id}: {e}")
+                    continue
+                
+                status = order.get("status")
+                filled_qty = float(order.get("filled_qty", 0))
+                filled_avg_price = order.get("filled_avg_price")
+                
+                if status in terminal_states:
+                    results[order_id] = {
+                        "filled_qty": int(filled_qty),
+                        "filled_avg_price": float(filled_avg_price) if filled_avg_price else 0.0,
+                        "status": status,
+                    }
+                    completed.append(order_id)
+                elif status == "partially_filled" and filled_qty > 0:
+                    # Same behavior as existing logic - cancel on partial
+                    self._cancel_order(order_id)
+            
+            for order_id in completed:
+                active_orders.pop(order_id, None)
+            
+            time.sleep(0.25)
+        
+        # Final cleanup (timeout case)
+        for order_id, meta in active_orders.items():
+            try:
+                response = self.session.get(f"{self.base_url}/v2/orders/{order_id}", timeout=5)
+                response.raise_for_status()
+                order = response.json()
+                
+                filled_qty = float(order.get("filled_qty", 0))
+                filled_avg_price = order.get("filled_avg_price")
+                
+                results[order_id] = {
+                    "filled_qty": int(filled_qty),
+                    "filled_avg_price": float(filled_avg_price) if filled_avg_price else 0.0,
+                    "status": order.get("status", "timeout"),
+                }
+                
+                self._cancel_order(order_id)
+            except requests.exceptions.RequestException:
+                results[order_id] = {
+                    "filled_qty": 0,
+                    "filled_avg_price": 0.0,
+                    "status": "timeout",
+                }
+        
+        # Map results back to plans
         for symbol, order_id, requested_qty, limit_price, plan in submitted_orders:
-            fill = self.get_order_fill(order_id, max_wait=10, allow_partial_cancel=True)
-            filled_qty = int(fill["filled_qty"]) if fill else 0
-            filled_avg_price = float(fill["filled_avg_price"]) if fill and fill.get("filled_avg_price") else 0.0
+            fill = results.get(order_id, {})
+            filled_qty = int(fill.get("filled_qty", 0))
+            filled_avg_price = float(fill.get("filled_avg_price", 0.0))
             
             # Only store fill quantities (order_id already stored above)
             if pass_name == "market1":
@@ -742,7 +818,6 @@ class PositionManager:
                 plan.market2_filled_qty = filled_qty
                 plan.market2_filled_avg_price = filled_avg_price
             
-            # FIX: Corrected logging (invalid f-string format)
             avg_fill_str = f"{filled_avg_price:.4f}" if filled_avg_price > 0 else "N/A"
             logger.info(
                 f"{pass_name} rescue complete: {symbol} requested {requested_qty}, filled {filled_qty}, "
