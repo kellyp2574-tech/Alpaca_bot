@@ -1,10 +1,13 @@
 """Gap Momentum Bot - Main Orchestrator
 
 Daily Schedule (ET):
-- 09:00: Pull full market snapshot from Massive, filter by price ($1-$2)
-- 09:25: Compute gaps from Massive data, build candidate list
-- 09:27: Submit MOO (Market On Open) orders for qualifying candidates
-- Variable exit: VIX-conditioned exits (2:30 PM, 3:30 PM, or trailing stop)
+- 09:00: Pull full market snapshot from Massive, filter by price ($0.50-$5.00)
+- 09:25: Compute gaps from Massive data, build candidate list (core 4%+, filler 3-4%)
+- 09:27: Submit MOO slice (25% of position) for core candidates (staged entry)
+- 09:30:10: Reconcile MOO fills, run rescue pass 1 for remaining size
+- 09:30:30: Run rescue pass 2, finalize positions
+- Variable exit: VIX-conditioned exits (2:30 PM low VIX, 3:30 PM high VIX, or trailing stop)
+- 3:30/3:45/3:58 PM: Broker-based failsafe flatten sweeps
 """
 import logging
 import os
@@ -62,6 +65,11 @@ class GapMomentumBot:
         # Staged entry control (prevents duplicate MOO submission, NOT same as stage_entry_done)
         self.entry_submission_locked = False
 
+        # Failsafe flags for broker-based flatten sweeps before market close
+        self.failsafe_330_done = False
+        self.failsafe_345_done = False
+        self.failsafe_358_done = False
+
         # Retry counters
         self.universe_retry_count = 0
         self.max_universe_retries = 3
@@ -81,6 +89,25 @@ class GapMomentumBot:
         # Load any existing state (for recovery)
         self._load_state()
 
+        # Startup market-hours guard (AFTER state load so we check restored entry_plans)
+        current_time = datetime.now().time()
+        
+        # After market close: do not run
+        if current_time >= self.market_close:
+            logger.error(f"Current time {current_time} is after market close ({self.market_close}) - exiting")
+            return
+        
+        # Between 9:27:30 and 9:30 with no saved staged-entry state: disable new entries
+        if dt_time(9, 27, 30) <= current_time < dt_time(9, 30) and not self.position_mgr.entry_plans:
+            logger.warning("Startup in entry dead zone (9:27:30-9:30) with no saved entry plans - disabling new entries for the day")
+            self.stage_entry_done = True
+        
+        # After 9:30:30 with no positions and no saved entry plans: disable entries, only run exit/failsafe
+        if current_time >= dt_time(9, 30, 30) and self.position_mgr.get_position_count() == 0 and not self.position_mgr.entry_plans:
+            logger.warning("Startup after 9:30:30 with no positions and no entry plans - disabling entries, will only run exit/failsafe logic")
+            self.stage_entry_done = True
+            self.stage_exit_done = True  # Nothing to exit
+
         # Main event loop
         while True:
             now = datetime.now()
@@ -94,7 +121,7 @@ class GapMomentumBot:
                     logger.warning("Skipped Step 1 - past candidate window")
                     self.stage_universe_done = True
 
-            # Step 2: Gap calculation via Alpaca
+            # Step 2: Gap calculation via Massive
             if not self.stage_candidates_done and current_time >= self.target_candidates:
                 if current_time < self.target_entry:
                     self._step2_find_candidates()
@@ -109,19 +136,26 @@ class GapMomentumBot:
             elif not self.stage_entry_done and current_time >= self.target_entry:
                 self._step3_enter_positions()
 
+            # Hard broker-based failsafe exits, independent of local bot memory
+            if self.stage_entry_done and not self.failsafe_330_done and current_time >= dt_time(15, 30):
+                self._run_failsafe_flatten("3:30 PM failsafe")
+                self.failsafe_330_done = True
+
+            if self.stage_entry_done and not self.failsafe_345_done and current_time >= dt_time(15, 45):
+                self._run_failsafe_flatten("3:45 PM failsafe")
+                self.failsafe_345_done = True
+
+            if self.stage_entry_done and not self.failsafe_358_done and current_time >= dt_time(15, 58):
+                self._run_failsafe_flatten("3:58 PM failsafe")
+                self.failsafe_358_done = True
+
             # Step 4: Manage exits
             if self.stage_entry_done and not self.stage_exit_done:
                 if current_time < self.market_close:
                     self._step4_manage_exits(current_time)
                 else:
-                    logger.info("Market close reached - forcing exits before finalizing")
-                    if self.position_mgr.get_position_count() > 0:
-                        self.position_mgr.force_exit_all("day_end")
-                    
-                    if self.position_mgr.get_position_count() == 0:
-                        self.stage_exit_done = True
-                    else:
-                        logger.error("Market close exit attempted, but positions remain open")
+                    logger.warning("Market close reached - running final broker-based flatten")
+                    self._run_failsafe_flatten("4:00 PM market-close failsafe")
 
             # Check if day is complete
             if current_time >= self.market_close and self.stage_entry_done and self.stage_exit_done:
@@ -214,8 +248,8 @@ class GapMomentumBot:
             self.stage_universe_done = True
 
     def _step2_find_candidates(self):
-        """Step 2: Compute gaps from Massive data only, find candidates"""
-        logger.info("STEP 2: Finding gap candidates via Massive (no Alpaca dependency)")
+        """Step 2: Compute gaps from Massive data (primary), with Alpaca fallback for universe if needed"""
+        logger.info("STEP 2: Finding gap candidates via Massive (Alpaca may be used for universe fallback in Step 1)")
 
         if not self.universe:
             logger.error("No universe available for Step 2")
@@ -378,63 +412,129 @@ class GapMomentumBot:
 
     def _step3_manage_staged_entry(self, current_time: dt_time):
         """Three-stage entry: pre-open MOO, 9:30:10 rescue, 9:30:30 cleanup."""
-        t1 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_1, "%H:%M:%S").time()
-        t2 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_2, "%H:%M:%S").time()
+        try:
+            t1 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_1, "%H:%M:%S").time()
+            t2 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_2, "%H:%M:%S").time()
 
-        # Hard pre-open cutoff
-        if current_time >= dt_time(9, 27, 30) and not self.position_mgr.entry_plans and not self.stage_entry_done:
-            logger.warning("Past MOO cutoff before entry plans were built")
-            self.stage_entry_done = True
-            self._save_state()
-            return
-
-        # Pre-open MOO submission
-        if current_time >= self.target_entry and current_time < t1 and not self.position_mgr.entry_stage1_done:
-            logger.info("STAGED ENTRY PHASE 1: Build plans + submit MOO slice")
-
-            if self.entry_submission_locked:
+            # Hard pre-open cutoff
+            if current_time >= dt_time(9, 27, 30) and not self.position_mgr.entry_plans and not self.stage_entry_done:
+                logger.warning("Past MOO cutoff before entry plans were built")
+                self.stage_entry_done = True
+                self._save_state()
                 return
 
-            self.entry_submission_locked = True
-            self._save_state()
+            # Pre-open MOO submission
+            if current_time >= self.target_entry and current_time < t1 and not self.position_mgr.entry_stage1_done:
+                logger.info("STAGED ENTRY PHASE 1: Build plans + submit MOO slice")
 
-            total_capital = self.position_mgr.get_total_capital()
+                if self.entry_submission_locked:
+                    return
 
-            plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
-            self.position_mgr.submit_moo_entry_slice(plans_core)
+                self.entry_submission_locked = True
+                self._save_state()
 
-            self.position_mgr.entry_stage1_done = True
-            self._save_state()
-            return
+                total_capital = self.position_mgr.get_total_capital()
 
-        # First rescue pass
-        if current_time >= t1 and current_time < t2 and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
-            logger.info("STAGED ENTRY PHASE 2: reconcile MOO + rescue pass 1")
-            self.position_mgr.reconcile_moo_fills()
-            self.position_mgr.submit_post_open_rescue_pass("market1")
-            self.position_mgr.entry_stage2_done = True
-            self._save_state()
-            return
+                # PHASE 1: Build core plans first (4%+ gaps)
+                # CRITICAL FIX: Clear stale entry plans before first build of the day
+                self.position_mgr.entry_plans.clear()
+                plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
+                
+                # Calculate capital reserved by core plans (use target_qty with 1.02 slippage reserve, matching build_entry_plans)
+                core_reserved_notional = sum(
+                    plan.target_qty * plan.expected_open_price * 1.02
+                    for plan in plans_core.values()
+                )
+                deployment_ratio = core_reserved_notional / total_capital if total_capital > 0 else 0
+                remaining_capital = total_capital - core_reserved_notional
+                remaining_slots = max(0, config.MAX_POSITIONS - len(plans_core))
+                
+                logger.info(f"PHASE 1: Built {len(plans_core)} core plans, "
+                           f"reserved ${core_reserved_notional:,.2f} ({deployment_ratio*100:.1f}%), "
+                           f"remaining ${remaining_capital:,.2f}, {remaining_slots} slots")
+                
+                # PHASE 2: Conditionally build filler plans (3-4% gaps)
+                plans_filler = {}
+                MIN_FILL_CAPITAL = 1000
+                
+                if (deployment_ratio < 0.8 and 
+                    remaining_capital > MIN_FILL_CAPITAL and 
+                    self.filler_candidates and 
+                    remaining_slots > 0):
+                    
+                    # Limit filler to remaining slots
+                    filler_to_plan = self.filler_candidates[:remaining_slots]
+                    plans_filler = self.position_mgr.build_entry_plans(
+                        filler_to_plan, 
+                        capital_override=remaining_capital
+                    )
+                    logger.info(f"PHASE 2: Built {len(plans_filler)} filler plans against remaining capital")
+                else:
+                    if deployment_ratio >= 0.8:
+                        logger.info(f"Phase 2 skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
+                    elif remaining_capital <= MIN_FILL_CAPITAL:
+                        logger.info(f"Phase 2 skipped: remaining ${remaining_capital:,.2f} <= min ${MIN_FILL_CAPITAL}")
+                    elif remaining_slots <= 0:
+                        logger.info(f"Phase 2 skipped: no slots (core filled {len(plans_core)}/{config.MAX_POSITIONS})")
+                    else:
+                        logger.info(f"Phase 2 skipped: no filler candidates")
+                
+                # Combine plans (core first, then filler)
+                all_plans = {**plans_core, **plans_filler}
+                
+                self.position_mgr.submit_moo_entry_slice(all_plans)
 
-        # Final rescue + finalize
-        if current_time >= t2 and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
-            logger.info("STAGED ENTRY PHASE 3: rescue pass 2 + finalize")
-            self.position_mgr.submit_post_open_rescue_pass("market2")
-            positions = self.position_mgr.finalize_entry_positions()
+                logger.info(f"STAGED ENTRY PHASE 1: Built {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} total entry plans")
 
-            logger.info(f"Entered {len(positions)} staged positions")
-            for pos in positions:
-                logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
+                self.position_mgr.entry_stage1_done = True
+                self._save_state()
+                return
 
-            # NOW entry is truly complete - set stage_entry_done
-            self.stage_entry_done = True
+            # First rescue pass
+            if current_time >= t1 and current_time < t2 and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
+                logger.info("STAGED ENTRY PHASE 2: reconcile MOO + rescue pass 1")
+                self.position_mgr.reconcile_moo_fills()
+                # CRITICAL: Refresh prices for no-fill symbols before chase guard checks
+                self.position_mgr.refresh_no_fill_prices()
+                self.position_mgr.submit_post_open_rescue_pass("market1")
+                self.position_mgr.entry_stage2_done = True
+                self._save_state()
+                return
+
+            # Final rescue + finalize
+            if current_time >= t2 and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
+                logger.info("STAGED ENTRY PHASE 3: rescue pass 2 + finalize")
+                self.position_mgr.submit_post_open_rescue_pass("market2")
+                positions = self.position_mgr.finalize_entry_positions()
+
+                logger.info(f"Entered {len(positions)} staged positions")
+                for pos in positions:
+                    logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
+
+                # NOW entry is truly complete - set stage_entry_done
+                self.stage_entry_done = True
+                self._save_state()
+        except Exception as e:
+            logger.exception(f"Error in staged entry flow: {e}")
             self._save_state()
 
     def _step4_manage_exits(self, current_time: dt_time):
         """Step 4: Monitor and execute exits based on VIX regime"""
-        if self.position_mgr.get_position_count() == 0:
-            logger.info("All positions closed - exit complete")
+        local_count = self.position_mgr.get_position_count()
+        broker_count = self.position_mgr.broker_position_count()
+
+        if local_count == 0 and broker_count == 0:
+            logger.info("All positions closed locally and at broker - exit complete")
             self.stage_exit_done = True
+            return
+
+        if local_count == 0 and broker_count > 0:
+            logger.warning(
+                f"Local positions empty but broker shows {broker_count} live positions - "
+                f"running immediate broker flatten"
+            )
+            self._run_failsafe_flatten("intraday broker/local mismatch")
+            self._save_state()
             return
 
         current_prices = self.position_mgr.update_positions()
@@ -510,6 +610,17 @@ class GapMomentumBot:
                 logger.warning(f"Stale bot state from {saved_date} - starting fresh")
                 self.state_mgr.clear_bot_state()
                 self._clear_pre_trade_state()
+
+        # Startup reconcile: log broker reality to prevent silent mismatch
+        live_broker_positions = self.position_mgr.get_broker_positions()
+        if live_broker_positions:
+            logger.warning(f"Startup reconcile: broker shows {len(live_broker_positions)} live positions")
+            for pos in live_broker_positions:
+                logger.warning(
+                    f"  Broker position: {pos.get('symbol')} qty={pos.get('qty')} side={pos.get('side')}"
+                )
+            # Rebuild missing local positions from broker state
+            self.position_mgr.reconcile_local_positions_from_broker()
 
     def _save_state(self):
         """Save current state including positions and bot state"""
@@ -611,21 +722,55 @@ class GapMomentumBot:
         if os.path.exists(pre_trade_file):
             os.remove(pre_trade_file)
 
+    def _run_failsafe_flatten(self, label: str):
+        """Broker-based catch-all flatten."""
+        logger.warning(f"{label}: starting broker-based failsafe flatten")
+
+        summary = self.position_mgr.force_flatten_broker_positions(label)
+
+        logger.warning(
+            f"{label}: failsafe flatten complete | "
+            f"positions_seen={summary['positions_seen']} | "
+            f"orders_submitted={summary['orders_submitted']} | "
+            f"errors={len(summary['errors'])}"
+        )
+
+        # If broker is flat, mark exits complete
+        if self.position_mgr.broker_position_count() == 0:
+            self.stage_exit_done = True
+            logger.warning(f"{label}: broker confirmed flat")
+        else:
+            logger.error(f"{label}: broker still shows open positions after failsafe")
+
+        self._save_state()
+
     def _finalize_day(self):
         """Finalize trading day, log summary"""
         logger.info("Finalizing trading day")
 
-        if self.position_mgr.get_position_count() > 0:
-            logger.warning("Force exiting remaining positions")
-            self.position_mgr.force_exit_all("day_end")
-        
-        if self.position_mgr.get_position_count() > 0:
-            logger.critical("FAILED TO FLATTEN POSITIONS AT END OF DAY - preserving state")
+        broker_count_before = self.position_mgr.broker_position_count()
+        if broker_count_before > 0:
+            logger.warning(f"Finalize day: broker shows {broker_count_before} open positions, flattening")
+            self.position_mgr.force_flatten_broker_positions("finalize_day")
+
+        broker_count_after = self.position_mgr.broker_position_count()
+        if broker_count_after > 0:
+            logger.critical(
+                f"FAILED TO FLATTEN BROKER POSITIONS AT END OF DAY - "
+                f"{broker_count_after} still open, preserving state"
+            )
             return
 
         self.state_mgr.clear_positions()
         self.state_mgr.clear_bot_state()
         self._clear_pre_trade_state()
+
+        # CRITICAL: Explicitly clear staged entry state to prevent leakage to next day
+        self.position_mgr.entry_plans.clear()
+        self.position_mgr.entry_stage1_done = False
+        self.position_mgr.entry_stage2_done = False
+        self.entry_submission_locked = False
+        logger.info("Cleared staged entry state (entry_plans, stage flags, lock)")
 
         today = datetime.now().strftime("%Y-%m-%d")
         summary = {

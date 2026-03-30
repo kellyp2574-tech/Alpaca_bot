@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time as dt_time
 import requests
 from bot import config
 from bot.market_data import AlpacaDataClient
@@ -504,7 +504,7 @@ class PositionManager:
         Build an aggressive buy limit from already-fetched snapshot data.
         Uses ask if available, otherwise last price, with 50 bps buffer.
         """
-        ask = snapshot.get("ask_price")
+        ask = snapshot.get("ask")
         last_price = snapshot.get("last_price") or snapshot.get("close") or fallback_open
 
         ref_price = ask or last_price
@@ -618,9 +618,44 @@ class PositionManager:
             if fill:
                 plan.moo_filled_qty = int(fill["filled_qty"])
                 plan.moo_filled_avg_price = float(fill["filled_avg_price"])
-                logger.info(f"MOO reconciled: {symbol} filled {plan.moo_filled_qty}/{plan.moo_qty}")
+                # Update expected_open_price to actual MOO fill price for better chase guard
+                if plan.moo_filled_avg_price > 0:
+                    plan.expected_open_price = plan.moo_filled_avg_price
+                    logger.info(f"MOO reconciled: {symbol} filled {plan.moo_filled_qty}/{plan.moo_qty}, updated ref price to {plan.expected_open_price:.4f}")
+                else:
+                    logger.info(f"MOO reconciled: {symbol} filled {plan.moo_filled_qty}/{plan.moo_qty}")
             else:
                 logger.info(f"MOO reconciled: {symbol} no fill on MOO slice")
+
+    def refresh_no_fill_prices(self) -> None:
+        """
+        For symbols with no MOO fill, refresh expected_open_price using live snapshot.
+        This ensures rescue pass chase guards use true post-open prices, not stale pre-open proxies.
+        """
+        symbols_to_refresh = []
+        for symbol, plan in self.entry_plans.items():
+            if plan.finalized or plan.symbol in self.positions:
+                continue
+            # Only refresh symbols with no MOO fill (moo_filled_qty == 0 but order was submitted)
+            if plan.moo_order_id and plan.moo_filled_qty == 0:
+                symbols_to_refresh.append(symbol)
+        
+        if not symbols_to_refresh:
+            return
+        
+        logger.info(f"Refreshing prices for {len(symbols_to_refresh)} no-fill symbols before rescue pass")
+        snapshots = self.client.get_snapshots(symbols_to_refresh)
+        
+        for symbol in symbols_to_refresh:
+            plan = self.entry_plans[symbol]
+            snapshot = snapshots.get(symbol, {}) if snapshots else {}
+            
+            # Use last trade price or daily bar open as best proxy for true open
+            true_open = snapshot.get("open") or snapshot.get("last_price") or snapshot.get("close")
+            if true_open and true_open > 0:
+                old_price = plan.expected_open_price
+                plan.expected_open_price = true_open
+                logger.info(f"Price refresh: {symbol} expected_open_price {old_price:.4f} -> {true_open:.4f} (no MOO fill)")
 
     def submit_post_open_rescue_pass(self, pass_name: str = "market1") -> None:
         """
@@ -783,24 +818,16 @@ class PositionManager:
             
             time.sleep(0.25)
         
-        # Final cleanup (timeout case)
+        # Final cleanup (timeout case) - use get_order_fill for safer handling
         for order_id, meta in active_orders.items():
-            try:
-                response = self.session.get(f"{self.base_url}/v2/orders/{order_id}", timeout=5)
-                response.raise_for_status()
-                order = response.json()
-                
-                filled_qty = float(order.get("filled_qty", 0))
-                filled_avg_price = order.get("filled_avg_price")
-                
+            fill = self.get_order_fill(order_id, max_wait=5, allow_partial_cancel=True)
+            if fill:
                 results[order_id] = {
-                    "filled_qty": int(filled_qty),
-                    "filled_avg_price": float(filled_avg_price) if filled_avg_price else 0.0,
-                    "status": order.get("status", "timeout"),
+                    "filled_qty": int(fill.get("filled_qty", 0)),
+                    "filled_avg_price": float(fill.get("filled_avg_price", 0.0)),
+                    "status": fill.get("status", "timeout"),
                 }
-                
-                self._cancel_order(order_id)
-            except requests.exceptions.RequestException:
+            else:
                 results[order_id] = {
                     "filled_qty": 0,
                     "filled_avg_price": 0.0,
@@ -901,7 +928,7 @@ class PositionManager:
 
         return current_prices
 
-    def check_exits(self, current_time: time, vix_level: float, current_prices: Dict[str, float]) -> List[str]:
+    def check_exits(self, current_time: dt_time, vix_level: float, current_prices: Dict[str, float]) -> List[str]:
         """Check if positions should be exited based on trailing stops (full) or time (sliced)"""
         exited = []
 
@@ -948,17 +975,17 @@ class PositionManager:
 
         return exited
 
-    def _start_exit_slicer(self, symbol: str, current_time: time, vix_level: float, reason: str):
+    def _start_exit_slicer(self, symbol: str, current_time: dt_time, vix_level: float, reason: str):
         """Start a time-based exit slicer for gradual position liquidation"""
         if symbol in self.exit_slicers:
             return
 
         # Determine slice parameters based on VIX regime
         if vix_level > config.VIX_HIGH_THRESHOLD:
-            total_window_seconds = 6 * 60   # 2:30 regime: 6 minutes
+            total_window_seconds = 6 * 60   # 3:30 regime: 6 minutes
             slices = 3
         elif vix_level < config.VIX_LOW_THRESHOLD:
-            total_window_seconds = 10 * 60  # 3:30 regime: 10 minutes
+            total_window_seconds = 10 * 60  # 2:30 regime: 10 minutes
             slices = 3
         else:
             total_window_seconds = 8 * 60
@@ -1083,3 +1110,146 @@ class PositionManager:
         for symbol in list(self.positions.keys()):
             self.exit_slicers.pop(symbol, None)  # Clear any active slicer
             self._exit_position(symbol, reason)
+
+    def cancel_all_open_orders(self) -> bool:
+        """Cancel all open Alpaca orders."""
+        url = f"{self.base_url}/v2/orders"
+        try:
+            response = self.session.delete(url, timeout=15)
+            if response.status_code in (200, 204):
+                logger.warning("Canceled all open orders")
+                return True
+            logger.warning(f"Cancel all orders returned HTTP {response.status_code}: {response.text}")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error canceling all open orders: {e}")
+            return False
+
+    def get_broker_positions(self) -> List[dict]:
+        """Read live positions from Alpaca, independent of local bot memory."""
+        url = f"{self.base_url}/v2/positions"
+        try:
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, list) else []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error getting broker positions: {e}")
+            return []
+
+    def broker_position_count(self) -> int:
+        """Count live broker positions."""
+        return len(self.get_broker_positions())
+
+    def force_flatten_broker_positions(self, reason: str = "failsafe") -> Dict[str, object]:
+        """
+        Flatten ALL live broker positions based on Alpaca account state,
+        not local self.positions.
+        """
+        summary = {
+            "reason": reason,
+            "positions_seen": 0,
+            "orders_submitted": 0,
+            "symbols": [],
+            "errors": [],
+        }
+
+        # Best effort: cancel any working orders first
+        self.cancel_all_open_orders()
+
+        broker_positions = self.get_broker_positions()
+        summary["positions_seen"] = len(broker_positions)
+
+        if not broker_positions:
+            logger.warning(f"No live broker positions found during {reason} flatten")
+            # Also clear stale local positions if broker is flat
+            if self.positions:
+                logger.warning("Broker is flat but local positions remain; clearing local state")
+                self.positions.clear()
+            self.exit_slicers.clear()
+            return summary
+
+        logger.warning(f"Flattening {len(broker_positions)} live broker positions: {reason}")
+
+        for pos in broker_positions:
+            try:
+                symbol = pos.get("symbol")
+                qty_raw = pos.get("qty", "0")
+                side = (pos.get("side") or "long").lower()
+
+                qty = abs(int(float(qty_raw)))
+                if not symbol or qty <= 0:
+                    continue
+
+                order_side = "sell" if side == "long" else "buy"
+
+                order_id = self._submit_market_order(symbol, qty, order_side)
+                if not order_id:
+                    msg = f"{symbol}: failed to submit {order_side} {qty}"
+                    logger.error(msg)
+                    summary["errors"].append(msg)
+                    continue
+
+                fill = self.get_order_fill(order_id, max_wait=30)
+                if fill:
+                    filled_qty = int(fill["filled_qty"])
+                    status = fill.get("status", "unknown")
+
+                    logger.warning(
+                        f"FAILSAFE FLATTEN {symbol}: {order_side} {filled_qty} "
+                        f"@ {fill['filled_avg_price']:.4f} status={status}"
+                    )
+
+                    # Only clear local state immediately if we believe this flatten completed
+                    if status == "filled":
+                        self.positions.pop(symbol, None)
+                        self.exit_slicers.pop(symbol, None)
+                    else:
+                        msg = f"{symbol}: flatten returned non-final status {status}"
+                        logger.warning(msg)
+                        summary["errors"].append(msg)
+                else:
+                    msg = f"{symbol}: no fill confirmation for order {order_id}"
+                    logger.error(msg)
+                    summary["errors"].append(msg)
+
+                summary["orders_submitted"] += 1
+                summary["symbols"].append(symbol)
+
+            except Exception as e:
+                msg = f"{pos.get('symbol', 'UNKNOWN')}: {e}"
+                logger.error(f"Error flattening broker position - {msg}")
+                summary["errors"].append(msg)
+
+        return summary
+
+    def reconcile_local_positions_from_broker(self):
+        """
+        Rebuild missing local Position objects from broker positions
+        when local state is empty or incomplete. Call this on startup
+        after detecting broker positions that aren't in local memory.
+        """
+        broker_positions = self.get_broker_positions()
+        if not broker_positions:
+            return
+
+        for pos in broker_positions:
+            symbol = pos.get("symbol")
+            qty = int(abs(float(pos.get("qty", 0))))
+            avg_entry = float(pos.get("avg_entry_price", 0) or 0)
+
+            if not symbol or qty <= 0:
+                continue
+
+            if symbol not in self.positions:
+                self.positions[symbol] = Position(
+                    symbol=symbol,
+                    entry_price=avg_entry,
+                    quantity=qty,
+                    entry_time=datetime.now(),
+                    entry_gap_pct=0.0,
+                    adv_estimate=0.0,
+                    peak_price=avg_entry,
+                    current_price=avg_entry,
+                )
+                logger.warning(f"Rebuilt local position from broker: {symbol} qty={qty} avg={avg_entry:.4f}")
