@@ -39,17 +39,17 @@ class ExitSlicerState:
 
 @dataclass
 class EntryExecutionPlan:
-    """Tracks staged entry execution: MOO slice + post-open rescue fills"""
+    """Tracks staged entry execution: open market order + post-open rescue fills"""
     symbol: str
     target_qty: int
-    moo_qty: int
+    open_qty: int
     planned_remaining_qty: int
     expected_open_price: float
     gap_pct: float
     adv_estimate: float
-    moo_order_id: Optional[str] = None
-    moo_filled_qty: int = 0
-    moo_filled_avg_price: float = 0.0
+    open_order_id: Optional[str] = None
+    open_filled_qty: int = 0
+    open_filled_avg_price: float = 0.0
     market1_order_id: Optional[str] = None
     market1_filled_qty: int = 0
     market1_filled_avg_price: float = 0.0
@@ -149,7 +149,7 @@ class PositionManager:
         window where remaining shares could fill before caller cancels.
         
         Args:
-            allow_partial_cancel: If False (for MOO orders), don't aggressively cancel
+            allow_partial_cancel: If False (for open market orders), don't aggressively cancel
                 on partial fills - let the order ride to terminal state.
         """
         url = f"{self.base_url}/v2/orders/{order_id}"
@@ -171,7 +171,7 @@ class PositionManager:
                 # On partial fill, optionally cancel immediately and poll until terminal state
                 if status == "partially_filled" and filled_qty > 0 and filled_avg_price:
                     if not allow_partial_cancel:
-                        # For MOO orders: don't cancel aggressively, just wait for terminal state
+                        # For open market orders: don't cancel aggressively, just wait for terminal state
                         logger.info(f"Order {order_id} partially filled: {filled_qty} shares - waiting for terminal state (allow_partial_cancel=False)")
                         time.sleep(0.5)
                         continue
@@ -238,7 +238,7 @@ class PositionManager:
             filled_avg_price = order.get("filled_avg_price")
             if filled_qty > 0 and filled_avg_price:
                 if not allow_partial_cancel:
-                    # For MOO orders: don't cancel on timeout, just return what we have
+                    # For open market orders: don't cancel on timeout, just return what we have
                     logger.info(f"Order {order_id} timeout with {filled_qty} shares filled (allow_partial_cancel=False)")
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
                 
@@ -364,8 +364,8 @@ class PositionManager:
             expected_budget = quantity * expected_price
             reserved_budget = expected_budget * 1.02  # 2% slippage buffer
             
-            # Submit MOO order
-            order_id = self._submit_moo_order(symbol, quantity, "buy")
+            # Submit market order (legacy path)
+            order_id = self._submit_market_order(symbol, quantity, "buy")
             if not order_id:
                 remaining_slots -= 1
                 continue
@@ -448,26 +448,6 @@ class PositionManager:
             logger.error(f"Market order error for {symbol}: {e}")
             return None
 
-    def _submit_moo_order(self, symbol: str, quantity: int, side: str) -> Optional[str]:
-        """Submit Market On Open (MOO) order to Alpaca for auction execution"""
-        url = f"{self.base_url}/v2/orders"
-        order_data = {
-            "symbol": symbol,
-            "qty": str(quantity),
-            "side": side,
-            "type": "market",
-            "time_in_force": "opg",  # MOO - executes at market open auction
-        }
-        try:
-            response = self.session.post(url, json=order_data, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            order_id = data.get("id")
-            logger.info(f"MOO order submitted: {symbol} {side} {quantity} (ID: {order_id}) - will execute at 9:30 open")
-            return order_id
-        except requests.exceptions.RequestException as e:
-            logger.error(f"MOO order error for {symbol}: {e}")
-            return None
 
     def _submit_marketable_limit_order(self, symbol: str, quantity: int, side: str, limit_price: float) -> Optional[str]:
         """Submit aggressive day limit order for post-open entry."""
@@ -516,7 +496,7 @@ class PositionManager:
 
     def build_entry_plans(self, candidates: List, capital_override: Optional[float] = None) -> Dict[str, EntryExecutionPlan]:
         """
-        Build target position sizes once, then split into MOO + post-open remainder.
+        Build target position sizes once, then split into open order + post-open remainder.
         Does NOT submit orders yet.
         """
         if not candidates:
@@ -569,12 +549,16 @@ class PositionManager:
                 remaining_slots -= 1
                 continue
 
-            # Calculate MOO slice - allow 0 to avoid tiny 1-share orders
-            moo_qty = int(target_qty * config.MOO_ENTRY_PCT)
-            if moo_qty <= 0:
-                moo_qty = 0
-            moo_qty = min(moo_qty, target_qty)
-            planned_remaining_qty = target_qty - moo_qty
+            # Calculate open order size - when OPEN_ENTRY_PCT=1.0, send full target size at open
+            open_qty = int(target_qty * config.OPEN_ENTRY_PCT)
+            if open_qty <= 0:
+                open_qty = 0
+            open_qty = min(open_qty, target_qty)
+            planned_remaining_qty = target_qty - open_qty
+            
+            # When OPEN_ENTRY_PCT=1.0 (full size at open), no rescue needed
+            if config.OPEN_ENTRY_PCT >= 1.0:
+                planned_remaining_qty = 0
 
             expected_budget = target_qty * expected_price
             reserved_budget = expected_budget * 1.02
@@ -582,7 +566,7 @@ class PositionManager:
             plans[symbol] = EntryExecutionPlan(
                 symbol=symbol,
                 target_qty=target_qty,
-                moo_qty=moo_qty,
+                open_qty=open_qty,
                 planned_remaining_qty=planned_remaining_qty,
                 expected_open_price=expected_price,
                 gap_pct=candidate.gap_pct,
@@ -596,39 +580,44 @@ class PositionManager:
         logger.info(f"Built {len(plans)} staged entry plans")
         return plans
 
-    def submit_moo_entry_slice(self, plans: Dict[str, EntryExecutionPlan], state_saver=None) -> None:
-        """Submit only the MOO slice for all plans.
+    def submit_open_entry_orders(self, plans: Dict[str, EntryExecutionPlan], state_saver=None) -> None:
+        """Submit full market orders at 9:30:00 for entry.
+        
+        When OPEN_ENTRY_PCT=1.0, submits full target_qty for pure market-at-open execution.
         
         Args:
             state_saver: Optional callable invoked after each successful submission
-                         so moo_order_ids are persisted incrementally (crash safety).
+                         so order_ids are persisted incrementally (crash safety).
         """
         for symbol, plan in plans.items():
-            if plan.moo_qty <= 0:
+            # When OPEN_ENTRY_PCT=1.0, use target_qty directly; otherwise use open_qty
+            submit_qty = plan.target_qty if config.OPEN_ENTRY_PCT >= 1.0 else plan.open_qty
+            if submit_qty <= 0:
                 continue
             if symbol in self.positions:
                 continue
 
-            order_id = self._submit_moo_order(symbol, plan.moo_qty, "buy")
+            order_id = self._submit_market_order(symbol, submit_qty, "buy")
             if order_id:
-                plan.moo_order_id = order_id
-                logger.info(f"MOO slice submitted: {symbol} {plan.moo_qty}/{plan.target_qty}")
+                plan.open_order_id = order_id
+                plan.open_qty = submit_qty  # Update to actual submitted qty
+                logger.info(f"Market order submitted at open: {symbol} {submit_qty}/{plan.target_qty}")
                 if state_saver:
                     state_saver()
 
-    def reconcile_moo_fills(self) -> None:
-        """Read MOO order outcomes via batch polling (all orders per cycle, not sequential)."""
+    def reconcile_open_order_fills(self) -> None:
+        """Read market order outcomes via batch polling (all orders per cycle, not sequential)."""
         # Collect orders to poll
         active_orders = {}
         for symbol, plan in self.entry_plans.items():
-            if not plan.moo_order_id or plan.moo_filled_qty > 0:
+            if not plan.open_order_id or plan.open_filled_qty > 0:
                 continue
-            active_orders[plan.moo_order_id] = {"symbol": symbol, "plan": plan}
+            active_orders[plan.open_order_id] = {"symbol": symbol, "plan": plan}
 
         if not active_orders:
             return
 
-        logger.info(f"Reconciling {len(active_orders)} MOO orders (batch polling)...")
+        logger.info(f"Reconciling {len(active_orders)} market orders (batch polling)...")
         terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
         start_time = datetime.now()
         max_wait = 10  # seconds total, not per-order
@@ -643,7 +632,7 @@ class PositionManager:
                     response.raise_for_status()
                     order = response.json()
                 except requests.exceptions.RequestException as e:
-                    logger.warning(f"MOO poll error {order_id}: {e}")
+                    logger.warning(f"Open order poll error {order_id}: {e}")
                     continue
 
                 status = order.get("status")
@@ -653,16 +642,16 @@ class PositionManager:
                 if status in terminal_states:
                     plan = meta["plan"]
                     symbol = meta["symbol"]
-                    plan.moo_filled_qty = filled_qty
-                    plan.moo_filled_avg_price = float(filled_avg_price) if filled_avg_price else 0.0
+                    plan.open_filled_qty = filled_qty
+                    plan.open_filled_avg_price = float(filled_avg_price) if filled_avg_price else 0.0
 
-                    if plan.moo_filled_avg_price > 0:
-                        plan.expected_open_price = plan.moo_filled_avg_price
-                        logger.info(f"MOO reconciled: {symbol} filled {filled_qty}/{plan.moo_qty}, updated ref price to {plan.expected_open_price:.4f}")
+                    if plan.open_filled_avg_price > 0:
+                        plan.expected_open_price = plan.open_filled_avg_price
+                        logger.info(f"Market order reconciled: {symbol} filled {filled_qty}/{plan.open_qty}, updated ref price to {plan.expected_open_price:.4f}")
                     elif filled_qty > 0:
-                        logger.info(f"MOO reconciled: {symbol} filled {filled_qty}/{plan.moo_qty}")
+                        logger.info(f"Market order reconciled: {symbol} filled {filled_qty}/{plan.open_qty}")
                     else:
-                        logger.info(f"MOO reconciled: {symbol} no fill (status={status})")
+                        logger.info(f"Market order reconciled: {symbol} no fill (status={status})")
                     completed.append(order_id)
 
             for order_id in completed:
@@ -674,20 +663,20 @@ class PositionManager:
         # Any still-active orders after timeout: mark as no-fill
         for order_id, meta in active_orders.items():
             symbol = meta["symbol"]
-            logger.info(f"MOO reconciled: {symbol} no fill on MOO slice (poll timeout)")
+            logger.info(f"Market order reconciled: {symbol} no fill (poll timeout)")
 
     def refresh_no_fill_prices(self) -> None:
         """
-        For symbols with no MOO fill, refresh expected_open_price using live snapshot.
+        Refresh expected_open_price for symbols with no market order fill using live post-open snapshot.
         This ensures rescue pass chase guards use true post-open prices, not stale pre-open proxies.
-        Covers ALL non-finalized plans with moo_filled_qty == 0, including plans where
-        moo_qty was 0 (tiny positions that skipped MOO submission entirely).
+        Covers ALL non-finalized plans with open_filled_qty == 0, including plans where
+        open_qty was 0 (tiny positions that skipped market order submission entirely).
         """
         symbols_to_refresh = []
         for symbol, plan in self.entry_plans.items():
             if plan.finalized or plan.symbol in self.positions:
                 continue
-            if plan.moo_filled_qty == 0:
+            if plan.open_filled_qty == 0:
                 symbols_to_refresh.append(symbol)
         
         if not symbols_to_refresh:
@@ -705,7 +694,7 @@ class PositionManager:
             if true_open and true_open > 0:
                 old_price = plan.expected_open_price
                 plan.expected_open_price = true_open
-                logger.info(f"Price refresh: {symbol} expected_open_price {old_price:.4f} -> {true_open:.4f} (no MOO fill)")
+                logger.info(f"Price refresh: {symbol} expected_open_price {old_price:.4f} -> {true_open:.4f} (no market order fill)")
 
     def submit_post_open_rescue_pass(self, pass_name: str = "market1", state_saver=None) -> None:
         """
@@ -730,7 +719,7 @@ class PositionManager:
         for plan in self.entry_plans.values():
             if plan.finalized or plan.symbol in self.positions:
                 continue
-            already_filled = plan.moo_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
+            already_filled = plan.open_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
             remaining_qty = plan.target_qty - already_filled
             if remaining_qty > 0:
                 # Use expected open price as conservative estimate
@@ -769,7 +758,7 @@ class PositionManager:
             plan = self.entry_plans[symbol]
             snapshot = all_snapshots.get(symbol, {}) if all_snapshots else {}
             
-            already_filled = plan.moo_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
+            already_filled = plan.open_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
             remaining_qty = plan.target_qty - already_filled
             
             if remaining_qty < config.MIN_RESCUE_SHARES:
@@ -922,13 +911,13 @@ class PositionManager:
             if plan.finalized:
                 continue
 
-            total_qty = plan.moo_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
+            total_qty = plan.open_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
             if total_qty <= 0:
                 plan.finalized = True
                 continue
 
             total_cost = (
-                plan.moo_filled_qty * plan.moo_filled_avg_price +
+                plan.open_filled_qty * plan.open_filled_avg_price +
                 plan.market1_filled_qty * plan.market1_filled_avg_price +
                 plan.market2_filled_qty * plan.market2_filled_avg_price
             )
@@ -942,7 +931,7 @@ class PositionManager:
                 entry_gap_pct=plan.gap_pct,
                 adv_estimate=plan.adv_estimate,
                 peak_price=avg_price,
-                order_id=plan.market2_order_id or plan.market1_order_id or plan.moo_order_id,
+                order_id=plan.market2_order_id or plan.market1_order_id or plan.open_order_id,
             )
             self.positions[symbol] = position
             entered.append(position)
@@ -1202,79 +1191,80 @@ class PositionManager:
             logger.error(f"Error getting open orders: {e}")
             return []
 
-    def cancel_opg_buy_orders(self) -> int:
-        """Cancel all open OPG (Market-On-Open) buy orders. Returns count canceled."""
+    def cancel_open_buy_orders(self) -> int:
+        """Cancel all open market buy orders (used for startup cleanup). Returns count canceled."""
         open_orders = self.get_open_orders()
-        opg_buy_orders = [
+        # Look for market orders with day time_in_force (our entry orders)
+        market_buy_orders = [
             order for order in open_orders
-            if order.get("time_in_force") == "opg" and order.get("side") == "buy"
+            if order.get("type") == "market" and order.get("side") == "buy" and order.get("time_in_force") == "day"
         ]
         
-        if not opg_buy_orders:
+        if not market_buy_orders:
             return 0
         
-        logger.warning(f"Found {len(opg_buy_orders)} open OPG buy orders on startup - canceling to prevent duplicates")
+        logger.warning(f"Found {len(market_buy_orders)} open market buy orders on startup - canceling to prevent duplicates")
         
         canceled_count = 0
-        for order in opg_buy_orders:
+        for order in market_buy_orders:
             order_id = order.get("id")
             symbol = order.get("symbol")
             qty = order.get("qty")
             
             if self._cancel_order(order_id):
-                logger.warning(f"Canceled orphaned OPG order: {symbol} {qty} shares (ID: {order_id})")
+                logger.warning(f"Canceled orphaned market order: {symbol} {qty} shares (ID: {order_id})")
                 canceled_count += 1
             else:
-                logger.error(f"Failed to cancel OPG order: {symbol} {qty} shares (ID: {order_id})")
+                logger.error(f"Failed to cancel market order: {symbol} {qty} shares (ID: {order_id})")
         
         return canceled_count
 
-    def cancel_orphaned_opg_orders(self) -> int:
+    def cancel_orphaned_open_orders(self) -> int:
         """
-        Cancel only truly orphaned OPG buy orders - those that don't match restored entry_plans.
-        Preserves legitimate MOO orders that have matching moo_order_id in entry_plans.
+        Cancel only truly orphaned market buy orders - those that don't match restored entry_plans.
+        Preserves legitimate market orders that have matching open_order_id in entry_plans.
         Returns count canceled.
         """
         open_orders = self.get_open_orders()
-        opg_buy_orders = [
+        market_buy_orders = [
             order for order in open_orders
-            if order.get("time_in_force") == "opg" and order.get("side") == "buy"
+            if order.get("type") == "market" and order.get("side") == "buy" and order.get("time_in_force") == "day"
         ]
         
-        if not opg_buy_orders:
+        if not market_buy_orders:
             return 0
         
         # Build set of legitimate order IDs from restored entry_plans
         legitimate_order_ids = {
-            plan.moo_order_id 
+            plan.open_order_id 
             for plan in self.entry_plans.values() 
-            if plan.moo_order_id is not None
+            if plan.open_order_id is not None
         }
         
-        logger.info(f"Found {len(opg_buy_orders)} open OPG buy orders, {len(legitimate_order_ids)} match restored entry_plans")
+        logger.info(f"Found {len(market_buy_orders)} open market buy orders, {len(legitimate_order_ids)} match restored entry_plans")
         
         canceled_count = 0
         preserved_count = 0
         
-        for order in opg_buy_orders:
+        for order in market_buy_orders:
             order_id = order.get("id")
             symbol = order.get("symbol")
             qty = order.get("qty")
             
             if order_id in legitimate_order_ids:
                 # This order matches a restored entry_plan - preserve it
-                logger.info(f"Preserving legitimate OPG order: {symbol} {qty} shares (ID: {order_id})")
+                logger.info(f"Preserving legitimate market order: {symbol} {qty} shares (ID: {order_id})")
                 preserved_count += 1
             else:
                 # This order is orphaned - cancel it
                 if self._cancel_order(order_id):
-                    logger.warning(f"Canceled orphaned OPG order: {symbol} {qty} shares (ID: {order_id})")
+                    logger.warning(f"Canceled orphaned market order: {symbol} {qty} shares (ID: {order_id})")
                     canceled_count += 1
                 else:
-                    logger.error(f"Failed to cancel orphaned OPG order: {symbol} {qty} shares (ID: {order_id})")
+                    logger.error(f"Failed to cancel orphaned market order: {symbol} {qty} shares (ID: {order_id})")
         
         if preserved_count > 0:
-            logger.info(f"Preserved {preserved_count} legitimate OPG orders matching restored entry_plans")
+            logger.info(f"Preserved {preserved_count} legitimate market orders matching restored entry_plans")
         
         return canceled_count
 

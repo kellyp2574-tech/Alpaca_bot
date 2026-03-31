@@ -3,9 +3,9 @@
 Daily Schedule (ET):
 - 09:00: Pull full market snapshot from Massive, filter by price ($0.50-$5.00)
 - 09:25: Compute gaps from Massive data, build candidate list (core 4%+, filler 3-4%)
-- 09:27: Submit MOO slice (25% of position) for core candidates (staged entry)
-- 09:30:10: Reconcile MOO fills, run rescue pass 1 for remaining size
-- 09:30:30: Run rescue pass 2, finalize positions
+- 09:30:00: Submit full-size market orders at open for all candidates
+- 09:31:00: Reconcile market order fills; if OPEN_ENTRY_PCT=1.0, finalize immediately
+- 09:31:30: Rescue passes for partial fills (only when OPEN_ENTRY_PCT<1.0), finalize positions
 - Variable exit: VIX-conditioned exits (2:30 PM low VIX, 3:30 PM high VIX, or trailing stop)
 - 3:30/3:45/3:58 PM: Broker-based failsafe flatten sweeps
 """
@@ -62,7 +62,7 @@ class GapMomentumBot:
         self.stage_entry_done = False
         self.stage_exit_done = False
 
-        # Staged entry control (prevents duplicate MOO submission, NOT same as stage_entry_done)
+        # Staged entry control (prevents duplicate market order submission, NOT same as stage_entry_done)
         self.entry_submission_locked = False
 
         # Failsafe flags for broker-based flatten sweeps before market close
@@ -85,10 +85,10 @@ class GapMomentumBot:
         self.universe_retry_count = 0
         self.max_universe_retries = config.UNIVERSE_MAX_RETRIES
 
-        # Timing - MOO orders at 9:27 (cutoff ~9:28), candidates at 9:25
+        # Timing - Market orders at 9:30:00, reconcile at 9:31:00, rescue passes after
         self.target_universe = dt_time(9, 0)
         self.target_candidates = dt_time(9, 25)
-        self.target_entry = dt_time(9, 27)
+        self.target_entry = dt_time(9, 30, 0)  # Submit market orders at 9:30:00
         self.market_close = dt_time(16, 0)
 
     def run(self):
@@ -108,14 +108,14 @@ class GapMomentumBot:
             logger.error(f"Current time {current_time} is after market close ({self.market_close}) - exiting")
             return
         
-        # Between 9:27:30 and 9:30 with no saved staged-entry state: disable new entries
-        if dt_time(9, 27, 30) <= current_time < dt_time(9, 30) and not self.position_mgr.entry_plans:
-            logger.warning("Startup in entry dead zone (9:27:30-9:30) with no saved entry plans - disabling new entries for the day")
+        # After 9:30:00 but before 9:31:00 with no saved staged-entry state: disable new entries
+        if dt_time(9, 30, 0) <= current_time < dt_time(9, 31, 0) and not self.position_mgr.entry_plans:
+            logger.warning("Startup in entry dead zone (9:30:00-9:31:00) with no saved entry plans - disabling new entries for the day")
             self.stage_entry_done = True
         
-        # After 9:30:30 with no positions and no saved entry plans: disable entries, only run exit/failsafe
-        if current_time >= dt_time(9, 30, 30) and self.position_mgr.get_position_count() == 0 and not self.position_mgr.entry_plans:
-            logger.warning("Startup after 9:30:30 with no positions and no entry plans - disabling entries, will only run exit/failsafe logic")
+        # After 9:31:00 with no positions and no saved entry plans: disable entries, only run exit/failsafe
+        if current_time >= dt_time(9, 31, 0) and self.position_mgr.get_position_count() == 0 and not self.position_mgr.entry_plans:
+            logger.warning("Startup after 9:31:00 with no positions and no entry plans - disabling entries, will only run exit/failsafe logic")
             self.stage_entry_done = True
             self.stage_exit_done = True  # Nothing to exit
 
@@ -140,8 +140,8 @@ class GapMomentumBot:
                     logger.warning("Skipped Step 2 - past entry window")
                     self.stage_candidates_done = True
 
-            # Step 3: Market entry (MOO orders must submit before 9:28 cutoff)
-            # Use staged entry if enabled: MOO slice before open, rescue passes after
+            # Step 3: Market entry at 9:30:00, reconcile at 9:31:00, finalize by 9:31:30
+            # Use staged entry if enabled: full market orders at open, rescue passes if partial
             if config.USE_STAGED_OPEN_ENTRY:
                 self._step3_manage_staged_entry(current_time)
             elif not self.stage_entry_done and current_time >= self.target_entry:
@@ -347,133 +347,40 @@ class GapMomentumBot:
             time.sleep(5)
 
     def _step3_enter_positions(self):
-        """Step 3: Submit MOO orders for candidates (must complete before 9:28 cutoff)"""
-        logger.info("STEP 3: Entering positions via MOO orders")
-
-        # HARD CUTOFF: Alpaca OPG cutoff is ~9:28, use 9:27:30 for 30s safety buffer
-        current_time = datetime.now().time()
-        if current_time >= dt_time(9, 27, 30):
-            logger.error(f"Past OPG cutoff (9:27:30 buffer); current time {current_time}. Skipping entry stage.")
-            self.stage_entry_done = True
-            self._save_state()
-            return
-
-        if not self.candidates:
-            logger.info("No candidates to enter")
-            self.stage_entry_done = True
-            self._save_state()
-            return
-
-        # CRITICAL FIX: Lock stage immediately to prevent re-entry race condition
-        if self.stage_entry_done:
-            logger.info("Execution guard: stage_entry_done flag is True - skipping entry")
-            return
-
-        # Check for existing positions before locking
-        if self.position_mgr.get_position_count() > 0:
-            logger.warning(f"Execution guard: {self.position_mgr.get_position_count()} positions already exist - skipping entry")
-            self.stage_entry_done = True
-            self._save_state()
-            return
-
-        # LOCK IMMEDIATELY - prevents any re-entry
+        """Step 3: DEPRECATED - Use _step3_manage_staged_entry for market-at-open execution.
+        
+        This legacy method sent partial OPG slices before 9:28 cutoff. The current design
+        sends full market DAY orders at 9:30:00 via submit_open_entry_orders().
+        """
+        logger.warning("STEP 3: _step3_enter_positions is deprecated. Use staged entry flow.")
         self.stage_entry_done = True
         self._save_state()
-        logger.info("Entry stage locked - stage_entry_done = True")
-
-        try:
-            # Fetch total capital ONCE before deployment for consistent calculations
-            total_capital = self.position_mgr.get_total_capital()
-            
-            # PHASE 1: Deploy to core candidates (4%+ gaps)
-            logger.info(f"PHASE 1: Deploying to {len(self.core_candidates)} core candidates (4%+ gaps) using ${total_capital:,.2f} total capital")
-            positions_core, used_capital = self.position_mgr.enter_positions_moo(
-                self.core_candidates, self.vix_level, capital_override=total_capital
-            )
-            
-            # PHASE 2: Compute deployment metrics using the ORIGINAL total_capital
-            deployment_ratio = used_capital / total_capital if total_capital > 0 else 0
-            remaining_capital = total_capital - used_capital
-            
-            logger.info(f"Phase 1 complete: {len(positions_core)} positions, "
-                       f"${used_capital:,.2f} used, "
-                       f"{deployment_ratio*100:.1f}% deployed, "
-                       f"${remaining_capital:,.2f} remaining")
-            
-            # PHASE 3: Conditionally unlock filler candidates (3-4% gaps)
-            positions_filler = []
-            MIN_FILL_CAPITAL = 1000  # Minimum capital needed to enter filler positions
-            
-            # Enforce global position cap: filler can only use remaining slots after core
-            core_position_count = len(positions_core)
-            remaining_slots = max(0, config.MAX_POSITIONS - core_position_count)
-            
-            if deployment_ratio < 0.8 and remaining_capital > MIN_FILL_CAPITAL and self.filler_candidates and remaining_slots > 0:
-                # Limit filler candidates to remaining slots
-                filler_to_use = self.filler_candidates[:remaining_slots]
-                logger.info(f"PHASE 3: Unlocking filler candidates (3-4% gaps) - "
-                           f"deployment {deployment_ratio*100:.1f}% < 80%, "
-                           f"${remaining_capital:,.2f} available, "
-                           f"{remaining_slots} slots remaining for filler")
-                positions_filler, _ = self.position_mgr.enter_positions_moo(
-                    filler_to_use,
-                    self.vix_level,
-                    capital_override=remaining_capital
-                )
-            else:
-                if deployment_ratio >= 0.8:
-                    logger.info(f"Phase 3 skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
-                elif remaining_capital <= MIN_FILL_CAPITAL:
-                    logger.info(f"Phase 3 skipped: remaining capital ${remaining_capital:,.2f} <= minimum ${MIN_FILL_CAPITAL}")
-                elif remaining_slots <= 0:
-                    logger.info(f"Phase 3 skipped: no remaining slots (core filled {core_position_count}/{config.MAX_POSITIONS})")
-                else:
-                    logger.info(f"Phase 3 skipped: no filler candidates available")
-            
-            # Combine results
-            positions = positions_core + positions_filler
-            
-            logger.info(f"Entered {len(positions)} total positions ({len(positions_core)} core, {len(positions_filler)} filler)")
-            for pos in positions:
-                logger.info(f"  {pos.symbol}: {pos.quantity} shares @ ${pos.entry_price:.2f}")
-
-            self._save_state()
-
-        except Exception as e:
-            logger.error(f"Error in Step 3: {e}")
-            # Do NOT unlock - safer to fail than risk duplicate orders
-            # If manual retry is needed, user must clear state manually
-            time.sleep(5)
 
     def _step3_manage_staged_entry(self, current_time: dt_time):
-        """Three-stage entry: pre-open MOO, 9:30:10 rescue, 9:30:30 cleanup."""
+        """Three-stage entry: market orders at 9:30:00, reconcile at 9:31:00, rescue passes at 9:31:30."""
         try:
-            t1 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_1, "%H:%M:%S").time()
-            t2 = datetime.strptime(config.POST_OPEN_ENTRY_TIME_2, "%H:%M:%S").time()
+            # Phase 1: Market orders at open (9:30:00)
+            # Phase 2: Reconcile fills (9:31:00)
+            # Phase 3: Rescue passes + finalize (9:31:30)
+            t1 = dt_time(9, 31, 0)
+            t2 = dt_time(9, 31, 30)
 
-            # Hard pre-open cutoff
-            if current_time >= dt_time(9, 27, 30) and not self.position_mgr.entry_plans and not self.stage_entry_done:
-                logger.warning("Past MOO cutoff before entry plans were built")
-                self.stage_entry_done = True
-                self._save_state()
-                return
-
-            # Pre-open MOO submission
+            # Market order submission at 9:30:00
             if current_time >= self.target_entry and current_time < t1 and not self.position_mgr.entry_stage1_done:
-                logger.info("STAGED ENTRY PHASE 1: Build plans + submit MOO slice")
+                logger.info("STAGED ENTRY PHASE 1: Build plans + submit market orders at open")
 
                 if self.entry_submission_locked:
                     # Crash recovery: lock is set but phase 1 never completed.
-                    # Check if any MOO orders were actually submitted and persisted.
+                    # Check if any market orders were actually submitted and persisted.
                     has_live_orders = any(
-                        plan.moo_order_id is not None
+                        plan.open_order_id is not None
                         for plan in self.position_mgr.entry_plans.values()
                     )
                     if has_live_orders:
                         # Orders exist at broker — promote to stage1_done so phases 2/3
                         # can reconcile fills and finalize positions.
                         logger.warning(
-                            "Crash recovery: lock set with persisted MOO orders but "
+                            "Crash recovery: lock set with persisted market orders but "
                             "entry_stage1_done=False — auto-promoting to stage1_done"
                         )
                         self.position_mgr.entry_stage1_done = True
@@ -481,7 +388,7 @@ class GapMomentumBot:
                     else:
                         # Lock was set but no orders made it to broker — safe to retry.
                         logger.warning(
-                            "Crash recovery: lock set but no MOO orders persisted — "
+                            "Crash recovery: lock set but no market orders persisted — "
                             "unlocking for retry"
                         )
                         self.entry_submission_locked = False
@@ -541,8 +448,8 @@ class GapMomentumBot:
                     # Combine plans (core first, then filler)
                     all_plans = {**plans_core, **plans_filler}
                     
-                    # Submit MOO orders (persist after each submission for crash safety)
-                    self.position_mgr.submit_moo_entry_slice(all_plans, state_saver=self._save_state)
+                    # Submit market orders at 9:30:00 (persist after each submission for crash safety)
+                    self.position_mgr.submit_open_entry_orders(all_plans, state_saver=self._save_state)
 
                     logger.info(f"STAGED ENTRY PHASE 1: Built {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} total entry plans")
 
@@ -553,47 +460,53 @@ class GapMomentumBot:
                     logger.exception(f"Error in staged entry phase 1: {e}")
                     
                     # CRITICAL: Rollback lock if no orders were actually submitted
-                    # Check if any entry_plans have moo_order_id set
+                    # Check if any entry_plans have open_order_id set
                     orders_submitted = any(
-                        plan.moo_order_id is not None 
+                        plan.open_order_id is not None 
                         for plan in self.position_mgr.entry_plans.values()
                     )
                     
                     if not orders_submitted:
-                        logger.warning("No MOO orders were submitted - rolling back entry_submission_locked")
+                        logger.warning("No market orders were submitted - rolling back entry_submission_locked")
                         self.entry_submission_locked = False
                         self.position_mgr.entry_plans.clear()
                     else:
-                        logger.warning(f"Partial submission: {sum(1 for p in self.position_mgr.entry_plans.values() if p.moo_order_id)} orders submitted - keeping lock")
+                        logger.warning(f"Partial submission: {sum(1 for p in self.position_mgr.entry_plans.values() if p.open_order_id)} orders submitted - keeping lock")
                     
                     self._save_state()
                 
                 return
 
-            # First rescue pass
+            # Reconcile market order fills at 9:31:00 (only for partial fill recovery)
             if current_time >= t1 and current_time < t2 and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
-                logger.info("STAGED ENTRY PHASE 2: reconcile MOO + rescue pass 1")
-                self.position_mgr.reconcile_moo_fills()
-                # CRITICAL: Refresh prices for no-fill symbols before chase guard checks
-                self.position_mgr.refresh_no_fill_prices()
-                self.position_mgr.submit_post_open_rescue_pass("market1", state_saver=self._save_state)
+                logger.info("PHASE 2: Reconcile market order fills")
+                self.position_mgr.reconcile_open_order_fills()
+                # When OPEN_ENTRY_PCT=1.0 (full size at open), skip rescue passes - go straight to finalize
+                if config.OPEN_ENTRY_PCT >= 1.0:
+                    logger.info("Full-size market orders sent - skipping rescue passes, finalizing positions")
+                    positions = self.position_mgr.finalize_entry_positions()
+                    logger.info(f"Entered {len(positions)} positions via pure market-at-open")
+                    for pos in positions:
+                        logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
+                    self.stage_entry_done = True
                 self.position_mgr.entry_stage2_done = True
                 self._save_state()
                 return
 
-            # Final rescue + finalize
+            # Finalize positions at 9:31:30 (only needed if OPEN_ENTRY_PCT < 1.0 for staged entry)
             if current_time >= t2 and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
-                logger.info("STAGED ENTRY PHASE 3: rescue pass 2 + finalize")
-                self.position_mgr.submit_post_open_rescue_pass("market2", state_saver=self._save_state)
+                if config.OPEN_ENTRY_PCT < 1.0:
+                    logger.info("PHASE 3: Rescue passes for remaining size")
+                    self.position_mgr.refresh_no_fill_prices()
+                    self.position_mgr.submit_post_open_rescue_pass("market1", state_saver=self._save_state)
+                    self.position_mgr.submit_post_open_rescue_pass("market2", state_saver=self._save_state)
                 positions = self.position_mgr.finalize_entry_positions()
-
-                logger.info(f"Entered {len(positions)} staged positions")
+                logger.info(f"Finalized {len(positions)} positions")
                 for pos in positions:
                     logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
-
-                # NOW entry is truly complete - set stage_entry_done
                 self.stage_entry_done = True
                 self._save_state()
+                return
         except Exception as e:
             logger.exception(f"Error in staged entry flow: {e}")
             self._save_state()
@@ -719,20 +632,20 @@ class GapMomentumBot:
                 self.state_mgr.clear_bot_state()
                 self._clear_pre_trade_state()
 
-        # CRITICAL: Cancel orphaned OPG buy orders, but preserve legitimate ones with matching entry_plans
+        # CRITICAL: Cancel orphaned open buy orders, but preserve legitimate ones with matching entry_plans
         # Only cancel if we don't have restored staged-entry state, or reconcile against saved order IDs
         has_valid_entry_plans = bool(self.position_mgr.entry_plans)
         
         if has_valid_entry_plans:
             # We have restored entry_plans - reconcile against them to only cancel truly orphaned orders
-            canceled_opg = self.position_mgr.cancel_orphaned_opg_orders()
-            if canceled_opg > 0:
-                logger.warning(f"Startup: Canceled {canceled_opg} orphaned OPG orders (not matching restored entry_plans)")
+            canceled = self.position_mgr.cancel_orphaned_open_orders()
+            if canceled > 0:
+                logger.warning(f"Startup: Canceled {canceled} orphaned open orders (not matching restored entry_plans)")
         else:
-            # No entry_plans - safe to cancel all OPG buy orders (they're all orphaned)
-            canceled_opg = self.position_mgr.cancel_opg_buy_orders()
-            if canceled_opg > 0:
-                logger.warning(f"Startup: Canceled {canceled_opg} orphaned OPG buy orders (no entry_plans restored)")
+            # No entry_plans - safe to cancel all open buy orders (they're all orphaned)
+            canceled = self.position_mgr.cancel_open_buy_orders()
+            if canceled > 0:
+                logger.warning(f"Startup: Canceled {canceled} orphaned open buy orders (no entry_plans restored)")
         
         # Startup reconcile: log broker reality to prevent silent mismatch
         live_broker_positions = self.position_mgr.get_broker_positions()
@@ -757,14 +670,14 @@ class GapMomentumBot:
             entry_plans_data[symbol] = {
                 "symbol": plan.symbol,
                 "target_qty": plan.target_qty,
-                "moo_qty": plan.moo_qty,
+                "open_qty": plan.open_qty,
                 "planned_remaining_qty": plan.planned_remaining_qty,
                 "expected_open_price": plan.expected_open_price,
                 "gap_pct": plan.gap_pct,
                 "adv_estimate": plan.adv_estimate,
-                "moo_order_id": plan.moo_order_id,
-                "moo_filled_qty": plan.moo_filled_qty,
-                "moo_filled_avg_price": plan.moo_filled_avg_price,
+                "open_order_id": plan.open_order_id,
+                "open_filled_qty": plan.open_filled_qty,
+                "open_filled_avg_price": plan.open_filled_avg_price,
                 "market1_order_id": plan.market1_order_id,
                 "market1_filled_qty": plan.market1_filled_qty,
                 "market1_filled_avg_price": plan.market1_filled_avg_price,
