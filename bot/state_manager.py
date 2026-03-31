@@ -65,8 +65,8 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error saving positions: {e}")
 
-    def load_positions(self) -> Dict[str, PositionState]:
-        """Load positions from file"""
+    def load_positions(self) -> Dict[str, dict]:
+        """Load positions from file as raw dicts (consumed by PositionManager.load_positions)"""
         if not os.path.exists(self.positions_file):
             return {}
 
@@ -85,7 +85,7 @@ class StateManager:
                     pos_data['is_trailing_active'] = False
                 if 'current_price' not in pos_data:
                     pos_data['current_price'] = pos_data.get('entry_price', 0)
-                positions[symbol] = PositionState(**pos_data)
+                positions[symbol] = pos_data
 
             return positions
         except Exception as e:
@@ -99,13 +99,13 @@ class StateManager:
 
     def clear_bot_state(self):
         """Clear bot state file"""
-        bot_state_file = self.positions_file.replace("positions.json", "bot_state.json")
+        bot_state_file = os.path.join(self.state_dir, "bot_state.json")
         if os.path.exists(bot_state_file):
             os.remove(bot_state_file)
 
     def save_bot_state(self, state: dict):
         """Save bot state (VIX, stages) to file"""
-        bot_state_file = self.positions_file.replace("positions.json", "bot_state.json")
+        bot_state_file = os.path.join(self.state_dir, "bot_state.json")
         try:
             with open(bot_state_file, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -114,7 +114,7 @@ class StateManager:
 
     def load_bot_state(self) -> Optional[dict]:
         """Load bot state from file"""
-        bot_state_file = self.positions_file.replace("positions.json", "bot_state.json")
+        bot_state_file = os.path.join(self.state_dir, "bot_state.json")
         if not os.path.exists(bot_state_file):
             return None
         try:
@@ -138,7 +138,7 @@ class StateManager:
             try:
                 with open(self.daily_log_file, 'r') as f:
                     logs = json.load(f)
-            except:
+            except (json.JSONDecodeError, IOError, OSError):
                 logs = []
 
         logs.append(log_entry)
@@ -149,46 +149,6 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error saving daily log: {e}")
 
-    def save_pre_trade_state(self, universe: List[str], massive_snapshots: Dict[str, dict], candidates: List = None):
-        """Save universe and Massive data for recovery (call after Step 1/2)"""
-        pre_trade_file = self.positions_file.replace("positions.json", "pre_trade_state.json")
-        state = {
-            "universe": universe,
-            "massive_snapshots": massive_snapshots,
-        }
-        if candidates:
-            # Convert GapCandidate objects to serializable dicts
-            state["candidates"] = [
-                {
-                    "symbol": c.symbol,
-                    "gap_pct": c.gap_pct,
-                    "open_price": c.open_price,
-                    "prev_close": c.prev_close,
-                    "adv_estimate": c.adv_estimate,
-                    "price": c.price,
-                }
-                for c in candidates
-            ]
-        try:
-            with open(pre_trade_file, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving pre-trade state: {e}")
-
-    def load_pre_trade_state(self) -> Optional[dict]:
-        """Load universe and Massive data for recovery"""
-        pre_trade_file = self.positions_file.replace("positions.json", "pre_trade_state.json")
-        if not os.path.exists(pre_trade_file):
-            return None
-        try:
-            with open(pre_trade_file, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading pre-trade state: {e}")
-            return None
-
-    def clear_pre_trade_state(self):
-        """Clear pre-trade state file"""
-        pre_trade_file = self.positions_file.replace("positions.json", "pre_trade_state.json")
-        if os.path.exists(pre_trade_file):
-            os.remove(pre_trade_file)
+    # Pre-trade state methods removed - now handled by integrated_main._save_pre_trade_state()
+    # with date validation. The schema differs (includes "date" field), so keeping these
+    # stale methods would create confusion and potential bugs.

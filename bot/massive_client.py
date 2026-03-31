@@ -32,7 +32,18 @@ class MassiveClient:
             response.raise_for_status()
             data = response.json()
 
+            # Validate response structure
+            if not isinstance(data, dict):
+                logger.error(f"Massive API returned non-dict response: {type(data)}")
+                return {}
+            
+            if "tickers" not in data:
+                logger.error(f"Massive API response missing 'tickers' key. Keys: {list(data.keys())[:10]}")
+                return {}
+
             snapshots = {}
+            open_proxy_last_trade = 0
+            open_proxy_price = 0
             # v2 endpoint returns tickers array
             for item in data.get("tickers", []):
                 symbol = item.get("ticker")
@@ -51,19 +62,16 @@ class MassiveClient:
                 )
 
                 if price is not None:
-                    day_data = item.get("day", {})
-                    prev_day = item.get("prevDay", {})
-                    
                     # Extract open/high/low for gap calculation
                     # Fallback: if open not available, use last trade price as proxy
                     open_price = day_data.get("o")
                     if not open_price:
                         open_price = last_trade.get("p")
                         if open_price:
-                            logger.debug(f"{symbol}: using last_trade as open proxy (no day.o yet)")
+                            open_proxy_last_trade += 1
                     if not open_price:
                         open_price = price  # final fallback
-                        logger.debug(f"{symbol}: using price as open proxy (no day.o and no last_trade)")
+                        open_proxy_price += 1
                     
                     snapshots[symbol] = {
                         "symbol": symbol,
@@ -77,7 +85,10 @@ class MassiveClient:
                         "timestamp": last_trade.get("t"),
                     }
 
-            logger.info(f"Massive snapshot: {len(snapshots)} symbols")
+            logger.info(
+                f"Massive snapshot: {len(snapshots)} symbols"
+                f" (open proxies: {open_proxy_last_trade} last_trade, {open_proxy_price} price fallback)"
+            )
             return snapshots
 
         except requests.exceptions.RequestException as e:

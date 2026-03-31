@@ -24,38 +24,48 @@ class VIXFetcher:
 
     def get_vix_level(self) -> Optional[float]:
         """
-        Get current VIX level from Alpaca.
-        VIX is available as index data through Alpaca's API.
+        Get current intraday VIX level via yfinance.
+        Priority: fast_info live price > 1-minute bar close > daily bar close.
+        Falls back to 15.0 (middle regime) if unavailable.
         """
-        # Try to get VIX via Alpaca's snapshot API
-        url = f"{self.data_url}/v2/stocks/VIX/snapshot"
-
         try:
-            response = self.session.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                latest_trade = data.get("latestTrade", {})
-                vix = latest_trade.get("p")
-                if vix:
-                    logger.info(f"VIX level: {vix:.2f}")
-                    return float(vix)
-        except requests.exceptions.RequestException:
-            pass
+            import yfinance as yf
+            ticker = yf.Ticker("^VIX")
 
-        # Fallback: try VIXY (VIX ETF proxy) if VIX not available
-        url = f"{self.data_url}/v2/stocks/VIXY/snapshot"
-        try:
-            response = self.session.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                # VIXY price roughly VIX/10, so estimate VIX
-                vixy_price = data.get("latestTrade", {}).get("p", 0)
-                if vixy_price:
-                    estimated_vix = vixy_price * 10
-                    logger.info(f"VIX estimate (via VIXY): {estimated_vix:.2f}")
-                    return estimated_vix
-        except requests.exceptions.RequestException:
-            pass
+            # Primary: fast_info gives the live/latest price during market hours
+            try:
+                last_price = ticker.fast_info.get("lastPrice")
+                if last_price and float(last_price) > 0:
+                    vix = float(last_price)
+                    logger.info(f"VIX level (live): {vix:.2f}")
+                    return vix
+            except Exception:
+                pass
 
-        logger.warning("Could not fetch VIX, using default middle regime (12-22)")
-        return 15.0  # Default to middle regime
+            # Fallback: 1-minute bars for current session
+            try:
+                bars = ticker.history(period="1d", interval="1m")
+                if not bars.empty:
+                    vix = float(bars["Close"].iloc[-1])
+                    if vix > 0:
+                        logger.info(f"VIX level (1m bar): {vix:.2f}")
+                        return vix
+            except Exception:
+                pass
+
+            # Last resort: daily bar (may be previous close, not intraday)
+            hist = ticker.history(period="1d")
+            if not hist.empty:
+                vix = float(hist["Close"].iloc[-1])
+                if vix > 0:
+                    logger.info(f"VIX level (daily close, may be stale): {vix:.2f}")
+                    return vix
+
+            logger.warning("yfinance returned no usable VIX data")
+        except ImportError:
+            logger.warning("yfinance not installed - cannot fetch VIX")
+        except Exception as e:
+            logger.warning(f"VIX fetch failed: {e}")
+
+        logger.warning("Using default middle regime (VIX=15.0)")
+        return 15.0

@@ -58,6 +58,8 @@ MIN_ADV_DOLLARS = 5_000_000  # $5M minimum average daily dollar volume
 # Position sizing
 LIQUIDITY_CAP_PCT = 0.003  # 0.3% of ADV max position size
 MAX_POSITIONS = 100  # Maximum positions to hold at once
+MAX_POSITION_DOLLARS = 50_000  # Maximum dollars per position (absolute cap)
+MAX_POSITION_SHARES = 50_000  # Maximum shares per position (absolute cap)
 
 # Exit rules (VIX-conditioned)
 VIX_LOW_THRESHOLD = 12.0
@@ -76,6 +78,7 @@ ALPACA_DATA_URL = "https://data.alpaca.markets"
 
 # Massive API (for universe reduction)
 MASSIVE_BASE_URL = "https://api.massive.com"
+UNIVERSE_MAX_RETRIES = 3  # Max retries for Massive universe building before Alpaca fallback
 
 # Data feed (IEX for free tier)
 DATA_FEED = "iex"

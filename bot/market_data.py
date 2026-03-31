@@ -85,9 +85,9 @@ class AlpacaDataClient:
         prev_close = prev_daily_bar.get("c")
         last_price = latest_trade.get("p")
         
-        # DIAGNOSTIC: Log suspicious data for key symbols or when fields are missing
-        if symbol in ["SNAP", "FLY", "AAPL", "TSLA"] or open_price is None or prev_close is None:
-            logger.info(
+        # DIAGNOSTIC: Log when critical fields are missing (DEBUG to avoid log flood)
+        if open_price is None or prev_close is None:
+            logger.debug(
                 f"SNAPSHOT DIAGNOSTIC {symbol}: "
                 f"dailyBar={daily_bar}, "
                 f"prevDailyBar={prev_daily_bar}, "
@@ -143,33 +143,10 @@ class AlpacaDataClient:
             logger.error(f"Error getting latest trade for {symbol}: {e}")
             return None
 
-    def get_regular_session_open(self, symbol: str) -> Optional[float]:
-        """
-        Get the true regular-session (9:30 AM ET) opening price for a symbol.
-        Uses Alpaca's quotes endpoint with limit=1 to get the first RTH quote.
-        This is more reliable than dailyBar.o at 9:30 which may include pre-market data.
-        """
-        url = f"{self.data_url}/v2/stocks/{symbol}/quotes"
-        params = {
-            "feed": self.feed,
-            "limit": 1,
-        }
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            quotes = data.get("quotes", [])
-            if quotes:
-                # First quote after 9:30 should be the opening quote
-                first_quote = quotes[0]
-                # Use ask price (offer) as the opening price - what you'd pay to enter
-                open_price = first_quote.get("ap")
-                logger.debug(f"Regular session open for {symbol}: ${open_price} (from first quote)")
-                return open_price
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting regular session open for {symbol}: {e}")
-            return None
+    # get_regular_session_open() removed - was unused and misleading
+    # The implementation used limit=1 without time filtering, which doesn't reliably
+    # return the first RTH quote after 9:30. If needed in future, reimplement with
+    # proper start/end time parameters to filter for RTH session.
 
     def get_tradable_assets(self) -> List[str]:
         """
