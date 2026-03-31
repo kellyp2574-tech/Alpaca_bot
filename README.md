@@ -1,138 +1,225 @@
-# 0DTE Options Bot — XSP Iron Condor + XND Directional
+# Gap Momentum Day Trading Bot
 
-Automated 0DTE options strategy on Alpaca running two independent sleeves: an always-on XSP iron condor and a conditional XND directional play. Both use European-style, cash-settled index options — no early assignment risk.
+Automated equity day-trading strategy on Alpaca that captures overnight gap momentum in low-priced stocks ($0.50-$5.00). Uses a staged entry system with Market-On-Open orders followed by aggressive post-open rescue passes, and VIX-conditioned exit timing with trailing stops.
 
 ---
 
 ## Strategy Overview
 
-### Sleeve 1: XSP Iron Condor (Every Day)
+### Signal: Overnight Gap Momentum
 
-- **Instrument:** XSP 0DTE options (Mini-SPX, European, cash-settled)
-- **Underlying proxy:** SPY price action (XSP settles off its own index calculation)
-- **Structure:** Sell call spread + sell put spread (iron condor) as a single mleg order
-- **Short strikes:** 0.90% OTM from anchor price (SPY at 11:30 AM)
-- **Wing width:** 1.00% (max loss = wing width - credit per contract)
-- **Target credit:** ~$1.30 per contract
-- **Max loss per contract:** ~$3.70 (this is the margin requirement)
-- **Defense trigger:** If SPY moves 1.00% from anchor (using post-anchor max excursion), close all legs immediately
-- **Entry:** 11:30 AM ET
-- **Exit:** Hold to 4:00 PM cash settlement, or defense close if triggered
+The bot identifies stocks with significant overnight gaps (3%+ minimum) and strong liquidity, then enters long positions at the market open to capture intraday momentum continuation.
 
-### Sleeve 2: XND Directional (Conditional)
+**Core Candidates (4%+ gaps):**
+- Primary allocation target
+- Highest conviction trades
+- Deployed first with full capital allocation
 
-- **Instrument:** XND 0DTE options (Mini-NDX, European, cash-settled)
-- **Underlying proxy:** QQQ price action (XND strikes are in NDX index points; QQQ × 40 ≈ NDX)
-- **Structure:** Buy a single call or put in the direction of the morning trend
-- **Strike selection:** ATM relative to estimated NDX level (QQQ × 40), not raw QQQ price
-- **Entry:** 10:45 AM ET
-- **Exit:** Hold to 4:00 PM cash settlement
+**Filler Candidates (3-4% gaps):**
+- Secondary allocation (conditional)
+- Only used if core deployment <80% and capital remains
+- Fills remaining position slots up to MAX_POSITIONS
 
-**Entry filters (all three must be true at 10:30 AM):**
-- Previous day VIX close >= 18
-- QQQ morning range >= 0.40%
-- |QQQ morning directional move| > 0.30%
+### Entry: Staged 3-Phase Execution
 
-If QQQ's morning direction is up, buy a call. If down, buy a put.
+**Phase 1: MOO Slice (9:27 AM)**
+- Submit 25% of target position as Market-On-Open orders
+- Executes at 9:30 AM opening auction
+- Minimizes slippage vs. post-open market orders
 
----
+**Phase 2: First Rescue Pass (9:30:10 AM)**
+- Reconcile MOO fills
+- Submit aggressive marketable limits for remaining 75%
+- Uses live quotes with 50 bps buffer above ask
+- Chase guard: skip if price moved >3% from expected open
 
-## Sizing
+**Phase 3: Second Rescue Pass (9:30:30 AM)**
+- Final fill attempt for any remaining unfilled size
+- Finalize positions with weighted average entry price
 
-### Condor Sizing
+### Exit: VIX-Conditioned Timing
 
-```
-contracts = floor(buying_power / max_loss_per_contract)
-max_loss_per_contract = wing_width - credit ≈ $3.70 × 100 = $370
-```
+**Low VIX (<12):** Exit at 2:30 PM
+- Sliced over 10 minutes (3 slices)
+- Low volatility = take profits early
 
-`buying_power` comes directly from the Alpaca API. Example: $20,000 / $370 = **54 contracts**.
+**Middle VIX (12-22):** Trailing stop or 3:30 PM exit
+- Trailing stop: Activate at +15% gain, trail by 3%
+- If no trailing stop triggered: exit at 3:30 PM (sliced over 8 minutes)
 
-### Directional Sizing
+**High VIX (>22):** Exit at 3:30 PM
+- Sliced over 6 minutes (3 slices)
+- High volatility = hold longer for momentum continuation
 
-Both sleeves size off **live available buying power** at their respective entry times. The directional sleeve goes first (10:45 AM), and the condor uses whatever BP remains (11:30 AM).
+### Failsafe Flatten System
 
-```
-premium_budget = buying_power × directional_bp_pct × directional_leverage_multiplier
-               = buying_power × 0.0125 × 5.0
-qty = floor(premium_budget / (premium_per_contract × 100))
-```
-
-Premium is estimated from a **live option snapshot** (bid/ask mid via Alpaca's option snapshot API). Falls back to prior close price, then a conservative $2.00 if no data is available. For 0DTE options, stale pricing can cause significant over- or under-sizing — the live snapshot mitigates this.
+Independent broker-based position checks at **3:30 PM, 3:45 PM, and 3:58 PM** to ensure all positions are closed before market close, regardless of local bot state.
 
 ---
 
 ## Daily Schedule
 
-| Time (ET) | Activity |
-|-----------|----------|
-| 9:00 AM | Bot starts, pull account info, VIX previous close |
-| 9:30 AM | Market opens, begin tracking SPY/QQQ prices via Alpaca snapshots |
-| 10:30 AM | Morning assessment — evaluate directional filters |
-| 10:45 AM | Directional entry (if qualified) — submit order, poll for fill |
-| 11:30 AM | Condor entry — record anchor, compute strikes, place mleg order, poll for fill |
-| 11:30–4:00 PM | Defense monitoring — check SPY max excursion vs anchor every ~60 s |
-| 4:00 PM | Settlement — compute estimated P&L from proxy underlying prices |
-| 4:15 PM | Log P&L, save daily report, shut down |
+| Time (ET) | Activity | Details |
+|-----------|----------|---------|
+| **9:00 AM** | Universe Building | Pull full market snapshot from Massive API, filter by price ($0.50-$5.00) |
+| **9:25 AM** | Candidate Selection | Compute gaps, split into core (4%+) and filler (3-4%), rank by liquidity |
+| **9:27 AM** | MOO Slice Submission | Submit 25% of target position as Market-On-Open orders |
+| **9:30:10 AM** | Rescue Pass 1 | Reconcile MOO fills, submit aggressive limits for remaining size |
+| **9:30:30 AM** | Rescue Pass 2 | Final rescue pass, finalize positions |
+| **9:30-4:00 PM** | Exit Monitoring | VIX-conditioned exits with trailing stops or time-based sliced exits |
+| **3:30 PM** | Failsafe Flatten 1 | Broker-based position check and flatten |
+| **3:45 PM** | Failsafe Flatten 2 | Second broker-based flatten sweep |
+| **3:58 PM** | Failsafe Flatten 3 | Final pre-close flatten sweep |
+| **4:00 PM** | Market Close | Final broker flatten if needed, save state, shut down |
 
 ---
 
-## Order Lifecycle
+## Position Sizing & Risk Management
 
-Orders go through a clear state machine:
+### Capital Allocation
 
-1. **Order submitted** — `entry_order_id` is set, `is_open = False`, `is_filled = False`
-2. **Fill confirmed** — `is_filled = True`, `is_open = True` (position is now live; recorded in PDT ledger)
-3. **Terminal failure** — if the order is cancelled/rejected/expired, `entry_order_dead = True` and the bot stops polling it
+**Dynamic per-position budget:**
+```
+remaining_capital = total_buying_power - allocated_capital
+per_position_budget = remaining_capital / remaining_slots
+```
 
-Defense close orders follow the same pattern. If a defense close order terminally fails, the bot retries up to 2 times (strategy level), then escalates to `cancel_all_orders()`. The orchestrator caps total escalation attempts at 3 before logging `MANUAL INTERVENTION REQUIRED`.
+**Liquidity cap:**
+```
+max_position_size = min(per_position_budget, ADV × 0.003) / current_price
+```
 
-Every exit fill is also recorded in the PDT ledger with an `exit_reason` (`scheduled_close`, `defense`, `emergency`, or `discretionary_early_exit`).
+Each position is capped at **0.3% of Average Daily Volume** to ensure liquid exits.
 
----
+### Two-Phase Allocation
 
-## PDT Protection
+**Phase 1: Core Candidates (4%+ gaps)**
+- Deploy to highest-conviction trades first
+- Calculate deployment ratio = used_capital / total_capital
+- Track remaining capital and position slots
 
-The bot includes a Pattern Day Trader (PDT) guard to prevent accidental PDT classification.
+**Phase 2: Filler Candidates (3-4% gaps) - Conditional**
+- Only triggered if:
+  - Core deployment ratio < 80%
+  - Remaining capital > $1,000
+  - Remaining position slots available
+- Uses only remaining capital (prevents over-allocation)
+- Limited to remaining slots (respects MAX_POSITIONS cap)
 
-**Decision tree for discretionary early exits:**
+### Configuration Parameters
 
-1. Is this a mandatory exit (defense, emergency, risk-reduction)? → **Always allowed**
-2. Is account equity > $30,000? → If no, **block early exit**
-3. Are there < 3 day trades in the rolling 5-business-day window? → If no, **block early exit**
-4. All checks pass → **Allow early exit**
-
-**What counts as a day trade:** A same-day round trip where both the entry fill and exit fill occur on the same trading day. Only confirmed fills are counted — cancelled orders are ignored.
-
-**Persistent ledger:** Day trades are recorded in `state/day_trade_log.json` and survive process restarts. Each record includes the trade date, strategy sleeve, symbol, timestamps, and exit reason.
-
-**Mandatory exits are never blocked:**
-- Condor defense close (SPY breach)
-- Emergency flatten
-- Broker/order failure cleanup
-
----
-
-## Defense Monitoring
-
-After the condor is filled, the bot monitors SPY for a 1.00% move from the anchor price.
-
-**Post-anchor tracking:** The bot maintains separate `spy_post_anchor_high` / `spy_post_anchor_low` fields that track only last-trade prices sampled after the anchor is set. This prevents pre-anchor session extremes (from the daily bar) from falsely triggering defense.
-
-**Max excursion check:** Defense uses `spy_max_move_from_anchor_pct()` which examines the worst post-anchor excursion — catching breaches that occurred between polling intervals even if the current price has recovered.
-
-**Polling limitation:** Defense relies on sampled last-trade prices refreshed every ~30 seconds. A very fast sub-second excursion that fully reverses between refreshes could be missed. True tick-level defense would require a streaming WebSocket connection.
+```python
+MIN_PRICE = 0.50              # Minimum stock price
+MAX_PRICE = 5.00              # Maximum stock price
+MIN_GAP_PCT = 3.0             # Minimum gap percentage
+MAX_GAP_PCT = 50.0            # Maximum gap percentage (sanity check)
+MIN_ADV_DOLLARS = 5_000_000   # $5M minimum average daily dollar volume
+LIQUIDITY_CAP_PCT = 0.003     # 0.3% of ADV max position size
+MAX_POSITIONS = 100           # Maximum concurrent positions
+```
 
 ---
 
-## Settlement & P&L
+## Data Sources
 
-Both sleeves compute estimated P&L at 4:00 PM from proxy underlying prices:
+### Universe Building (Step 1)
+**Primary:** Massive API (Polygon)
+- Full market snapshot at 9:00 AM
+- Filter by price range ($0.50-$5.00)
+- ~4,000-8,000 symbols typically
 
-- **Condor:** Uses `tracker.spy_last` as a proxy for XSP settlement. Computes put-spread and call-spread intrinsic values against actual leg strikes. If defense was triggered, uses the actual fill price from the close order.
-- **Directional:** Uses `QQQ × 40` as an NDX proxy. Computes call/put intrinsic value against the strike price.
+**Fallback:** Alpaca Assets API
+- Used if Massive API fails after 3 retries
+- Fetches tradable US equities
+- Batched snapshot requests (1,000 symbols per batch)
 
-**Important:** These are *estimates*. XSP settles off a special index settlement value (SET), not literally SPY last trade. XND settles off an NDX-derived value, not exactly QQQ × 40. Reported P&L may differ slightly from the broker's end-of-day statement. For precise accounting, reconcile against broker reports.
+### Gap Calculation (Step 2)
+**Massive API snapshot at 9:25 AM:**
+- Fresh snapshot (not stale 9:00 data)
+- Provides: open, prev_close, volume, prev_volume
+- Gap % = (open - prev_close) / prev_close × 100
+- ADV estimate = prev_volume × prev_close
+
+### Live Execution Data
+**Alpaca IEX feed:**
+- Real-time quotes for rescue pass pricing
+- Position monitoring during trading hours
+- VIX level from Alpaca snapshot (fallback: VIXY ETF × 10)
+
+---
+
+## Order Execution Details
+
+### MOO Orders (Market-On-Open)
+```python
+order_type = "market"
+time_in_force = "opg"  # Executes at 9:30 AM auction
+```
+- Must submit before 9:28 AM cutoff (9:27:30 safety buffer)
+- Polls for fills with 5-minute timeout
+- Does NOT aggressively cancel on partial fills (lets auction complete)
+
+### Rescue Pass Orders (Marketable Limits)
+```python
+order_type = "limit"
+time_in_force = "day"
+limit_price = ask × 1.005  # 50 bps above ask for aggressive fill
+```
+- Parallel submission: all orders submitted first, then polled
+- 10-second fill timeout with partial fill cancellation
+- Buying power scaling: reduces quantities if capital insufficient
+- Chase guard: skips if price moved >3% from expected open
+
+### Exit Orders (Market)
+```python
+order_type = "market"
+time_in_force = "day"
+```
+- Trailing stops: instant full exit (no slicing)
+- Time-based exits: sliced over 6-10 minutes (3 slices)
+- Failsafe flattens: broker-based market orders at 3:30/3:45/3:58 PM
+
+---
+
+## State Persistence & Recovery
+
+### State Files
+
+**`state/positions.json`** - Active positions
+- Symbol, entry price, quantity, entry time
+- Gap %, ADV estimate
+- Peak price, trailing stop price, trailing stop active flag
+
+**`state/bot_state.json`** - Bot execution state
+- Stage flags (universe, candidates, entry, exit)
+- VIX level
+- Staged entry state (stage1_done, stage2_done, entry_submission_locked)
+- Entry plans (MOO/rescue fill tracking)
+
+**`state/pre_trade_state.json`** - Pre-trade data for recovery
+- Universe symbols
+- Massive snapshots
+- Candidates (core + filler)
+- Date stamp for validation
+
+### Recovery Logic
+
+**Startup before 9:27:30:**
+- Restore positions, entry plans, and pre-trade state
+- Resume from last completed stage
+
+**Startup 9:27:30-9:30 with no entry plans:**
+- Disable new entries (missed MOO cutoff)
+- Only run exit/failsafe logic
+
+**Startup after 9:30:30 with no positions:**
+- Disable entries and exits
+- Only run failsafe flatten sweeps
+
+**Broker reconciliation:**
+- On startup, fetch live broker positions
+- Rebuild missing local Position objects
+- Prevents silent broker/local mismatch
 
 ---
 
@@ -141,88 +228,185 @@ Both sleeves compute estimated P&L at 4:00 PM from proxy underlying prices:
 ```
 run.py                      # Entry point
 bot/
-  integrated_main.py        # CondorBot orchestrator — daily schedule, main loop
-  config.py                 # API keys (.env), state paths, logging
-  condor_config.py          # Strategy parameters (strikes, sizing, schedule, filters)
-  options_client.py         # Alpaca options REST API — contracts, mleg orders,
-                            #   single-leg orders, option snapshots, account info
-  market_data.py            # MorningTracker — SPY/QQQ/VIX price tracking,
-                            #   session-wide daily bar stats + post-anchor defense
-  condor_strategy.py        # Iron condor: enter, check_defense, close_defense,
-                            #   check_defense_fill, on_settlement
-  directional_strategy.py   # XND directional: assess_filters, enter, on_settlement
-  pdt_guard.py              # PDT protection — persistent day-trade ledger,
-                            #   rolling 5-business-day count, discretionary exit gate
+  integrated_main.py        # GapMomentumBot orchestrator — daily schedule, event loop
+  config.py                 # API keys (.env), state paths, logging, strategy params
+  position_manager.py       # Position & order management, staged entry, exits
+  gap_calculator.py         # Gap calculation, candidate filtering, liquidity ranking
+  massive_client.py         # Massive API client for universe building
+  market_data.py            # Alpaca data client (IEX feed)
+  vix_fetcher.py            # VIX level fetching (Alpaca snapshot or VIXY fallback)
+  state_manager.py          # State persistence and recovery
 state/
-  day_trade_log.json        # Persistent PDT day-trade ledger (auto-created)
-  reports/                  # Daily JSON reports with PDT status
+  positions.json            # Active positions (auto-created)
+  bot_state.json            # Bot execution state (auto-created)
+  pre_trade_state.json      # Pre-trade data for recovery (auto-created)
+  daily_log.json            # Daily summary log (auto-created)
+  logs/
+    bot.log                 # Main log file
+    trades.log              # Trade-specific log
 ```
-
-Legacy momentum files (`morning_main.py`, `position_manager.py`, etc.) are preserved in `bot/` but are not used by the condor system.
-
-**Data flow:**
-- SPY/QQQ prices from Alpaca stock snapshots (daily bar high/low + last trade)
-- VIX previous close from yfinance
-- Option contracts from `/v2/options/contracts` (0DTE strike lookup)
-- Live option premium from `/v1beta1/options/snapshots/{symbol}` (directional sizing)
-- Iron condor placed as a single `order_class: "mleg"` order with 4 legs
-- All legs use `position_intent` (`buy_to_open`, `sell_to_open`, etc.)
 
 ---
 
 ## Setup
 
+### Requirements
+- Python 3.11+
+- Alpaca trading account (paper or live)
+- Massive API key (Polygon) for universe building
+
+### Installation
+
 ```bash
+# Create virtual environment
 python -m venv .venv
 .venv\Scripts\activate  # Windows
+source .venv/bin/activate  # Linux/Mac
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Configure environment
 cp .env.example .env
-# Fill in Alpaca keys, set ALPACA_PAPER=true for paper trading
+# Edit .env with your API keys:
+#   ALPACA_API_KEY=your_alpaca_key
+#   ALPACA_SECRET_KEY=your_alpaca_secret
+#   ALPACA_PAPER=true  # or false for live trading
+#   MASSIVE_API_KEY=your_massive_key
 ```
 
-**Requirements:** Python 3.11+, Alpaca Options Level 3 trading enabled.
+### Dependencies
+```
+requests>=2.31.0
+python-dotenv>=1.0.0
+```
+
+---
 
 ## Usage
 
+### Basic Usage
 ```bash
-python run.py               # Live/paper trading
-python run.py --dry-run     # Log signals without submitting orders
+python run.py
 ```
 
-Start the bot at or before 9:00 AM ET. It will wait for each scheduled event and shut down automatically at 4:15 PM.
+Start the bot at or before **9:00 AM ET**. It will:
+1. Wait for each scheduled event
+2. Execute trades automatically
+3. Shut down at 4:00 PM after market close
 
-If started after 9:30 AM, the bot detects the late start and backfills open prices from the Alpaca daily bar. Morning range calculations will still use exchange-reported session extremes.
+### Late Start Behavior
 
-**Daily reports** are saved to `state/reports/daily_report_YYYY-MM-DD.json`.
+**Started after 9:00 but before 9:25:**
+- Immediately runs universe building
+- Continues normally
+
+**Started after 9:25 but before 9:27:30:**
+- Immediately runs candidate selection
+- Continues to MOO submission
+
+**Started after 9:27:30 but before 9:30:**
+- Skips entry stage (missed MOO cutoff)
+- Only runs exit/failsafe logic
+
+**Started after 9:30:30:**
+- Checks for existing positions
+- If positions exist: runs exit/failsafe logic
+- If no positions: only runs failsafe flatten sweeps
+
+### Monitoring
+
+**Log files:**
+- `state/logs/bot.log` - Main execution log
+- `state/logs/trades.log` - Trade-specific events
+
+**State files:**
+- `state/positions.json` - Current positions
+- `state/bot_state.json` - Execution state
+- `state/daily_log.json` - Daily summaries
+
+---
 
 ## Configuration
 
-All strategy parameters are in `bot/condor_config.py`:
+All parameters in `bot/config.py`:
 
+### Price & Gap Filters
 ```python
-# Condor strikes
-short_strike_pct = 0.009    # 0.90% OTM from anchor
-wing_width_pct = 0.010      # 1.00% wing width
-target_credit = 1.30        # Target net credit per contract
-max_loss_per_contract = 3.70
-
-# Defense
-defense_trigger_pct = 0.010 # 1.00% move from anchor triggers close
-
-# Directional filters
-vix_threshold = 18.0
-morning_range_pct = 0.004   # 0.40%
-morning_direction_pct = 0.003  # 0.30%
-
-# Directional sizing (based on current available buying power)
-directional_bp_pct = 0.0125             # Percent of current BP for premium budget
-directional_leverage_multiplier = 5.0   # Premium budget scaled by this multiplier
+MIN_PRICE = 0.50              # Minimum stock price
+MAX_PRICE = 5.00              # Maximum stock price
+MIN_GAP_PCT = 3.0             # Minimum gap percentage
+MAX_GAP_PCT = 50.0            # Maximum gap percentage
 ```
+
+### Volume & Liquidity
+```python
+MIN_ADV_DOLLARS = 5_000_000   # $5M minimum ADV
+LIQUIDITY_CAP_PCT = 0.003     # 0.3% of ADV max position
+MAX_POSITIONS = 100           # Max concurrent positions
+```
+
+### VIX Exit Thresholds
+```python
+VIX_LOW_THRESHOLD = 12.0      # Below = early exit (2:30 PM)
+VIX_HIGH_THRESHOLD = 22.0     # Above = late exit (3:30 PM)
+EXIT_TIME_LOW_VIX = "14:30"   # 2:30 PM
+EXIT_TIME_MIDDLE_VIX = "15:30"  # 3:30 PM
+EXIT_TIME_HIGH_VIX = "15:30"  # 3:30 PM
+```
+
+### Trailing Stop (Middle VIX Regime)
+```python
+TRAILING_STOP_ACTIVATION = 0.15  # 15% gain to activate
+TRAILING_STOP_PCT = 0.03         # 3% trail
+```
+
+### Staged Entry
+```python
+USE_STAGED_OPEN_ENTRY = True     # Enable staged entry
+MOO_ENTRY_PCT = 0.25             # 25% MOO slice
+POST_OPEN_ENTRY_TIME_1 = "09:30:10"  # First rescue pass
+POST_OPEN_ENTRY_TIME_2 = "09:30:30"  # Second rescue pass
+POST_OPEN_BUY_LIMIT_BUFFER = 0.005   # 50 bps above ask
+MAX_CHASE_FROM_OPEN_PCT = 0.03       # 3% max chase
+MIN_RESCUE_NOTIONAL = 100.0          # Skip tiny orders
+MIN_RESCUE_SHARES = 1                # Minimum share count
+```
+
+---
 
 ## Known Limitations
 
-- **Settlement P&L is estimated.** XSP and XND settle off special index values, not SPY/QQQ last trades. Reported P&L should be reconciled against broker statements.
-- **Defense is polling-based.** Sub-second excursions between ~30 s refresh intervals could be missed. Streaming WebSocket defense is not implemented.
-- **Directional sizing falls back to stale data.** If the live option snapshot is unavailable, sizing uses prior close or a $2.00 fallback, which can be far off for 0DTE.
-- **NDX proxy.** XND strike selection and settlement use QQQ × 40 as an NDX approximation. The actual ratio fluctuates slightly.
-- **PDT guard uses local business-day count.** Does not account for market holidays. The 5-business-day window is based on Mon–Fri, not the exchange calendar.
+1. **Massive API dependency** - Universe building requires Massive API. Alpaca fallback is slower and may miss symbols.
+
+2. **No intraday monitoring system** - No real-time performance tracking, alerts, or trade ledgers (monitoring system referenced in code memories but not implemented).
+
+3. **Polling-based execution** - 1-second event loop. Very fast market moves between polls could be missed.
+
+4. **No maximum position size cap** - Liquidity cap could theoretically produce very large positions for high-ADV stocks. Consider adding absolute dollar/share caps.
+
+5. **Sliced exits use time-based execution** - Not VWAP-aware. Could improve with volume-weighted slicing.
+
+6. **No backtesting framework** - Strategy parameters tuned manually without systematic backtesting.
+
+7. **VIX fallback estimation** - Uses VIXY × 10 approximation if VIX unavailable. Could be inaccurate.
+
+8. **State recovery race conditions** - Startup in 9:27:30-9:30 window could abandon live MOO orders if no entry plans saved.
+
+9. **No duplicate protection between core/filler** - Same symbol could theoretically appear in both core and filler candidate lists.
+
+10. **Massive API endpoint may be Polygon-specific** - Code uses Polygon v2 endpoint structure. Verify compatibility with actual Massive.com API.
+
+---
+
+## Risk Warnings
+
+⚠️ **This is a high-frequency day-trading strategy with significant risks:**
+
+- **Gap fade risk:** Overnight gaps can reverse intraday, causing losses
+- **Low-priced stock volatility:** $0.50-$5.00 stocks are highly volatile
+- **Liquidity risk:** 0.3% ADV cap may not prevent slippage in fast markets
+- **Technology risk:** API failures, network issues, or bugs could cause losses
+- **Regulatory risk:** Pattern Day Trader rules apply (requires $25k+ for margin accounts)
+
+**Always test in paper trading first. Never risk capital you cannot afford to lose.**
