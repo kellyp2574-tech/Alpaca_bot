@@ -70,9 +70,20 @@ class GapMomentumBot:
         self.failsafe_345_done = False
         self.failsafe_358_done = False
 
+        # Post-close flatten retry cap (prevents infinite loop if positions can't close)
+        self.post_close_flatten_attempts = 0
+        self.max_post_close_flatten_attempts = 3
+
+        # Cooldown: prevent mismatch flatten from firing every poll cycle
+        self.mismatch_flatten_done = False
+
+        # Rate-limit exit checks to stay under 200 API calls/min
+        self.last_exit_check_time: Optional[datetime] = None
+        self.exit_check_interval_seconds = 30
+
         # Retry counters
         self.universe_retry_count = 0
-        self.max_universe_retries = 3
+        self.max_universe_retries = config.UNIVERSE_MAX_RETRIES
 
         # Timing - MOO orders at 9:27 (cutoff ~9:28), candidates at 9:25
         self.target_universe = dt_time(9, 0)
@@ -138,6 +149,8 @@ class GapMomentumBot:
 
             # Hard broker-based failsafe exits, independent of local bot memory
             if self.stage_entry_done and not self.failsafe_330_done and current_time >= dt_time(15, 30):
+                # Clear exit slicers first so they don't fight with the failsafe
+                self.position_mgr.exit_slicers.clear()
                 self._run_failsafe_flatten("3:30 PM failsafe")
                 self.failsafe_330_done = True
 
@@ -149,13 +162,34 @@ class GapMomentumBot:
                 self._run_failsafe_flatten("3:58 PM failsafe")
                 self.failsafe_358_done = True
 
-            # Step 4: Manage exits
+            # Step 4: Manage exits (rate-limited to every 30s to stay under 200 API calls/min)
             if self.stage_entry_done and not self.stage_exit_done:
                 if current_time < self.market_close:
-                    self._step4_manage_exits(current_time)
+                    # Throttle exit checks: only run every exit_check_interval_seconds
+                    should_check = (
+                        self.last_exit_check_time is None
+                        or (now - self.last_exit_check_time).total_seconds() >= self.exit_check_interval_seconds
+                    )
+                    if should_check:
+                        self._step4_manage_exits(current_time)
+                        self.last_exit_check_time = now
                 else:
-                    logger.warning("Market close reached - running final broker-based flatten")
-                    self._run_failsafe_flatten("4:00 PM market-close failsafe")
+                    # Post-close: retry flatten with a cap to prevent infinite loop
+                    if self.post_close_flatten_attempts < self.max_post_close_flatten_attempts:
+                        self.post_close_flatten_attempts += 1
+                        logger.warning(
+                            f"Market close reached - flatten attempt "
+                            f"{self.post_close_flatten_attempts}/{self.max_post_close_flatten_attempts}"
+                        )
+                        self._run_failsafe_flatten("4:00 PM market-close failsafe")
+                    elif not self.stage_exit_done:
+                        broker_count = self.position_mgr.broker_position_count()
+                        if broker_count > 0:
+                            logger.critical(
+                                f"FAILED TO FLATTEN after {self.max_post_close_flatten_attempts} attempts - "
+                                f"{broker_count} broker positions remain. Manual intervention required."
+                            )
+                        self.stage_exit_done = True
 
             # Check if day is complete
             if current_time >= self.market_close and self.stage_entry_done and self.stage_exit_done:
@@ -283,13 +317,14 @@ class GapMomentumBot:
             core_candidates = [c for c in all_candidates if c.gap_pct >= 4.0]
             filler_candidates = [c for c in all_candidates if 3.0 <= c.gap_pct < 4.0]
 
-            # Apply liquidity filter separately
+            # Apply liquidity filter: core gets priority, filler gets remaining slots
             core_candidates = self.gap_calc.select_by_liquidity_and_gap(
                 core_candidates, max_positions=config.MAX_POSITIONS
             )
+            remaining_slots = max(0, config.MAX_POSITIONS - len(core_candidates))
             filler_candidates = self.gap_calc.select_by_liquidity_and_gap(
-                filler_candidates, max_positions=config.MAX_POSITIONS
-            )
+                filler_candidates, max_positions=remaining_slots
+            ) if remaining_slots > 0 else []
 
             # Store both lists
             self.core_candidates = core_candidates
@@ -428,66 +463,111 @@ class GapMomentumBot:
                 logger.info("STAGED ENTRY PHASE 1: Build plans + submit MOO slice")
 
                 if self.entry_submission_locked:
+                    # Crash recovery: lock is set but phase 1 never completed.
+                    # Check if any MOO orders were actually submitted and persisted.
+                    has_live_orders = any(
+                        plan.moo_order_id is not None
+                        for plan in self.position_mgr.entry_plans.values()
+                    )
+                    if has_live_orders:
+                        # Orders exist at broker — promote to stage1_done so phases 2/3
+                        # can reconcile fills and finalize positions.
+                        logger.warning(
+                            "Crash recovery: lock set with persisted MOO orders but "
+                            "entry_stage1_done=False — auto-promoting to stage1_done"
+                        )
+                        self.position_mgr.entry_stage1_done = True
+                        self._save_state()
+                    else:
+                        # Lock was set but no orders made it to broker — safe to retry.
+                        logger.warning(
+                            "Crash recovery: lock set but no MOO orders persisted — "
+                            "unlocking for retry"
+                        )
+                        self.entry_submission_locked = False
+                        self._save_state()
                     return
 
                 self.entry_submission_locked = True
                 self._save_state()
 
-                total_capital = self.position_mgr.get_total_capital()
+                try:
+                    total_capital = self.position_mgr.get_total_capital()
 
-                # PHASE 1: Build core plans first (4%+ gaps)
-                # CRITICAL FIX: Clear stale entry plans before first build of the day
-                self.position_mgr.entry_plans.clear()
-                plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
-                
-                # Calculate capital reserved by core plans (use target_qty with 1.02 slippage reserve, matching build_entry_plans)
-                core_reserved_notional = sum(
-                    plan.target_qty * plan.expected_open_price * 1.02
-                    for plan in plans_core.values()
-                )
-                deployment_ratio = core_reserved_notional / total_capital if total_capital > 0 else 0
-                remaining_capital = total_capital - core_reserved_notional
-                remaining_slots = max(0, config.MAX_POSITIONS - len(plans_core))
-                
-                logger.info(f"PHASE 1: Built {len(plans_core)} core plans, "
-                           f"reserved ${core_reserved_notional:,.2f} ({deployment_ratio*100:.1f}%), "
-                           f"remaining ${remaining_capital:,.2f}, {remaining_slots} slots")
-                
-                # PHASE 2: Conditionally build filler plans (3-4% gaps)
-                plans_filler = {}
-                MIN_FILL_CAPITAL = 1000
-                
-                if (deployment_ratio < 0.8 and 
-                    remaining_capital > MIN_FILL_CAPITAL and 
-                    self.filler_candidates and 
-                    remaining_slots > 0):
+                    # PHASE 1: Build core plans first (4%+ gaps)
+                    # CRITICAL FIX: Clear stale entry plans before first build of the day
+                    self.position_mgr.entry_plans.clear()
+                    plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
                     
-                    # Limit filler to remaining slots
-                    filler_to_plan = self.filler_candidates[:remaining_slots]
-                    plans_filler = self.position_mgr.build_entry_plans(
-                        filler_to_plan, 
-                        capital_override=remaining_capital
+                    # Calculate capital reserved by core plans (use target_qty with 1.02 slippage reserve, matching build_entry_plans)
+                    core_reserved_notional = sum(
+                        plan.target_qty * plan.expected_open_price * 1.02
+                        for plan in plans_core.values()
                     )
-                    logger.info(f"PHASE 2: Built {len(plans_filler)} filler plans against remaining capital")
-                else:
-                    if deployment_ratio >= 0.8:
-                        logger.info(f"Phase 2 skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
-                    elif remaining_capital <= MIN_FILL_CAPITAL:
-                        logger.info(f"Phase 2 skipped: remaining ${remaining_capital:,.2f} <= min ${MIN_FILL_CAPITAL}")
-                    elif remaining_slots <= 0:
-                        logger.info(f"Phase 2 skipped: no slots (core filled {len(plans_core)}/{config.MAX_POSITIONS})")
+                    deployment_ratio = core_reserved_notional / total_capital if total_capital > 0 else 0
+                    remaining_capital = total_capital - core_reserved_notional
+                    remaining_slots = max(0, config.MAX_POSITIONS - len(plans_core))
+                    
+                    logger.info(f"PHASE 1: Built {len(plans_core)} core plans, "
+                               f"reserved ${core_reserved_notional:,.2f} ({deployment_ratio*100:.1f}%), "
+                               f"remaining ${remaining_capital:,.2f}, {remaining_slots} slots")
+                    
+                    # PHASE 2: Conditionally build filler plans (3-4% gaps)
+                    plans_filler = {}
+                    MIN_FILL_CAPITAL = 1000
+                    
+                    if (deployment_ratio < 0.8 and 
+                        remaining_capital > MIN_FILL_CAPITAL and 
+                        self.filler_candidates and 
+                        remaining_slots > 0):
+                        
+                        # Limit filler to remaining slots
+                        filler_to_plan = self.filler_candidates[:remaining_slots]
+                        plans_filler = self.position_mgr.build_entry_plans(
+                            filler_to_plan, 
+                            capital_override=remaining_capital
+                        )
+                        logger.info(f"PHASE 2: Built {len(plans_filler)} filler plans against remaining capital")
                     else:
-                        logger.info(f"Phase 2 skipped: no filler candidates")
-                
-                # Combine plans (core first, then filler)
-                all_plans = {**plans_core, **plans_filler}
-                
-                self.position_mgr.submit_moo_entry_slice(all_plans)
+                        if deployment_ratio >= 0.8:
+                            logger.info(f"Phase 2 skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
+                        elif remaining_capital <= MIN_FILL_CAPITAL:
+                            logger.info(f"Phase 2 skipped: remaining ${remaining_capital:,.2f} <= min ${MIN_FILL_CAPITAL}")
+                        elif remaining_slots <= 0:
+                            logger.info(f"Phase 2 skipped: no slots (core filled {len(plans_core)}/{config.MAX_POSITIONS})")
+                        else:
+                            logger.info(f"Phase 2 skipped: no filler candidates")
+                    
+                    # Combine plans (core first, then filler)
+                    all_plans = {**plans_core, **plans_filler}
+                    
+                    # Submit MOO orders (persist after each submission for crash safety)
+                    self.position_mgr.submit_moo_entry_slice(all_plans, state_saver=self._save_state)
 
-                logger.info(f"STAGED ENTRY PHASE 1: Built {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} total entry plans")
+                    logger.info(f"STAGED ENTRY PHASE 1: Built {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} total entry plans")
 
-                self.position_mgr.entry_stage1_done = True
-                self._save_state()
+                    self.position_mgr.entry_stage1_done = True
+                    self._save_state()
+                    
+                except Exception as e:
+                    logger.exception(f"Error in staged entry phase 1: {e}")
+                    
+                    # CRITICAL: Rollback lock if no orders were actually submitted
+                    # Check if any entry_plans have moo_order_id set
+                    orders_submitted = any(
+                        plan.moo_order_id is not None 
+                        for plan in self.position_mgr.entry_plans.values()
+                    )
+                    
+                    if not orders_submitted:
+                        logger.warning("No MOO orders were submitted - rolling back entry_submission_locked")
+                        self.entry_submission_locked = False
+                        self.position_mgr.entry_plans.clear()
+                    else:
+                        logger.warning(f"Partial submission: {sum(1 for p in self.position_mgr.entry_plans.values() if p.moo_order_id)} orders submitted - keeping lock")
+                    
+                    self._save_state()
+                
                 return
 
             # First rescue pass
@@ -496,7 +576,7 @@ class GapMomentumBot:
                 self.position_mgr.reconcile_moo_fills()
                 # CRITICAL: Refresh prices for no-fill symbols before chase guard checks
                 self.position_mgr.refresh_no_fill_prices()
-                self.position_mgr.submit_post_open_rescue_pass("market1")
+                self.position_mgr.submit_post_open_rescue_pass("market1", state_saver=self._save_state)
                 self.position_mgr.entry_stage2_done = True
                 self._save_state()
                 return
@@ -504,7 +584,7 @@ class GapMomentumBot:
             # Final rescue + finalize
             if current_time >= t2 and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
                 logger.info("STAGED ENTRY PHASE 3: rescue pass 2 + finalize")
-                self.position_mgr.submit_post_open_rescue_pass("market2")
+                self.position_mgr.submit_post_open_rescue_pass("market2", state_saver=self._save_state)
                 positions = self.position_mgr.finalize_entry_positions()
 
                 logger.info(f"Entered {len(positions)} staged positions")
@@ -526,14 +606,33 @@ class GapMomentumBot:
         if local_count == 0 and broker_count == 0:
             logger.info("All positions closed locally and at broker - exit complete")
             self.stage_exit_done = True
+            self._save_state()
             return
 
         if local_count == 0 and broker_count > 0:
+            if not self.mismatch_flatten_done:
+                logger.warning(
+                    f"Local positions empty but broker shows {broker_count} live positions - "
+                    f"running immediate broker flatten"
+                )
+                self._run_failsafe_flatten("intraday broker/local mismatch")
+                self.mismatch_flatten_done = True
+                self._save_state()
+            else:
+                logger.warning(
+                    f"Broker still shows {broker_count} positions after mismatch flatten - "
+                    f"waiting for failsafe sweeps"
+                )
+            return
+
+        if local_count > 0 and broker_count == 0:
             logger.warning(
-                f"Local positions empty but broker shows {broker_count} live positions - "
-                f"running immediate broker flatten"
+                f"Local shows {local_count} positions but broker is flat - "
+                f"clearing stale local state"
             )
-            self._run_failsafe_flatten("intraday broker/local mismatch")
+            self.position_mgr.positions.clear()
+            self.position_mgr.exit_slicers.clear()
+            self.stage_exit_done = True
             self._save_state()
             return
 
@@ -541,8 +640,7 @@ class GapMomentumBot:
         exited = self.position_mgr.check_exits(current_time, self.vix_level, current_prices)
         if exited:
             logger.info(f"Exited {len(exited)} positions: {exited}")
-
-        self._save_state()
+            self._save_state()
 
     def _load_state(self):
         """Load state from previous run (for recovery)"""
@@ -601,6 +699,16 @@ class GapMomentumBot:
                 else:
                     # No pre-trade data - don't restore stage flags for steps 1-2
                     logger.warning("No pre-trade state found - will rebuild universe and candidates")
+                    
+                    # CRITICAL FIX: If no valid pre_trade and no valid entry_plans, reset staged entry locks
+                    # to prevent permanent lock from corrupted/missing state
+                    if not entry_plans_data:
+                        logger.warning("No entry plans found - resetting staged entry locks to allow fresh entry")
+                        self.entry_submission_locked = False
+                        self.position_mgr.entry_stage1_done = False
+                        self.position_mgr.entry_stage2_done = False
+                        self.position_mgr.entry_plans.clear()
+                    
                     # Only restore entry/exit if we have positions
                     if positions:
                         self.stage_entry_done = True
@@ -611,6 +719,21 @@ class GapMomentumBot:
                 self.state_mgr.clear_bot_state()
                 self._clear_pre_trade_state()
 
+        # CRITICAL: Cancel orphaned OPG buy orders, but preserve legitimate ones with matching entry_plans
+        # Only cancel if we don't have restored staged-entry state, or reconcile against saved order IDs
+        has_valid_entry_plans = bool(self.position_mgr.entry_plans)
+        
+        if has_valid_entry_plans:
+            # We have restored entry_plans - reconcile against them to only cancel truly orphaned orders
+            canceled_opg = self.position_mgr.cancel_orphaned_opg_orders()
+            if canceled_opg > 0:
+                logger.warning(f"Startup: Canceled {canceled_opg} orphaned OPG orders (not matching restored entry_plans)")
+        else:
+            # No entry_plans - safe to cancel all OPG buy orders (they're all orphaned)
+            canceled_opg = self.position_mgr.cancel_opg_buy_orders()
+            if canceled_opg > 0:
+                logger.warning(f"Startup: Canceled {canceled_opg} orphaned OPG buy orders (no entry_plans restored)")
+        
         # Startup reconcile: log broker reality to prevent silent mismatch
         live_broker_positions = self.position_mgr.get_broker_positions()
         if live_broker_positions:
@@ -790,11 +913,37 @@ def main():
     try:
         bot.run()
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        bot._finalize_day()
+        current_time = datetime.now().time()
+        logger.warning(f"Interrupted by user at {current_time}")
+        
+        # Only flatten if after market close or in failsafe window
+        if current_time >= dt_time(16, 0):
+            logger.info("After market close - running finalize_day")
+            bot._finalize_day()
+        elif current_time >= dt_time(15, 30):
+            logger.warning("In failsafe window - running broker flatten only")
+            bot._run_failsafe_flatten("KeyboardInterrupt during failsafe window")
+            bot._save_state()
+        else:
+            logger.warning("During market hours - preserving state, NOT flattening positions")
+            logger.warning("Positions remain open. Manual intervention required if liquidation needed.")
+            bot._save_state()
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
-        bot._finalize_day()
+        current_time = datetime.now().time()
+        logger.exception(f"Fatal error at {current_time}: {e}")
+        
+        # Only flatten if after market close or in failsafe window
+        if current_time >= dt_time(16, 0):
+            logger.info("After market close - running finalize_day")
+            bot._finalize_day()
+        elif current_time >= dt_time(15, 30):
+            logger.warning("In failsafe window - running broker flatten only")
+            bot._run_failsafe_flatten("Exception during failsafe window")
+            bot._save_state()
+        else:
+            logger.critical("FATAL ERROR DURING MARKET HOURS - preserving state, NOT flattening positions")
+            logger.critical("Positions remain open. Manual intervention required.")
+            bot._save_state()
         raise
 
 
