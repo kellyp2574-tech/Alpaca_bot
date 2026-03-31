@@ -84,18 +84,18 @@ UNIVERSE_MAX_RETRIES = 3  # Max retries for Massive universe building before Alp
 DATA_FEED = "iex"
 
 # ═══════════════════════════════════════════════════
-# Staged Entry Execution Model (MOO + Post-Open Rescue)
+# Staged Entry Execution Model (Market Orders at Open + Rescue Passes)
 # ═══════════════════════════════════════════════════
 
-# Enable staged entry: submit partial MOO before open, aggressive fill remainder after
+# Enable staged entry: submit market orders at 9:30:00, rescue passes after
 USE_STAGED_OPEN_ENTRY = True
 
-# Percent of target size sent as MOO before the open (0.25 = 25%)
-MOO_ENTRY_PCT = 0.25
+# Percent of target size sent as initial market order at 9:30:00 (1.0 = 100%)
+OPEN_ENTRY_PCT = 1.0
 
-# Timing for post-open rescue passes
-POST_OPEN_ENTRY_TIME_1 = "09:30:10"
-POST_OPEN_ENTRY_TIME_2 = "09:30:30"
+# Timing for reconciliation and rescue passes
+POST_OPEN_ENTRY_TIME_1 = "09:31:00"  # Reconcile initial market order fills
+POST_OPEN_ENTRY_TIME_2 = "09:31:30"  # Rescue passes for remaining size
 
 # Aggressive marketable limit buffer for buy orders (0.005 = 50 bps)
 POST_OPEN_BUY_LIMIT_BUFFER = 0.005
