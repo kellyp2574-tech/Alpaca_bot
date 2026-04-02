@@ -572,123 +572,116 @@ class GapMomentumBot:
             self._save_state()
 
     def _load_state(self):
-        """Load state from previous run (for recovery)"""
-        # Load positions first
-        positions = self.state_mgr.load_positions()
-        if positions:
-            logger.info(f"Loaded {len(positions)} positions from state, restoring...")
-            self.position_mgr.load_positions(positions)
-            self.stage_entry_done = True
-            self.stage_universe_done = True
-            self.stage_candidates_done = True
+        """Load state from previous run (for same-day crash recovery only).
         
-        # Load bot state (VIX, stages, and pre-trade data)
-        bot_state = self.state_mgr.load_bot_state()
+        Rules:
+        1. Non-today state → nuke everything, start completely fresh.
+        2. Same-day state → restore only if backing data is complete.
+        3. Broker positions are always ground truth at the end.
+        """
         today = datetime.now().strftime("%Y-%m-%d")
-        
-        if bot_state:
-            saved_date = bot_state.get("date")
-            if saved_date == today:
-                self.vix_level = bot_state.get("vix_level", self.vix_level)
-                
-                # CRITICAL FIX: Always restore staged entry state if available (independent of pre_trade)
+        bot_state = self.state_mgr.load_bot_state()
+        saved_date = bot_state.get("date") if bot_state else None
+        is_same_day = saved_date == today
+
+        # ── Step 1: If not same-day, clear everything ──
+        if not is_same_day:
+            if saved_date:
+                logger.warning(f"Stale state from {saved_date} — clearing all state for fresh start")
+            else:
+                logger.info("No saved state found — fresh start")
+            self.state_mgr.clear_bot_state()
+            self.state_mgr.save_positions({})
+            self._clear_pre_trade_state()
+            self.position_mgr.positions.clear()
+            self.position_mgr.entry_plans.clear()
+            self.position_mgr.exit_slicers.clear()
+            # All stage flags stay at __init__ defaults (False)
+
+        # ── Step 2: Same-day recovery ──
+        else:
+            logger.info(f"Same-day state found — attempting recovery")
+
+            # Restore entry plans if saved
+            entry_plans_data = bot_state.get("entry_plans", {})
+            if entry_plans_data:
+                from bot.position_manager import EntryExecutionPlan
+                for symbol, plan_data in entry_plans_data.items():
+                    self.position_mgr.entry_plans[symbol] = EntryExecutionPlan(**plan_data)
+                logger.info(f"Restored {len(entry_plans_data)} entry plans")
+
+            # Restore positions from file
+            positions = self.state_mgr.load_positions()
+            if positions:
+                self.position_mgr.load_positions(positions)
+                logger.info(f"Restored {len(positions)} positions from state")
+
+            # Restore pre-trade data (universe, candidates, Massive snapshots)
+            pre_trade = self._load_pre_trade_state()
+            if pre_trade:
+                self.universe = pre_trade.get("universe", [])
+                self.massive_snapshots = pre_trade.get("massive_snapshots", {})
+                candidates_data = pre_trade.get("candidates", [])
+                if candidates_data:
+                    self.candidates = [GapCandidate(**c) for c in candidates_data]
+                    self.core_candidates = [c for c in self.candidates if c.gap_pct >= 4.0]
+                    self.filler_candidates = [c for c in self.candidates if 3.0 <= c.gap_pct < 4.0]
+                    logger.info(f"Restored {len(self.candidates)} candidates: {len(self.core_candidates)} core, {len(self.filler_candidates)} filler")
+
+            # Restore stage flags ONLY if we have the backing data to support them
+            has_universe = bool(self.universe)
+            has_candidates = bool(self.candidates)
+            has_entry_plans = bool(self.position_mgr.entry_plans)
+            has_positions = self.position_mgr.get_position_count() > 0
+
+            if has_universe:
+                self.stage_universe_done = bot_state.get("stage_universe_done", False)
+            if has_candidates:
+                self.stage_candidates_done = bot_state.get("stage_candidates_done", False)
+            if has_entry_plans or has_positions:
+                self.stage_entry_done = bot_state.get("stage_entry_done", False)
                 self.entry_submission_locked = bot_state.get("entry_submission_locked", False)
                 self.position_mgr.entry_stage1_done = bot_state.get("entry_stage1_done", False)
                 self.position_mgr.entry_stage2_done = bot_state.get("entry_stage2_done", False)
-                
-                # Restore entry plans if saved
-                entry_plans_data = bot_state.get("entry_plans", {})
-                if entry_plans_data:
-                    from bot.position_manager import EntryExecutionPlan
-                    for symbol, plan_data in entry_plans_data.items():
-                        self.position_mgr.entry_plans[symbol] = EntryExecutionPlan(**plan_data)
-                    logger.info(f"Restored {len(entry_plans_data)} entry plans")
-                
-                # CRITICAL FIX: Only restore stage flags if we also restore the underlying data
-                # Check if we have pre-trade state saved
-                pre_trade = self._load_pre_trade_state()
-                if pre_trade:
-                    self.universe = pre_trade.get("universe", [])
-                    self.massive_snapshots = pre_trade.get("massive_snapshots", {})
-                    candidates_data = pre_trade.get("candidates", [])
-                    if candidates_data:
-                        self.candidates = [GapCandidate(**c) for c in candidates_data]
-                        # CRITICAL FIX: Rebuild core/filler split from restored candidates
-                        self.core_candidates = [c for c in self.candidates if c.gap_pct >= 4.0]
-                        self.filler_candidates = [c for c in self.candidates if 3.0 <= c.gap_pct < 4.0]
-                        logger.info(f"Restored {len(self.candidates)} candidates: {len(self.core_candidates)} core, {len(self.filler_candidates)} filler")
-                    
-                    # Now safe to restore stage flags
-                    self.stage_universe_done = bot_state.get("stage_universe_done", False)
-                    self.stage_candidates_done = bot_state.get("stage_candidates_done", False)
-                    self.stage_entry_done = bot_state.get("stage_entry_done", False)
-                    self.stage_exit_done = bot_state.get("stage_exit_done", False)
-                    
-                    logger.info(f"Restored full state: universe={len(self.universe)}, candidates={len(self.candidates)}, stages: U={self.stage_universe_done}, C={self.stage_candidates_done}, E={self.stage_entry_done}, X={self.stage_exit_done}")
-                else:
-                    # No pre-trade data - don't restore stage flags for steps 1-2
-                    logger.warning("No pre-trade state found - will rebuild universe and candidates")
-                    
-                    # CRITICAL FIX: If no valid pre_trade and no valid entry_plans, reset staged entry locks
-                    # to prevent permanent lock from corrupted/missing state
-                    if not entry_plans_data:
-                        logger.warning("No entry plans found - resetting staged entry locks to allow fresh entry")
-                        self.entry_submission_locked = False
-                        self.position_mgr.entry_stage1_done = False
-                        self.position_mgr.entry_stage2_done = False
-                        self.position_mgr.entry_plans.clear()
-                    
-                    # Only restore entry/exit if we have positions
-                    if positions:
-                        self.stage_entry_done = True
-                        self.stage_universe_done = True
-                        self.stage_candidates_done = True
-            else:
-                logger.warning(f"Stale bot state from {saved_date} - starting fresh")
-                self.state_mgr.clear_bot_state()
-                self._clear_pre_trade_state()
+            if has_positions:
+                self.stage_exit_done = bot_state.get("stage_exit_done", False)
 
-                # Reset ALL stage flags that may have been prematurely set by
-                # position loading above (lines 581-583). Stale positions from
-                # yesterday must not lock out today's universe/candidate/entry flow.
-                self.stage_universe_done = False
-                self.stage_candidates_done = False
-                self.stage_entry_done = False
-                self.stage_exit_done = False
-                self.entry_submission_locked = False
-                self.position_mgr.entry_stage1_done = False
-                self.position_mgr.entry_stage2_done = False
-                self.position_mgr.entry_plans.clear()
-                self.position_mgr.positions.clear()
-                self.position_mgr.exit_slicers.clear()
-                self.state_mgr.save_positions({})
-                logger.info("Stale state fully cleared — all stages reset for fresh day")
+            self.vix_level = bot_state.get("vix_level", self.vix_level)
 
-        # CRITICAL: Cancel orphaned open buy orders, but preserve legitimate ones with matching entry_plans
-        # Only cancel if we don't have restored staged-entry state, or reconcile against saved order IDs
-        has_valid_entry_plans = bool(self.position_mgr.entry_plans)
-        
-        if has_valid_entry_plans:
-            # We have restored entry_plans - reconcile against them to only cancel truly orphaned orders
+            logger.info(
+                f"Recovery: universe={len(self.universe)}, candidates={len(self.candidates)}, "
+                f"plans={len(self.position_mgr.entry_plans)}, positions={self.position_mgr.get_position_count()}, "
+                f"stages: U={self.stage_universe_done} C={self.stage_candidates_done} "
+                f"E={self.stage_entry_done} X={self.stage_exit_done}"
+            )
+
+        # ── Step 3: Cancel orphaned orders ──
+        if self.position_mgr.entry_plans:
             canceled = self.position_mgr.cancel_orphaned_open_orders()
             if canceled > 0:
                 logger.warning(f"Startup: Canceled {canceled} orphaned open orders (not matching restored entry_plans)")
         else:
-            # No entry_plans - safe to cancel all open buy orders (they're all orphaned)
             canceled = self.position_mgr.cancel_open_buy_orders()
             if canceled > 0:
-                logger.warning(f"Startup: Canceled {canceled} orphaned open buy orders (no entry_plans restored)")
-        
-        # Startup reconcile: log broker reality to prevent silent mismatch
+                logger.warning(f"Startup: Canceled {canceled} orphaned open buy orders")
+
+        # ── Step 4: Broker is ground truth — reconcile ──
         live_broker_positions = self.position_mgr.get_broker_positions()
+        local_count = self.position_mgr.get_position_count()
+
         if live_broker_positions:
-            logger.warning(f"Startup reconcile: broker shows {len(live_broker_positions)} live positions")
+            logger.warning(f"Startup: broker shows {len(live_broker_positions)} live positions")
             for pos in live_broker_positions:
-                logger.warning(
-                    f"  Broker position: {pos.get('symbol')} qty={pos.get('qty')} side={pos.get('side')}"
-                )
-            # Rebuild missing local positions from broker state
+                logger.warning(f"  Broker: {pos.get('symbol')} qty={pos.get('qty')} side={pos.get('side')}")
             self.position_mgr.reconcile_local_positions_from_broker()
+            # If broker has positions, entries are done
+            self.stage_entry_done = True
+            self.stage_universe_done = True
+            self.stage_candidates_done = True
+        elif local_count > 0:
+            logger.warning(f"Local shows {local_count} positions but broker is flat — clearing stale local state")
+            self.position_mgr.positions.clear()
+            self.position_mgr.exit_slicers.clear()
 
     def _save_state(self):
         """Save current state including positions and bot state"""
