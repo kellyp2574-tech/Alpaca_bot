@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, time as dt_time
 import requests
 from bot import config
 from bot.market_data import AlpacaDataClient
+from bot.rate_limiter import create_alpaca_session
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ class PositionManager:
         self.api_key = config.ALPACA_API_KEY
         self.secret_key = config.ALPACA_SECRET_KEY
 
-        self.session = requests.Session()
+        self.session = create_alpaca_session()
         self.session.headers.update({
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.secret_key,
