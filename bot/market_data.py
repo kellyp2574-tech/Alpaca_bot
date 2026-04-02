@@ -3,6 +3,7 @@ import logging
 from typing import Dict, List, Optional, Set
 import requests
 from bot import config
+from bot.rate_limiter import create_alpaca_session
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class AlpacaDataClient:
         self.secret_key = config.ALPACA_SECRET_KEY
         self.feed = config.DATA_FEED
 
-        self.session = requests.Session()
+        self.session = create_alpaca_session()
         self.session.headers.update({
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.secret_key,
