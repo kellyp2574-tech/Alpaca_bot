@@ -219,6 +219,21 @@ class GapMomentumBot:
                 snapshots, config.MIN_PRICE, config.MAX_PRICE
             )
             
+            # First-pass filter: remove symbols Alpaca marks as non-tradable (OTC, halted, etc.)
+            # Uses bulk GET /v2/assets (1 API call). NOTE: this is not a complete shield —
+            # symbols can still become close-only or restricted intraday due to broker
+            # controls, corporate actions, or special restrictions.
+            pre_filter_count = len(self.universe)
+            tradable_set = set(self.alpaca.get_tradable_assets())
+            if tradable_set:
+                rejected = [s for s in self.universe if s not in tradable_set]
+                self.universe = [s for s in self.universe if s in tradable_set]
+                if rejected:
+                    logger.info(f"Tradability filter: {pre_filter_count} -> {len(self.universe)} "
+                               f"({len(rejected)} non-tradable removed)")
+            else:
+                logger.warning("Tradability filter skipped: failed to fetch Alpaca asset list")
+
             # Store full Massive snapshots for merging in Step 2
             self.massive_snapshots = snapshots
 
@@ -402,6 +417,7 @@ class GapMomentumBot:
                     total_capital = self.position_mgr.get_total_capital()
 
                     # PHASE 1: Build core plans first (4%+ gaps)
+                    # Non-tradable symbols already filtered in Step 1 (universe build)
                     # CRITICAL FIX: Clear stale entry plans before first build of the day
                     self.position_mgr.entry_plans.clear()
                     plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
@@ -767,14 +783,17 @@ class GapMomentumBot:
         logger.warning(
             f"{label}: failsafe flatten complete | "
             f"positions_seen={summary['positions_seen']} | "
-            f"orders_submitted={summary['orders_submitted']} | "
+            f"closes_submitted={summary['closes_submitted']} | "
+            f"fills_confirmed={summary['fills_confirmed']} | "
             f"errors={len(summary['errors'])}"
         )
 
-        # If broker is flat, mark exits complete
+        # If broker is flat, mark exits complete and clear any stale local state
         if self.position_mgr.broker_position_count() == 0:
             self.stage_exit_done = True
-            logger.warning(f"{label}: broker confirmed flat")
+            self.position_mgr.positions.clear()
+            self.position_mgr.exit_slicers.clear()
+            logger.warning(f"{label}: broker confirmed flat — local state cleared")
         else:
             logger.error(f"{label}: broker still shows open positions after failsafe")
 
