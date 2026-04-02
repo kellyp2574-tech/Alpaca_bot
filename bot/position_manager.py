@@ -58,6 +58,7 @@ class EntryExecutionPlan:
     market2_filled_qty: int = 0
     market2_filled_avg_price: float = 0.0
     finalized: bool = False
+    open_order_terminal: bool = False
 
 
 class PositionManager:
@@ -706,21 +707,25 @@ class PositionManager:
                     state_saver()
 
     def reconcile_open_order_fills(self) -> None:
-        """Read market order outcomes via batch polling (all orders per cycle, not sequential)."""
-        # Collect orders to poll
+        """Poll market order status for up to 90s. Only records fills for terminal orders.
+        
+        Non-terminal orders after timeout are left pending (open_order_terminal=False)
+        for the broker repair sync at 9:35 to resolve. This prevents declaring
+        still-working orders as no-fills.
+        """
         active_orders = {}
         for symbol, plan in self.entry_plans.items():
-            if not plan.open_order_id or plan.open_filled_qty > 0:
+            if not plan.open_order_id or plan.open_order_terminal:
                 continue
             active_orders[plan.open_order_id] = {"symbol": symbol, "plan": plan}
 
         if not active_orders:
             return
 
-        logger.info(f"Reconciling {len(active_orders)} market orders (batch polling)...")
+        logger.info(f"Reconciling {len(active_orders)} market orders (batch polling, 90s window)...")
         terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
         start_time = datetime.now()
-        max_wait = 45  # seconds total, not per-order (penny stocks may fill slowly at open)
+        max_wait = 90  # penny stock market orders can take 3-4 min to fill at open
 
         while active_orders and (datetime.now() - start_time).total_seconds() < max_wait:
             completed = []
@@ -744,15 +749,20 @@ class PositionManager:
                     symbol = meta["symbol"]
                     plan.open_filled_qty = filled_qty
                     plan.open_filled_avg_price = float(filled_avg_price) if filled_avg_price else 0.0
+                    plan.open_order_terminal = True
 
                     if plan.open_filled_avg_price > 0:
                         plan.expected_open_price = plan.open_filled_avg_price
-                        logger.info(f"Market order reconciled: {symbol} filled {filled_qty}/{plan.open_qty}, updated ref price to {plan.expected_open_price:.4f}")
+                        logger.info(f"Market order TERMINAL: {symbol} filled {filled_qty}/{plan.open_qty} @ {plan.expected_open_price:.4f} (status={status})")
                     elif filled_qty > 0:
-                        logger.info(f"Market order reconciled: {symbol} filled {filled_qty}/{plan.open_qty}")
+                        logger.info(f"Market order TERMINAL: {symbol} filled {filled_qty}/{plan.open_qty} (status={status})")
                     else:
-                        logger.info(f"Market order reconciled: {symbol} no fill (status={status})")
+                        logger.info(f"Market order TERMINAL: {symbol} no fill (status={status})")
                     completed.append(order_id)
+                else:
+                    # Log partial progress for non-terminal orders
+                    if filled_qty > 0:
+                        logger.info(f"Market order PENDING: {symbol} partial {filled_qty}/{meta['plan'].open_qty} (status={status})")
 
             for order_id in completed:
                 active_orders.pop(order_id, None)
@@ -760,42 +770,120 @@ class PositionManager:
             if active_orders:
                 time.sleep(1.0)
 
-        # Any still-active orders after timeout: cross-check against actual broker positions
-        # before declaring "no fill". Orders may have filled at the broker after our poll window.
+        # Log remaining non-terminal orders — these will be resolved by broker_repair_sync at 9:35
         if active_orders:
-            timed_out_symbols = {meta["symbol"]: meta for meta in active_orders.values()}
-            logger.info(f"Reconciliation timeout for {len(timed_out_symbols)} symbols — cross-checking broker positions")
+            pending_symbols = [meta["symbol"] for meta in active_orders.values()]
+            logger.warning(
+                f"Reconciliation timeout: {len(active_orders)} orders still non-terminal after {max_wait}s — "
+                f"will resolve at broker repair sync. Symbols: {pending_symbols}"
+            )
 
-            try:
-                broker_positions = self.get_broker_positions()
-                broker_map = {
-                    pos.get("symbol"): pos for pos in broker_positions
-                } if broker_positions else {}
-            except Exception as e:
-                logger.error(f"Broker position cross-check failed: {e}")
-                broker_map = {}
+    def broker_repair_sync(self) -> List[str]:
+        """Delayed broker repair sync — resolves pending entry orders against broker ground truth.
+        
+        Called repeatedly from Phase 3 (9:35–9:38). For each unresolved plan:
+        1. Fetch all broker positions (single API call).
+        2. If broker holds the symbol: import qty + avg price, mark terminal.
+        3. If broker doesn't hold it: check order status.
+           - Terminal with fills → record, mark terminal.
+           - Terminal with no fills → confirmed no-fill, mark terminal.
+           - Still non-terminal → leave unresolved for retry on next call.
+        
+        Does NOT force-mark non-terminal orders as no-fill. The caller
+        (Phase 3 in _step3_manage_staged_entry) handles the hard cutoff
+        at 9:38 via finalize_entry_positions(force=True).
+        
+        Returns list of symbols that were repaired from broker data.
+        """
+        # Identify unresolved plans (submitted but not yet terminal)
+        unresolved = {}
+        for symbol, plan in self.entry_plans.items():
+            if plan.open_order_id and not plan.open_order_terminal and not plan.finalized:
+                unresolved[symbol] = plan
 
-            for order_id, meta in active_orders.items():
-                symbol = meta["symbol"]
-                plan = meta["plan"]
-                broker_pos = broker_map.get(symbol)
+        if not unresolved:
+            logger.info("Broker repair sync: all orders already terminal — nothing to resolve")
+            return []
 
-                if broker_pos:
-                    # Broker shows a position — the order likely filled despite poll timeout
-                    broker_qty = abs(int(float(broker_pos.get("qty", 0))))
-                    broker_avg = float(broker_pos.get("avg_entry_price", 0) or 0)
+        logger.info(f"Broker repair sync: resolving {len(unresolved)} pending orders")
 
-                    plan.open_filled_qty = broker_qty
-                    plan.open_filled_avg_price = broker_avg
-                    if broker_avg > 0:
-                        plan.expected_open_price = broker_avg
+        # Fetch broker positions (ground truth)
+        try:
+            broker_positions = self.get_broker_positions()
+            broker_map = {
+                pos.get("symbol"): pos for pos in broker_positions
+            } if broker_positions else {}
+        except Exception as e:
+            logger.error(f"Broker repair sync: failed to fetch positions: {e}")
+            broker_map = {}
 
-                    logger.warning(
-                        f"Market order reconciled via broker cross-check: {symbol} "
-                        f"filled {broker_qty} @ {broker_avg:.4f} (order poll had timed out)"
+        repaired = []
+        terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
+
+        for symbol, plan in unresolved.items():
+            broker_pos = broker_map.get(symbol)
+
+            if broker_pos:
+                # Broker holds this symbol — import position data
+                broker_qty = abs(int(float(broker_pos.get("qty", 0))))
+                broker_avg = float(broker_pos.get("avg_entry_price", 0) or 0)
+
+                plan.open_filled_qty = broker_qty
+                plan.open_filled_avg_price = broker_avg
+                if broker_avg > 0:
+                    plan.expected_open_price = broker_avg
+                plan.open_order_terminal = True
+
+                logger.warning(
+                    f"Broker repair: {symbol} filled {broker_qty} @ {broker_avg:.4f} "
+                    f"(recovered from broker positions)"
+                )
+                repaired.append(symbol)
+            else:
+                # Broker doesn't hold it — one final order status check
+                try:
+                    url = f"{self.base_url}/v2/orders/{plan.open_order_id}"
+                    response = self.session.get(url, timeout=5)
+                    response.raise_for_status()
+                    order = response.json()
+                    status = order.get("status")
+                    filled_qty = int(float(order.get("filled_qty", 0)))
+                    filled_avg_price = order.get("filled_avg_price")
+
+                    if status in terminal_states:
+                        plan.open_filled_qty = filled_qty
+                        plan.open_filled_avg_price = float(filled_avg_price) if filled_avg_price else 0.0
+                        plan.open_order_terminal = True
+                        if filled_qty > 0:
+                            if plan.open_filled_avg_price > 0:
+                                plan.expected_open_price = plan.open_filled_avg_price
+                            logger.warning(f"Broker repair: {symbol} late fill {filled_qty} (status={status})")
+                            repaired.append(symbol)
+                        else:
+                            logger.info(f"Broker repair: {symbol} confirmed no fill (status={status})")
+                    else:
+                        # Still non-terminal — leave unresolved for retry on next call.
+                        # Don't force no-fill yet; Alpaca may still be working the order.
+                        logger.warning(
+                            f"Broker repair: {symbol} still non-terminal (status={status}) "
+                            f"and broker has no position — leaving unresolved for retry"
+                        )
+                except requests.exceptions.RequestException as e:
+                    # Can't reach order — leave unresolved rather than guessing
+                    logger.error(
+                        f"Broker repair: {symbol} order check failed ({e}) "
+                        f"— leaving unresolved for retry"
                     )
-                else:
-                    logger.info(f"Market order reconciled: {symbol} no fill (poll timeout, broker confirms no position)")
+
+        still_unresolved = sum(
+            1 for s, p in unresolved.items()
+            if not p.open_order_terminal
+        )
+        logger.info(
+            f"Broker repair sync complete: {len(repaired)} repaired, "
+            f"{still_unresolved} still unresolved"
+        )
+        return repaired
 
     def refresh_no_fill_prices(self) -> None:
         """
@@ -1035,8 +1123,14 @@ class PositionManager:
                 f"limit={limit_price:.4f}, avg_fill={avg_fill_str}"
             )
 
-    def finalize_entry_positions(self) -> List[Position]:
-        """Create final Position objects from all entry fills."""
+    def finalize_entry_positions(self, force: bool = False) -> List[Position]:
+        """Create final Position objects from confirmed entry fills.
+        
+        Args:
+            force: If True, finalize ALL plans including non-terminal orders
+                   (used at 9:35 after broker_repair_sync). If False, only
+                   finalize plans where the order is confirmed terminal.
+        """
         entered = []
 
         for symbol, plan in self.entry_plans.items():
@@ -1045,7 +1139,10 @@ class PositionManager:
 
             total_qty = plan.open_filled_qty + plan.market1_filled_qty + plan.market2_filled_qty
             if total_qty <= 0:
-                plan.finalized = True
+                if force or plan.open_order_terminal:
+                    plan.finalized = True
+                    logger.info(f"Entry plan finalized (no fill): {symbol}")
+                # else: order still working, skip — will resolve at broker repair sync
                 continue
 
             total_cost = (
@@ -1536,23 +1633,34 @@ class PositionManager:
 
         return summary
 
-    def reconcile_local_positions_from_broker(self):
-        """
-        Rebuild missing local Position objects from broker positions
-        when local state is empty or incomplete. Call this on startup
-        after detecting broker positions that aren't in local memory.
+    def reconcile_local_positions_from_broker(self) -> Dict[str, str]:
+        """Sync local positions to match broker ground truth.
+        
+        For each broker position:
+        - Missing locally → create from broker data.
+        - Exists locally with wrong quantity → correct to broker quantity.
+        - Exists locally with correct quantity → no change.
+        
+        Also removes local positions that the broker no longer holds.
+        
+        Returns dict of {symbol: action} for logging (added/corrected/removed).
         """
         broker_positions = self.get_broker_positions()
-        if not broker_positions:
-            return
+        actions = {}
 
-        for pos in broker_positions:
-            symbol = pos.get("symbol")
-            qty = int(abs(float(pos.get("qty", 0))))
-            avg_entry = float(pos.get("avg_entry_price", 0) or 0)
+        broker_map = {}
+        if broker_positions:
+            for pos in broker_positions:
+                symbol = pos.get("symbol")
+                qty = int(abs(float(pos.get("qty", 0))))
+                avg_entry = float(pos.get("avg_entry_price", 0) or 0)
+                if symbol and qty > 0:
+                    broker_map[symbol] = {"qty": qty, "avg_entry": avg_entry}
 
-            if not symbol or qty <= 0:
-                continue
+        # Add missing + correct wrong quantities
+        for symbol, bdata in broker_map.items():
+            qty = bdata["qty"]
+            avg_entry = bdata["avg_entry"]
 
             if symbol not in self.positions:
                 self.positions[symbol] = Position(
@@ -1565,4 +1673,25 @@ class PositionManager:
                     peak_price=avg_entry,
                     current_price=avg_entry,
                 )
-                logger.warning(f"Rebuilt local position from broker: {symbol} qty={qty} avg={avg_entry:.4f}")
+                logger.warning(f"Broker reconcile: ADDED {symbol} qty={qty} avg={avg_entry:.4f}")
+                actions[symbol] = "added"
+            else:
+                local_pos = self.positions[symbol]
+                if local_pos.quantity != qty:
+                    old_qty = local_pos.quantity
+                    local_pos.quantity = qty
+                    local_pos.entry_price = avg_entry
+                    logger.warning(f"Broker reconcile: CORRECTED {symbol} qty {old_qty} → {qty}, avg → {avg_entry:.4f}")
+                    actions[symbol] = "corrected"
+
+        # Remove local positions the broker no longer holds
+        local_only = [s for s in list(self.positions.keys()) if s not in broker_map]
+        for symbol in local_only:
+            del self.positions[symbol]
+            self.exit_slicers.pop(symbol, None)
+            logger.warning(f"Broker reconcile: REMOVED {symbol} (broker no longer holds)")
+            actions[symbol] = "removed"
+
+        if actions:
+            logger.info(f"Broker reconcile complete: {actions}")
+        return actions

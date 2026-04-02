@@ -77,6 +77,9 @@ class GapMomentumBot:
         # Cooldown: prevent mismatch flatten from firing every poll cycle
         self.mismatch_flatten_done = False
 
+        # Periodic broker reconciliation timer (symbol-level sync every 60s during exits)
+        self._last_broker_reconcile_time: Optional[datetime] = None
+
         # Rate-limit exit checks to stay under 200 API calls/min
         self.last_exit_check_time: Optional[datetime] = None
         self.exit_check_interval_seconds = 30
@@ -113,9 +116,10 @@ class GapMomentumBot:
             logger.warning("Startup in entry dead zone (9:30:00-9:31:00) with no saved entry plans - disabling new entries for the day")
             self.stage_entry_done = True
         
-        # After 9:31:00 with no positions and no saved entry plans: disable entries, only run exit/failsafe
-        if current_time >= dt_time(9, 31, 0) and self.position_mgr.get_position_count() == 0 and not self.position_mgr.entry_plans:
-            logger.warning("Startup after 9:31:00 with no positions and no entry plans - disabling entries, will only run exit/failsafe logic")
+        # After 9:35:00 with no positions and no saved entry plans: disable entries, only run exit/failsafe
+        # (Phase 3 broker repair runs at 9:35, so don't give up on entries until after that)
+        if current_time >= dt_time(9, 35, 0) and self.position_mgr.get_position_count() == 0 and not self.position_mgr.entry_plans:
+            logger.warning("Startup after 9:35:00 with no positions and no entry plans - disabling entries, will only run exit/failsafe logic")
             self.stage_entry_done = True
             self.stage_exit_done = True  # Nothing to exit
 
@@ -140,8 +144,8 @@ class GapMomentumBot:
                     logger.warning("Skipped Step 2 - past entry window")
                     self.stage_candidates_done = True
 
-            # Step 3: Market entry at 9:30:00, reconcile at 9:31:00, finalize by 9:31:30
-            # Use staged entry if enabled: full market orders at open, rescue passes if partial
+            # Step 3: Market entry at 9:30:00, poll at 9:31:00, broker repair at 9:35:00
+            # Uses three-phase staged entry: submit → poll → broker repair sync
             if config.USE_STAGED_OPEN_ENTRY:
                 self._step3_manage_staged_entry(current_time)
             elif not self.stage_entry_done and current_time >= self.target_entry:
@@ -372,28 +376,28 @@ class GapMomentumBot:
         self._save_state()
 
     def _step3_manage_staged_entry(self, current_time: dt_time):
-        """Three-stage entry: market orders at 9:30:00, reconcile at 9:31:00, rescue passes at 9:31:30."""
+        """Three-stage entry: submit at 9:30, poll at 9:31, broker repair at 9:35.
+        
+        Phase 1 (9:30:00): Build plans + submit market orders.
+        Phase 2 (9:31:00): Poll order status for 90s, finalize only confirmed fills.
+                           Non-terminal orders stay pending.
+        Phase 3 (9:35:00): Broker repair sync — fetch broker positions as ground truth,
+                           resolve any still-pending orders, force-finalize all.
+        """
         try:
-            # Phase 1: Market orders at open (9:30:00)
-            # Phase 2: Reconcile fills (9:31:00)
-            # Phase 3: Rescue passes + finalize (9:31:30)
-            t1 = dt_time(9, 31, 0)
-            t2 = dt_time(9, 31, 30)
+            t_poll = dt_time(9, 31, 0)    # Start active polling
+            t_repair = dt_time(9, 35, 0)  # Broker repair sync
 
-            # Market order submission at 9:30:00
-            if current_time >= self.target_entry and current_time < t1 and not self.position_mgr.entry_stage1_done:
+            # ── Phase 1: Submit market orders at 9:30:00 ──
+            if current_time >= self.target_entry and current_time < t_poll and not self.position_mgr.entry_stage1_done:
                 logger.info("STAGED ENTRY PHASE 1: Build plans + submit market orders at open")
 
                 if self.entry_submission_locked:
-                    # Crash recovery: lock is set but phase 1 never completed.
-                    # Check if any market orders were actually submitted and persisted.
                     has_live_orders = any(
                         plan.open_order_id is not None
                         for plan in self.position_mgr.entry_plans.values()
                     )
                     if has_live_orders:
-                        # Orders exist at broker — promote to stage1_done so phases 2/3
-                        # can reconcile fills and finalize positions.
                         logger.warning(
                             "Crash recovery: lock set with persisted market orders but "
                             "entry_stage1_done=False — auto-promoting to stage1_done"
@@ -401,7 +405,6 @@ class GapMomentumBot:
                         self.position_mgr.entry_stage1_done = True
                         self._save_state()
                     else:
-                        # Lock was set but no orders made it to broker — safe to retry.
                         logger.warning(
                             "Crash recovery: lock set but no market orders persisted — "
                             "unlocking for retry"
@@ -416,13 +419,9 @@ class GapMomentumBot:
                 try:
                     total_capital = self.position_mgr.get_total_capital()
 
-                    # PHASE 1: Build core plans first (4%+ gaps)
-                    # Non-tradable symbols already filtered in Step 1 (universe build)
-                    # CRITICAL FIX: Clear stale entry plans before first build of the day
                     self.position_mgr.entry_plans.clear()
                     plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
                     
-                    # Calculate capital reserved by core plans (use target_qty with 1.02 slippage reserve, matching build_entry_plans)
                     core_reserved_notional = sum(
                         plan.target_qty * plan.expected_open_price * 1.02
                         for plan in plans_core.values()
@@ -435,7 +434,6 @@ class GapMomentumBot:
                                f"reserved ${core_reserved_notional:,.2f} ({deployment_ratio*100:.1f}%), "
                                f"remaining ${remaining_capital:,.2f}, {remaining_slots} slots")
                     
-                    # PHASE 2: Conditionally build filler plans (3-4% gaps)
                     plans_filler = {}
                     MIN_FILL_CAPITAL = 1000
                     
@@ -444,30 +442,27 @@ class GapMomentumBot:
                         self.filler_candidates and 
                         remaining_slots > 0):
                         
-                        # Limit filler to remaining slots
                         filler_to_plan = self.filler_candidates[:remaining_slots]
                         plans_filler = self.position_mgr.build_entry_plans(
                             filler_to_plan, 
                             capital_override=remaining_capital
                         )
-                        logger.info(f"PHASE 2: Built {len(plans_filler)} filler plans against remaining capital")
+                        logger.info(f"Built {len(plans_filler)} filler plans against remaining capital")
                     else:
                         if deployment_ratio >= 0.8:
-                            logger.info(f"Phase 2 skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
+                            logger.info(f"Filler skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
                         elif remaining_capital <= MIN_FILL_CAPITAL:
-                            logger.info(f"Phase 2 skipped: remaining ${remaining_capital:,.2f} <= min ${MIN_FILL_CAPITAL}")
+                            logger.info(f"Filler skipped: remaining ${remaining_capital:,.2f} <= min ${MIN_FILL_CAPITAL}")
                         elif remaining_slots <= 0:
-                            logger.info(f"Phase 2 skipped: no slots (core filled {len(plans_core)}/{config.MAX_POSITIONS})")
+                            logger.info(f"Filler skipped: no slots (core filled {len(plans_core)}/{config.MAX_POSITIONS})")
                         else:
-                            logger.info(f"Phase 2 skipped: no filler candidates")
+                            logger.info(f"Filler skipped: no filler candidates")
                     
-                    # Combine plans (core first, then filler)
                     all_plans = {**plans_core, **plans_filler}
                     
-                    # Submit market orders at 9:30:00 (persist after each submission for crash safety)
                     self.position_mgr.submit_open_entry_orders(all_plans, state_saver=self._save_state)
 
-                    logger.info(f"STAGED ENTRY PHASE 1: Built {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} total entry plans")
+                    logger.info(f"PHASE 1 COMPLETE: {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} orders submitted")
 
                     self.position_mgr.entry_stage1_done = True
                     self._save_state()
@@ -475,8 +470,6 @@ class GapMomentumBot:
                 except Exception as e:
                     logger.exception(f"Error in staged entry phase 1: {e}")
                     
-                    # CRITICAL: Rollback lock if no orders were actually submitted
-                    # Check if any entry_plans have open_order_id set
                     orders_submitted = any(
                         plan.open_order_id is not None 
                         for plan in self.position_mgr.entry_plans.values()
@@ -493,33 +486,90 @@ class GapMomentumBot:
                 
                 return
 
-            # Reconcile market order fills at 9:31:00 (only for partial fill recovery)
-            if current_time >= t1 and current_time < t2 and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
-                logger.info("PHASE 2: Reconcile market order fills")
+            # ── Phase 2: Active poll + partial finalize at 9:31:00 ──
+            # Polls for 90s. Only finalizes orders confirmed terminal.
+            # Non-terminal orders stay pending for Phase 3.
+            if current_time >= t_poll and current_time < t_repair and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
+                logger.info("PHASE 2: Active poll of market order fills (90s window)")
                 self.position_mgr.reconcile_open_order_fills()
-                # When OPEN_ENTRY_PCT=1.0 (full size at open), skip rescue passes - go straight to finalize
-                if config.OPEN_ENTRY_PCT >= 1.0:
-                    logger.info("Full-size market orders sent - skipping rescue passes, finalizing positions")
-                    positions = self.position_mgr.finalize_entry_positions()
-                    logger.info(f"Entered {len(positions)} positions via pure market-at-open")
-                    for pos in positions:
+
+                # Finalize only confirmed fills (terminal orders with qty > 0)
+                confirmed = self.position_mgr.finalize_entry_positions(force=False)
+                if confirmed:
+                    logger.info(f"Phase 2: finalized {len(confirmed)} confirmed fills")
+                    for pos in confirmed:
                         logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
+
+                # Count pending (non-terminal) orders
+                pending = sum(
+                    1 for plan in self.position_mgr.entry_plans.values()
+                    if plan.open_order_id and not plan.open_order_terminal and not plan.finalized
+                )
+                if pending > 0:
+                    logger.warning(f"Phase 2: {pending} orders still pending — will resolve at 9:35 broker repair")
+                else:
+                    logger.info("Phase 2: all orders terminal — entry complete")
                     self.stage_entry_done = True
+
                 self.position_mgr.entry_stage2_done = True
                 self._save_state()
                 return
 
-            # Finalize positions at 9:31:30 (only needed if OPEN_ENTRY_PCT < 1.0 for staged entry)
-            if current_time >= t2 and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
-                if config.OPEN_ENTRY_PCT < 1.0:
-                    logger.info("PHASE 3: Rescue passes for remaining size")
+            # ── Phase 3: Broker repair sync at 9:35:00, retries until 9:38 hard cutoff ──
+            # Resolves pending orders using broker positions as ground truth.
+            # Re-enters on each main loop iteration until all orders are resolved or 9:38 hits.
+            t_hard_cutoff = dt_time(9, 38, 0)
+
+            if current_time >= t_repair and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
+                past_cutoff = current_time >= t_hard_cutoff
+
+                if past_cutoff:
+                    logger.info("PHASE 3: Broker repair sync — HARD CUTOFF 9:38, force-finalizing all")
+                else:
+                    logger.info("PHASE 3: Broker repair sync — resolving pending orders")
+
+                # If OPEN_ENTRY_PCT < 1.0, run rescue passes on first Phase 3 entry only
+                if config.OPEN_ENTRY_PCT < 1.0 and not hasattr(self, '_rescue_passes_done'):
+                    logger.info("Running rescue passes for remaining size")
                     self.position_mgr.refresh_no_fill_prices()
                     self.position_mgr.submit_post_open_rescue_pass("market1", state_saver=self._save_state)
                     self.position_mgr.submit_post_open_rescue_pass("market2", state_saver=self._save_state)
-                positions = self.position_mgr.finalize_entry_positions()
-                logger.info(f"Finalized {len(positions)} positions")
+                    self._rescue_passes_done = True
+
+                # Broker repair: resolve any still-pending orders
+                repaired = self.position_mgr.broker_repair_sync()
+
+                # Check if any orders are still unresolved
+                still_pending = sum(
+                    1 for plan in self.position_mgr.entry_plans.values()
+                    if plan.open_order_id and not plan.open_order_terminal and not plan.finalized
+                )
+
+                if still_pending > 0 and not past_cutoff:
+                    # Orders still unresolved — retry on next loop iteration
+                    # Finalize only what's confirmed so far
+                    confirmed = self.position_mgr.finalize_entry_positions(force=False)
+                    if confirmed:
+                        logger.info(f"Phase 3: finalized {len(confirmed)} newly confirmed fills")
+                    logger.warning(
+                        f"Phase 3: {still_pending} orders still unresolved — "
+                        f"will retry next cycle (hard cutoff at 9:38)"
+                    )
+                    self._save_state()
+                    return
+
+                # All resolved or past hard cutoff — force-finalize everything
+                positions = self.position_mgr.finalize_entry_positions(force=True)
+                total_positions = self.position_mgr.get_position_count()
+
+                logger.info(
+                    f"PHASE 3 COMPLETE: {len(repaired)} repaired from broker, "
+                    f"{len(positions)} new positions finalized, "
+                    f"{total_positions} total positions"
+                )
                 for pos in positions:
                     logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
+
                 self.stage_entry_done = True
                 self._save_state()
                 return
@@ -528,7 +578,13 @@ class GapMomentumBot:
             self._save_state()
 
     def _step4_manage_exits(self, current_time: dt_time):
-        """Step 4: Monitor and execute exits based on VIX regime"""
+        """Step 4: Monitor and execute exits based on VIX regime.
+        
+        Includes periodic symbol-level broker reconciliation (every 60s) to catch:
+        - Late fills that slipped past the Phase 3 hard cutoff
+        - Symbol mismatches (local and broker have same count but different names)
+        - Wrong local quantities from partial fill desync
+        """
         local_count = self.position_mgr.get_position_count()
         broker_count = self.position_mgr.broker_position_count()
 
@@ -538,7 +594,36 @@ class GapMomentumBot:
             self._save_state()
             return
 
+        # ── Periodic symbol-level broker reconciliation (every 60s) ──
+        # This catches late fills, symbol mismatches, and wrong quantities.
+        # Runs after the entry grace period (9:40+) to avoid conflicting with Phase 3.
+        now = datetime.now()
+        if current_time >= dt_time(9, 40):
+            if (self._last_broker_reconcile_time is None or
+                    (now - self._last_broker_reconcile_time).total_seconds() >= 60):
+                actions = self.position_mgr.reconcile_local_positions_from_broker()
+                self._last_broker_reconcile_time = now
+                if actions:
+                    self._save_state()
+                # Re-read counts after reconciliation
+                local_count = self.position_mgr.get_position_count()
+                broker_count = self.position_mgr.broker_position_count()
+
+        if local_count == 0 and broker_count == 0:
+            logger.info("All positions closed locally and at broker - exit complete")
+            self.stage_exit_done = True
+            self._save_state()
+            return
+
         if local_count == 0 and broker_count > 0:
+            # Guard: don't flatten during entry grace period (before 9:40).
+            if current_time < dt_time(9, 40):
+                logger.warning(
+                    f"Local empty but broker shows {broker_count} positions — "
+                    f"in entry grace period (before 9:40), NOT flattening"
+                )
+                return
+
             if not self.mismatch_flatten_done:
                 logger.warning(
                     f"Local positions empty but broker shows {broker_count} live positions - "
@@ -674,7 +759,11 @@ class GapMomentumBot:
             for pos in live_broker_positions:
                 logger.warning(f"  Broker: {pos.get('symbol')} qty={pos.get('qty')} side={pos.get('side')}")
             self.position_mgr.reconcile_local_positions_from_broker()
-            # If broker has positions, entries are done
+            # If broker has positions, entries are done.
+            # NOTE: reconcile_local_positions_from_broker rebuilds positions with
+            # zeroed entry metadata (gap_pct=0, adv_estimate=0). Exit logic that
+            # depends on original entry context (e.g., gap-based trailing stops)
+            # will lose fidelity. This is an acceptable tradeoff vs losing positions.
             self.stage_entry_done = True
             self.stage_universe_done = True
             self.stage_candidates_done = True
@@ -710,6 +799,7 @@ class GapMomentumBot:
                 "market2_filled_qty": plan.market2_filled_qty,
                 "market2_filled_avg_price": plan.market2_filled_avg_price,
                 "finalized": plan.finalized,
+                "open_order_terminal": plan.open_order_terminal,
             }
         
         self.state_mgr.save_bot_state({
