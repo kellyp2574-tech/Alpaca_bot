@@ -36,6 +36,9 @@ class ExitSlicerState:
     next_slice_time: datetime
     seconds_between_slices: int
     reason: str
+    # Dynamic sizing: track fill quality to adapt slice sizes
+    last_fill_rate: float = 1.0  # ratio of filled_qty / requested_qty (0.0-1.0)
+    consecutive_partials: int = 0  # count of consecutive partial fills
 
 
 @dataclass
@@ -83,8 +86,11 @@ class PositionManager:
         self.entry_stage2_done = False
 
         # Circuit breaker: track consecutive sell failures per symbol
+        # Uses cooldown (not permanent ban) — after 60s the symbol can retry
         self._exit_failures: Dict[str, int] = {}
-        self._max_exit_failures = 3  # Stop retrying after this many consecutive failures
+        self._exit_failure_times: Dict[str, datetime] = {}  # last failure timestamp
+        self._max_exit_failures = 3  # Trigger cooldown after this many consecutive failures
+        self._exit_cooldown_seconds = 60  # Seconds to wait before retrying after breaker trips
 
     def load_positions(self, saved_positions: Dict):
         """Restore positions from saved state"""
@@ -174,7 +180,7 @@ class PositionManager:
                 if status == "filled" and filled_qty > 0 and filled_avg_price:
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "filled"}
                 
-                # On partial fill, optionally cancel immediately and poll until terminal state
+                # On partial fill, optionally cancel after a grace period
                 if status == "partially_filled" and filled_qty > 0 and filled_avg_price:
                     if not allow_partial_cancel:
                         # For open market orders: don't cancel aggressively, just wait for terminal state
@@ -182,15 +188,33 @@ class PositionManager:
                         time.sleep(0.5)
                         continue
                     
-                    logger.warning(f"Order {order_id} partially filled: {filled_qty} shares - canceling residual immediately")
+                    # Wait 3 seconds before canceling to let more liquidity come in
+                    logger.info(f"Order {order_id} partially filled: {filled_qty} shares - waiting 3s for more fills")
+                    time.sleep(3)
+                    
+                    # Re-check: order might have filled during the wait
+                    try:
+                        recheck = self.session.get(url, timeout=10).json()
+                        recheck_status = recheck.get("status")
+                        recheck_qty = float(recheck.get("filled_qty", 0))
+                        if recheck_status == "filled" and recheck_qty > 0:
+                            return {"order_id": order_id, "filled_qty": recheck_qty, "filled_avg_price": float(recheck.get("filled_avg_price")), "status": "filled"}
+                        if recheck_qty > filled_qty:
+                            filled_qty = recheck_qty
+                            filled_avg_price = recheck.get("filled_avg_price", filled_avg_price)
+                            logger.info(f"Additional fill during grace period: now {filled_qty} shares")
+                    except Exception:
+                        pass
+                    
+                    logger.warning(f"Order {order_id} still partial after grace period ({filled_qty} shares) - canceling residual")
                     cancel_success = self._cancel_order(order_id)
                     if not cancel_success:
                         logger.error(f"Failed to cancel order {order_id} - order may still be working, proceeding with caution")
                     
-                    # Poll until order reaches terminal state (not just one re-read)
+                    # Poll until order reaches terminal state (10s for small-cap settle time)
                     terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
                     poll_start = datetime.now()
-                    max_post_cancel_poll = 5  # Max 5 seconds of post-cancellation polling
+                    max_post_cancel_poll = 10
                     
                     while (datetime.now() - poll_start).total_seconds() < max_post_cancel_poll:
                         time.sleep(0.5)
@@ -248,15 +272,33 @@ class PositionManager:
                     logger.info(f"Order {order_id} timeout with {filled_qty} shares filled (allow_partial_cancel=False)")
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
                 
-                logger.warning(f"Order {order_id} timeout but {filled_qty} shares filled - canceling residual")
+                # Grace period: wait 3s before canceling to let more liquidity come in
+                logger.info(f"Order {order_id} timeout with {filled_qty} shares filled - waiting 3s for more fills")
+                time.sleep(3)
+                
+                # Re-check: order might have filled during the wait
+                try:
+                    recheck = self.session.get(url, timeout=10).json()
+                    recheck_status = recheck.get("status")
+                    recheck_qty = float(recheck.get("filled_qty", 0))
+                    if recheck_status == "filled" and recheck_qty > 0:
+                        return {"order_id": order_id, "filled_qty": recheck_qty, "filled_avg_price": float(recheck.get("filled_avg_price")), "status": "filled"}
+                    if recheck_qty > filled_qty:
+                        filled_qty = recheck_qty
+                        filled_avg_price = recheck.get("filled_avg_price", filled_avg_price)
+                        logger.info(f"Additional fill during timeout grace period: now {filled_qty} shares")
+                except Exception:
+                    pass
+                
+                logger.warning(f"Order {order_id} still partial after timeout grace period ({filled_qty} shares) - canceling residual")
                 cancel_success = self._cancel_order(order_id)
                 if not cancel_success:
                     logger.error(f"Failed to cancel order {order_id} after timeout - order may still be working")
                 
-                # Same post-cancel polling as partial_filled branch
+                # Post-cancel polling (10s for small-cap settle time)
                 terminal_states = {"filled", "canceled", "done_for_day", "expired", "rejected"}
                 poll_start = datetime.now()
-                max_poll = 5
+                max_poll = 10
                 
                 while (datetime.now() - poll_start).total_seconds() < max_poll:
                     time.sleep(0.5)
@@ -470,34 +512,44 @@ class PositionManager:
             return None
 
 
-    def _close_position(self, symbol: str, qty: Optional[int] = None) -> Optional[dict]:
-        """Close a position using DELETE /v2/positions/{symbol}.
+    def _submit_sell_order(self, symbol: str, qty: int, order_type: str = "market",
+                           limit_price: Optional[float] = None) -> Optional[dict]:
+        """Submit a sell order via POST /v2/orders.
         
-        This bypasses short-sell restrictions that cause 403 on regular sell orders
-        for penny stocks and restricted symbols. Returns the close order response or None.
-        
-        NOTE: partial close (qty param) semantics should be validated in your
-        environment. Test: full close with no qty, partial close with qty < full,
-        and repeated partial closes on the same symbol. The exit slicer depends
-        on partial close support behaving exactly as expected.
+        ALL exits go through this method — never DELETE /v2/positions.
+        POST /v2/orders is more reliable and avoids Alpaca's extra restrictions
+        on the close-position endpoint.
         
         Args:
-            symbol: The symbol to close.
-            qty: If provided, close only this many shares (partial close).
-                 If None, closes the entire position.
+            symbol: The symbol to sell.
+            qty: Number of shares to sell.
+            order_type: 'market' or 'limit'.
+            limit_price: Required if order_type='limit'.
+        
+        Returns:
+            Order response dict (with 'id') or None on failure.
         """
-        url = f"{self.base_url}/v2/positions/{symbol}"
-        params = {}
-        if qty is not None:
-            params["qty"] = str(qty)
+        url = f"{self.base_url}/v2/orders"
+        order_data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": order_type,
+            "time_in_force": "day",
+        }
+        if order_type == "limit" and limit_price is not None:
+            order_data["limit_price"] = f"{limit_price:.4f}"
+
         try:
-            response = self.session.delete(url, params=params, timeout=10)
+            response = self.session.post(url, json=order_data, timeout=10)
             response.raise_for_status()
             data = response.json()
             order_id = data.get("id")
-            logger.info(f"Close position submitted: {symbol} qty={qty or 'all'} (ID: {order_id})")
-            # Reset failure counter on success
+            price_info = f" @ {limit_price:.4f}" if limit_price else ""
+            logger.info(f"Sell order submitted: {symbol} {order_type} {qty}{price_info} (ID: {order_id})")
+            # Reset failure counter and timestamp on success
             self._exit_failures.pop(symbol, None)
+            self._exit_failure_times.pop(symbol, None)
             return data
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else "N/A"
@@ -507,32 +559,61 @@ class PositionManager:
             except Exception:
                 body = "<unreadable>"
             logger.error(
-                f"Close position FAILED | symbol={symbol} | qty={qty or 'all'} | "
+                f"Sell order FAILED | symbol={symbol} | type={order_type} | qty={qty} | "
                 f"url={url} | status={status_code} | body={body}"
             )
             self._exit_failures[symbol] = self._exit_failures.get(symbol, 0) + 1
+            self._exit_failure_times[symbol] = datetime.now()
             if self._exit_failures[symbol] >= self._max_exit_failures:
                 logger.error(
                     f"CIRCUIT BREAKER: {symbol} has failed {self._exit_failures[symbol]} "
-                    f"consecutive close attempts — stopping retries"
+                    f"consecutive close attempts — {self._exit_cooldown_seconds}s cooldown"
                 )
             return None
         except requests.exceptions.RequestException as e:
             logger.error(
-                f"Close position FAILED (network) | symbol={symbol} | qty={qty or 'all'} | "
-                f"url={url} | error={e}"
+                f"Sell order FAILED (network) | symbol={symbol} | type={order_type} | "
+                f"qty={qty} | url={url} | error={e}"
             )
             self._exit_failures[symbol] = self._exit_failures.get(symbol, 0) + 1
+            self._exit_failure_times[symbol] = datetime.now()
             if self._exit_failures[symbol] >= self._max_exit_failures:
                 logger.error(
                     f"CIRCUIT BREAKER: {symbol} has failed {self._exit_failures[symbol]} "
-                    f"consecutive close attempts — stopping retries"
+                    f"consecutive close attempts — {self._exit_cooldown_seconds}s cooldown"
                 )
             return None
 
+    def _get_last_price(self, symbol: str) -> Optional[float]:
+        """Get last trade price for a symbol (for limit sell fallback)."""
+        try:
+            snapshots = self.client.get_snapshots([symbol])
+            snap = snapshots.get(symbol, {}) if snapshots else {}
+            return snap.get("last_price") or snap.get("close")
+        except Exception:
+            return None
+
     def _is_exit_blocked(self, symbol: str) -> bool:
-        """Check if a symbol has hit the circuit breaker for exit failures."""
-        return self._exit_failures.get(symbol, 0) >= self._max_exit_failures
+        """Check if a symbol is in cooldown after hitting the circuit breaker.
+        
+        Returns False (not blocked) if:
+        - symbol has fewer than _max_exit_failures consecutive failures, OR
+        - the cooldown period has elapsed (resets the counter to allow retry)
+        """
+        failures = self._exit_failures.get(symbol, 0)
+        if failures < self._max_exit_failures:
+            return False
+        # Breaker tripped — check if cooldown has elapsed
+        last_fail = self._exit_failure_times.get(symbol)
+        if last_fail and (datetime.now() - last_fail).total_seconds() >= self._exit_cooldown_seconds:
+            # Cooldown elapsed: reset counter, allow retry
+            logger.info(f"Circuit breaker cooldown elapsed for {symbol} — allowing retry")
+            self._exit_failures[symbol] = 0
+            self._exit_failure_times.pop(symbol, None)
+            return False
+        remaining = self._exit_cooldown_seconds - (datetime.now() - last_fail).total_seconds() if last_fail else 0
+        logger.debug(f"Circuit breaker active for {symbol}: {failures} failures, {remaining:.0f}s cooldown remaining")
+        return True
 
     def _submit_marketable_limit_order(self, symbol: str, quantity: int, side: str, limit_price: float) -> Optional[str]:
         """Submit aggressive day limit order for post-open entry."""
@@ -1043,7 +1124,6 @@ class PositionManager:
                 "requested_qty": requested_qty,
                 "limit_price": limit_price,
                 "plan": plan,
-                "cancel_requested": False,
             }
             for symbol, order_id, requested_qty, limit_price, plan in submitted_orders
         }
@@ -1077,10 +1157,10 @@ class PositionManager:
                     }
                     completed.append(order_id)
                 elif status == "partially_filled" and filled_qty > 0:
-                    # Same behavior as existing logic - cancel on partial, but only once
-                    if not meta["cancel_requested"]:
-                        self._cancel_order(order_id)
-                        meta["cancel_requested"] = True
+                    # Let order ride — don't cancel during the parallel window.
+                    # If still partial after the poll window, get_order_fill cleanup
+                    # handles it with proper 3s grace period + 10s post-cancel poll.
+                    logger.info(f"Rescue {meta['symbol']}: partial fill {int(filled_qty)} shares, letting order ride")
             
             for order_id in completed:
                 active_orders.pop(order_id, None)
@@ -1284,7 +1364,11 @@ class PositionManager:
         logger.info(f"Started exit slicer for {symbol}: {slices} slices over {total_window_seconds}s ({reason})")
 
     def _execute_exit_slice(self, symbol: str) -> bool:
-        """Execute one slice of a gradual exit. Returns True if slice executed successfully."""
+        """Execute one slice of a gradual exit. Returns True if slice executed successfully.
+        
+        On partial fill: immediately resubmits for remaining slice qty (no waiting).
+        On market sell failure: falls back to aggressive limit sell.
+        """
         position = self.positions.get(symbol)
         slicer = self.exit_slicers.get(symbol)
 
@@ -1296,21 +1380,63 @@ class PositionManager:
         if self._is_exit_blocked(symbol):
             return False
 
-        # Calculate slice quantity
+        # Calculate slice quantity (liquidity-aware + dynamic)
         if slicer.slices_remaining <= 1:
             qty = position.quantity  # Last slice: sell all remaining
         else:
-            qty = max(1, position.quantity // slicer.slices_remaining)
+            base_qty = max(1, position.quantity // slicer.slices_remaining)
+            qty = base_qty
 
-        # Use close-position endpoint (bypasses short-sell restrictions on penny stocks)
-        close_resp = self._close_position(symbol, qty)
-        if not close_resp:
-            logger.error(f"Failed to submit exit slice for {symbol}")
+            # Dynamic sizing: reduce slice if previous fills were poor
+            if slicer.last_fill_rate < 1.0 and slicer.last_fill_rate > 0:
+                adjusted = max(1, int(qty * slicer.last_fill_rate))
+                if adjusted < qty:
+                    logger.info(f"Dynamic sizing {symbol}: reducing slice {qty} → {adjusted} (fill rate {slicer.last_fill_rate:.0%})")
+                    qty = adjusted
+            # After 2+ consecutive partials, halve aggressively
+            if slicer.consecutive_partials >= 2:
+                halved = max(1, qty // 2)
+                if halved < qty:
+                    logger.warning(f"Dynamic sizing {symbol}: halving slice {qty} → {halved} ({slicer.consecutive_partials} consecutive partials)")
+                    qty = halved
+
+            # Floor: never shrink below 25% of base slice (prevents infinite ratchet-down)
+            min_qty = max(1, base_qty // 4)
+            if qty < min_qty:
+                logger.warning(f"Dynamic sizing {symbol}: clamping {qty} → {min_qty} (25% floor of base {base_qty})")
+                qty = min_qty
+
+        # Cap slice size to 1% of ADV to avoid overwhelming thin books
+        adv = getattr(position, 'adv_estimate', 0) or 0
+        if adv > 0 and position.current_price and position.current_price > 0:
+            adv_shares = adv / position.current_price
+            max_slice = max(1, int(adv_shares * 0.01))
+            if qty > max_slice and slicer.slices_remaining > 1:
+                qty = max_slice
+                # Recalculate slices needed for the remainder
+                new_slices = max(1, (position.quantity + max_slice - 1) // max_slice)
+                if new_slices > slicer.slices_remaining:
+                    slicer.slices_remaining = new_slices
+                    logger.info(f"Liquidity cap: {symbol} slice capped to {qty} shares (1% ADV), slices expanded to {new_slices}")
+
+        # Submit sell order via POST /v2/orders
+        sell_resp = self._submit_sell_order(symbol, qty)
+
+        # Fallback: if market sell fails, try aggressive limit sell
+        if not sell_resp:
+            last_price = self._get_last_price(symbol)
+            if last_price and last_price > 0:
+                limit_price = round(last_price * 0.97, 4)  # 3% below last trade
+                logger.warning(f"Market sell failed for {symbol}, trying limit sell @ {limit_price:.4f}")
+                sell_resp = self._submit_sell_order(symbol, qty, order_type="limit", limit_price=limit_price)
+
+        if not sell_resp:
+            logger.error(f"Failed to submit exit slice for {symbol} (market + limit both failed)")
             return False
 
-        order_id = close_resp.get("id")
+        order_id = sell_resp.get("id")
         if not order_id:
-            logger.error(f"Close position response missing order ID for {symbol}")
+            logger.error(f"Sell order response missing order ID for {symbol}")
             return False
 
         fill = self.get_order_fill(order_id, max_wait=30)
@@ -1322,6 +1448,13 @@ class PositionManager:
         filled_qty = int(fill["filled_qty"])
         fill_status = fill.get("status", "unknown")
 
+        # Update dynamic fill tracking for next slice sizing
+        slicer.last_fill_rate = filled_qty / qty if qty > 0 else 1.0
+        if filled_qty < qty:
+            slicer.consecutive_partials += 1
+        else:
+            slicer.consecutive_partials = 0
+
         pnl = (exit_price - position.entry_price) * filled_qty
         pnl_pct = ((exit_price / position.entry_price) - 1) * 100
 
@@ -1329,13 +1462,38 @@ class PositionManager:
 
         if remaining > 0:
             position.quantity = remaining
+
+            # If partial fill left residual from THIS slice, resubmit immediately
+            slice_residual = qty - filled_qty
+            if slice_residual > 0 and fill_status != "filled":
+                logger.warning(
+                    f"EXIT SLICE {symbol}: partial fill {filled_qty}/{qty} — "
+                    f"resubmitting {slice_residual} immediately"
+                )
+                resub_resp = self._submit_sell_order(symbol, slice_residual)
+                if resub_resp:
+                    resub_id = resub_resp.get("id")
+                    if resub_id:
+                        resub_fill = self.get_order_fill(resub_id, max_wait=15)
+                        if resub_fill:
+                            resub_qty = int(resub_fill["filled_qty"])
+                            remaining -= resub_qty
+                            position.quantity = remaining
+                            logger.info(f"Resubmit filled {resub_qty} more for {symbol}, remaining={remaining}")
+
             slicer.slices_remaining -= 1
             slicer.next_slice_time = slicer.next_slice_time + timedelta(seconds=slicer.seconds_between_slices)
             logger.info(
                 f"EXIT SLICE {symbol}: {filled_qty} @ {exit_price:.2f} "
                 f"(P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - remaining {remaining}, "
-                f"slices left {slicer.slices_remaining}, status={fill_status}"
+                f"slices left {slicer.slices_remaining}, fill_rate={slicer.last_fill_rate:.0%}, status={fill_status}"
             )
+
+            # If resubmit cleaned up the rest
+            if remaining <= 0:
+                logger.info(f"FINAL EXIT {symbol} (resubmit completed): {slicer.reason}")
+                self.positions.pop(symbol, None)
+                self.exit_slicers.pop(symbol, None)
         else:
             logger.info(
                 f"FINAL EXIT {symbol}: {filled_qty} @ {exit_price:.2f} "
@@ -1347,10 +1505,10 @@ class PositionManager:
         return True
 
     def _exit_position(self, symbol: str, reason: str):
-        """
-        Exit a position using the close-position endpoint.
-        Uses DELETE /v2/positions/{symbol} to bypass short-sell restrictions
-        on penny stocks and restricted symbols.
+        """Exit a full position via POST /v2/orders (market sell with limit fallback).
+        
+        On partial fill: immediately resubmits for remaining qty.
+        On market sell failure: falls back to aggressive limit sell.
         """
         position = self.positions.get(symbol)
         if not position:
@@ -1360,13 +1518,24 @@ class PositionManager:
         if self._is_exit_blocked(symbol):
             return
 
-        close_resp = self._close_position(symbol)
-        if not close_resp:
+        qty = position.quantity
+        sell_resp = self._submit_sell_order(symbol, qty)
+
+        # Fallback: if market sell fails, try aggressive limit sell
+        if not sell_resp:
+            last_price = self._get_last_price(symbol)
+            if last_price and last_price > 0:
+                limit_price = round(last_price * 0.97, 4)
+                logger.warning(f"Market sell failed for {symbol}, trying limit sell @ {limit_price:.4f}")
+                sell_resp = self._submit_sell_order(symbol, qty, order_type="limit", limit_price=limit_price)
+
+        if not sell_resp:
+            logger.error(f"Failed to exit {symbol} (market + limit both failed) - {reason}")
             return
 
-        order_id = close_resp.get("id")
+        order_id = sell_resp.get("id")
         if not order_id:
-            logger.error(f"Close position response missing order ID for {symbol}")
+            logger.error(f"Sell order response missing order ID for {symbol}")
             return
 
         fill = self.get_order_fill(order_id, max_wait=30)
@@ -1386,7 +1555,24 @@ class PositionManager:
         if remaining > 0:
             position.quantity = remaining
             position.order_id = None
-            logger.warning(f"PARTIAL EXIT {symbol}: {filled_qty} shares @ {exit_price:.2f} (P&L: {pnl:+.2f}) - {reason} - REMAINING: {remaining}")
+            logger.warning(
+                f"PARTIAL EXIT {symbol}: {filled_qty}/{qty} @ {exit_price:.2f} "
+                f"(P&L: {pnl:+.2f}) - {reason} - resubmitting {remaining}"
+            )
+            # Immediate resubmit for residual
+            resub_resp = self._submit_sell_order(symbol, remaining)
+            if resub_resp:
+                resub_id = resub_resp.get("id")
+                if resub_id:
+                    resub_fill = self.get_order_fill(resub_id, max_wait=15)
+                    if resub_fill:
+                        resub_qty = int(resub_fill["filled_qty"])
+                        remaining -= resub_qty
+                        position.quantity = remaining
+                        logger.info(f"Resubmit filled {resub_qty} more for {symbol}, remaining={remaining}")
+            if remaining <= 0:
+                logger.info(f"EXIT {symbol} (resubmit completed): {reason}")
+                self.positions.pop(symbol, None)
         else:
             logger.info(f"EXIT {symbol}: {filled_qty} shares @ {exit_price:.2f} (P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - {reason}")
             del self.positions[symbol]
@@ -1515,8 +1701,14 @@ class PositionManager:
         
         return canceled_count
 
-    def get_broker_positions(self) -> List[dict]:
-        """Read live positions from Alpaca, independent of local bot memory."""
+    def get_broker_positions(self) -> Optional[List[dict]]:
+        """Read live positions from Alpaca, independent of local bot memory.
+        
+        Returns:
+            List of position dicts on success (may be empty if genuinely flat).
+            None on API error — callers MUST check for None to avoid
+            treating an API glitch as "broker is flat".
+        """
         url = f"{self.base_url}/v2/positions"
         try:
             response = self.session.get(url, timeout=15)
@@ -1525,16 +1717,25 @@ class PositionManager:
             return data if isinstance(data, list) else []
         except requests.exceptions.RequestException as e:
             logger.error(f"Error getting broker positions: {e}")
-            return []
+            return None
 
     def broker_position_count(self) -> int:
-        """Count live broker positions."""
-        return len(self.get_broker_positions())
+        """Count live broker positions. Returns -1 if broker API failed."""
+        positions = self.get_broker_positions()
+        if positions is None:
+            return -1
+        return len(positions)
 
     def force_flatten_broker_positions(self, reason: str = "failsafe") -> Dict[str, object]:
-        """
-        Flatten ALL live broker positions based on Alpaca account state,
-        not local self.positions.
+        """Flatten ALL live broker positions using multi-layer retry.
+        
+        Retry chain per symbol:
+        1. Market sell (full qty)
+        2. Limit sell at -3% of last price (full qty)
+        3. Limit sell at -5% of last price (half qty, then remaining)
+        4. Flag for manual intervention
+        
+        Cancels all slicers and working orders first to prevent conflicts.
         """
         summary = {
             "reason": reason,
@@ -1543,93 +1744,229 @@ class PositionManager:
             "fills_confirmed": 0,
             "symbols": [],
             "errors": [],
+            "manual_required": [],
         }
 
-        # Best effort: cancel any working orders first
+        # Cancel all slicers first to prevent overlap (issue 4)
+        if self.exit_slicers:
+            logger.warning(f"Failsafe: canceling {len(self.exit_slicers)} active exit slicers")
+            self.exit_slicers.clear()
+
+        # Cancel any working orders
         self.cancel_all_open_orders()
 
         broker_positions = self.get_broker_positions()
+        if broker_positions is None:
+            logger.error(f"Broker API failed during {reason} flatten — cannot proceed, keeping local state")
+            summary["errors"].append("broker API unreachable")
+            return summary
         summary["positions_seen"] = len(broker_positions)
 
         if not broker_positions:
             logger.warning(f"No live broker positions found during {reason} flatten")
-            # Also clear stale local positions if broker is flat
             if self.positions:
                 logger.warning("Broker is flat but local positions remain; clearing local state")
                 self.positions.clear()
-            self.exit_slicers.clear()
             return summary
 
         logger.warning(f"Flattening {len(broker_positions)} live broker positions: {reason}")
 
-        # Reset circuit breaker for failsafe — this is last resort, try everything
+        # Reset circuit breaker — this is last resort, try everything
         self._exit_failures.clear()
 
         for pos in broker_positions:
             try:
                 symbol = pos.get("symbol")
                 qty_raw = pos.get("qty", "0")
-
                 qty = abs(int(float(qty_raw)))
                 if not symbol or qty <= 0:
                     continue
 
-                # Use close-position endpoint (bypasses short-sell restrictions)
-                close_resp = self._close_position(symbol)
-                if not close_resp:
-                    msg = f"{symbol}: failed to submit sell {qty}"
-                    logger.error(msg)
-                    summary["errors"].append(msg)
-                    continue
+                remaining_qty = qty
+                total_filled = 0
 
-                order_id = close_resp.get("id")
-                if not order_id:
-                    msg = f"{symbol}: close response missing order ID"
-                    logger.error(msg)
-                    summary["errors"].append(msg)
-                    continue
+                # ── Layer 1: Market sell ──
+                sell_resp = self._submit_sell_order(symbol, remaining_qty)
+                if sell_resp:
+                    order_id = sell_resp.get("id")
+                    if order_id:
+                        summary["closes_submitted"] += 1
+                        fill = self.get_order_fill(order_id, max_wait=30)
+                        if fill:
+                            filled = int(fill["filled_qty"])
+                            total_filled += filled
+                            remaining_qty -= filled
+                            logger.warning(
+                                f"FAILSAFE L1 {symbol}: market sell filled {filled}/{qty} "
+                                f"@ {fill['filled_avg_price']:.4f}"
+                            )
 
-                summary["closes_submitted"] += 1
+                # ── Layer 2: Limit sell at -3% ──
+                if remaining_qty > 0:
+                    last_price = self._get_last_price(symbol)
+                    if last_price and last_price > 0:
+                        limit_price = round(last_price * 0.97, 4)
+                        logger.warning(f"FAILSAFE L2 {symbol}: trying limit sell {remaining_qty} @ {limit_price:.4f}")
+                        sell_resp = self._submit_sell_order(symbol, remaining_qty, "limit", limit_price)
+                        if sell_resp:
+                            order_id = sell_resp.get("id")
+                            if order_id:
+                                summary["closes_submitted"] += 1
+                                fill = self.get_order_fill(order_id, max_wait=20)
+                                if fill:
+                                    filled = int(fill["filled_qty"])
+                                    total_filled += filled
+                                    remaining_qty -= filled
+                                    logger.warning(f"FAILSAFE L2 {symbol}: limit sell filled {filled}")
 
-                fill = self.get_order_fill(order_id, max_wait=30)
-                if fill:
-                    filled_qty = int(fill["filled_qty"])
-                    status = fill.get("status", "unknown")
+                # ── Layer 3: Limit sell at -5%, half qty then remainder ──
+                if remaining_qty > 0:
+                    last_price = self._get_last_price(symbol) or last_price
+                    if last_price and last_price > 0:
+                        limit_price = round(last_price * 0.95, 4)
+                        half_qty = max(1, remaining_qty // 2)
+                        logger.warning(f"FAILSAFE L3 {symbol}: trying limit sell {half_qty} @ {limit_price:.4f}")
+                        sell_resp = self._submit_sell_order(symbol, half_qty, "limit", limit_price)
+                        if sell_resp:
+                            order_id = sell_resp.get("id")
+                            if order_id:
+                                summary["closes_submitted"] += 1
+                                fill = self.get_order_fill(order_id, max_wait=15)
+                                if fill:
+                                    filled = int(fill["filled_qty"])
+                                    total_filled += filled
+                                    remaining_qty -= filled
 
-                    logger.warning(
-                        f"FAILSAFE FLATTEN {symbol}: closed {filled_qty} "
-                        f"@ {fill['filled_avg_price']:.4f} status={status}"
-                    )
+                        # Try the rest if half worked
+                        if remaining_qty > 0:
+                            sell_resp = self._submit_sell_order(symbol, remaining_qty, "limit", limit_price)
+                            if sell_resp:
+                                order_id = sell_resp.get("id")
+                                if order_id:
+                                    summary["closes_submitted"] += 1
+                                    fill = self.get_order_fill(order_id, max_wait=15)
+                                    if fill:
+                                        filled = int(fill["filled_qty"])
+                                        total_filled += filled
+                                        remaining_qty -= filled
 
+                # ── Result tracking ──
+                if total_filled > 0:
                     summary["fills_confirmed"] += 1
                     summary["symbols"].append(symbol)
 
-                    # Update local state to match confirmed broker activity
-                    if filled_qty >= qty:
-                        self.positions.pop(symbol, None)
-                        self.exit_slicers.pop(symbol, None)
-                        logger.info(f"Cleared local state for {symbol}: {filled_qty}/{qty} shares filled")
-                    else:
-                        # Partial fill: reduce local position quantity so it's not overstated
-                        local_pos = self.positions.get(symbol)
-                        if local_pos:
-                            local_pos.quantity = max(0, local_pos.quantity - filled_qty)
-                            logger.warning(
-                                f"{symbol}: partial fill {filled_qty}/{qty} shares, "
-                                f"local qty reduced to {local_pos.quantity}"
-                            )
-                        else:
-                            logger.warning(f"{symbol}: partial fill {filled_qty}/{qty} shares (no local position)")
-                        summary["errors"].append(f"{symbol}: partial fill {filled_qty}/{qty} shares, status={status}")
+                # Update local state
+                if remaining_qty <= 0:
+                    self.positions.pop(symbol, None)
+                    self.exit_slicers.pop(symbol, None)
+                    logger.info(f"FAILSAFE COMPLETE {symbol}: {total_filled}/{qty} shares closed")
                 else:
-                    msg = f"{symbol}: no fill confirmation for order {order_id}"
-                    logger.error(msg)
-                    summary["errors"].append(msg)
+                    # Reduce local qty to match what's still open
+                    local_pos = self.positions.get(symbol)
+                    if local_pos:
+                        local_pos.quantity = max(0, local_pos.quantity - total_filled)
+
+                    # ── Layer 4: Flag for manual intervention ──
+                    logger.critical(
+                        f"MANUAL INTERVENTION REQUIRED: {symbol} still has {remaining_qty} shares "
+                        f"after all retry layers ({reason})"
+                    )
+                    summary["manual_required"].append(f"{symbol}: {remaining_qty} shares remaining")
+                    summary["errors"].append(f"{symbol}: {remaining_qty}/{qty} unfilled after all layers")
 
             except Exception as e:
                 msg = f"{pos.get('symbol', 'UNKNOWN')}: {e}"
                 logger.error(f"Error flattening broker position - {msg}")
                 summary["errors"].append(msg)
+
+        return summary
+
+    def nuclear_flatten(self, max_rounds: int = 5) -> Dict[str, object]:
+        """NUCLEAR OPTION: spam market sells until broker is completely flat.
+        
+        Ignores circuit breakers entirely. Retries up to max_rounds.
+        Each round: cancel all orders, re-read broker, market sell everything.
+        
+        Use only after 3:58 PM as absolute last resort.
+        """
+        logger.critical(f"NUCLEAR FLATTEN: starting — will retry up to {max_rounds} rounds")
+
+        # Nuke all state that could interfere
+        self.exit_slicers.clear()
+        self._exit_failures.clear()
+        self._exit_failure_times.clear()
+
+        summary = {
+            "rounds": 0,
+            "total_sells": 0,
+            "total_filled": 0,
+            "still_open": [],
+        }
+
+        for rnd in range(1, max_rounds + 1):
+            summary["rounds"] = rnd
+
+            self.cancel_all_open_orders()
+            time.sleep(1)
+
+            broker_positions = self.get_broker_positions()
+            if broker_positions is None:
+                logger.critical(f"NUCLEAR FLATTEN round {rnd}: broker API failed — retrying")
+                time.sleep(2)
+                continue
+            if not broker_positions:
+                logger.critical(f"NUCLEAR FLATTEN: broker is FLAT after round {rnd}")
+                self.positions.clear()
+                return summary
+
+            logger.critical(f"NUCLEAR FLATTEN round {rnd}: {len(broker_positions)} positions remaining")
+
+            for pos in broker_positions:
+                try:
+                    symbol = pos.get("symbol")
+                    qty = abs(int(float(pos.get("qty", "0"))))
+                    if not symbol or qty <= 0:
+                        continue
+
+                    # Bypass _submit_sell_order to avoid circuit breaker entirely
+                    url = f"{self.base_url}/v2/orders"
+                    order_data = {
+                        "symbol": symbol,
+                        "qty": str(qty),
+                        "side": "sell",
+                        "type": "market",
+                        "time_in_force": "day",
+                    }
+                    try:
+                        resp = self.session.post(url, json=order_data, timeout=10)
+                        resp.raise_for_status()
+                        order_id = resp.json().get("id")
+                        summary["total_sells"] += 1
+                        logger.critical(f"NUCLEAR SELL {symbol} x{qty} (ID: {order_id})")
+
+                        if order_id:
+                            fill = self.get_order_fill(order_id, max_wait=15)
+                            if fill and int(fill["filled_qty"]) > 0:
+                                summary["total_filled"] += int(fill["filled_qty"])
+                                self.positions.pop(symbol, None)
+                    except Exception as e:
+                        logger.critical(f"NUCLEAR SELL FAILED {symbol}: {e}")
+                except Exception as e:
+                    logger.critical(f"NUCLEAR FLATTEN error: {e}")
+
+            time.sleep(2)
+
+        # Final check
+        remaining = self.get_broker_positions()
+        if remaining is None:
+            logger.critical(f"NUCLEAR FLATTEN: broker API failed on final check — cannot confirm flat")
+        elif remaining:
+            symbols = [p.get("symbol") for p in remaining]
+            summary["still_open"] = symbols
+            logger.critical(f"NUCLEAR FLATTEN INCOMPLETE: {symbols} still open after {max_rounds} rounds")
+        else:
+            self.positions.clear()
+            logger.critical(f"NUCLEAR FLATTEN: broker confirmed flat after {max_rounds} rounds")
 
         return summary
 
@@ -1647,6 +1984,10 @@ class PositionManager:
         """
         broker_positions = self.get_broker_positions()
         actions = {}
+
+        if broker_positions is None:
+            logger.error("Broker API failed during reconciliation — skipping to preserve local state")
+            return actions
 
         broker_map = {}
         if broker_positions:

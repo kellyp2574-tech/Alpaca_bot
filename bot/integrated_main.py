@@ -163,7 +163,7 @@ class GapMomentumBot:
                 self.failsafe_345_done = True
 
             if self.stage_entry_done and not self.failsafe_358_done and current_time >= dt_time(15, 58):
-                self._run_failsafe_flatten("3:58 PM failsafe")
+                self._run_nuclear_flatten()
                 self.failsafe_358_done = True
 
             # Step 4: Manage exits (rate-limited to every 30s to stay under 200 API calls/min)
@@ -584,15 +584,26 @@ class GapMomentumBot:
         - Late fills that slipped past the Phase 3 hard cutoff
         - Symbol mismatches (local and broker have same count but different names)
         - Wrong local quantities from partial fill desync
+        
+        If broker API returns -1 (unreachable), skip destructive state decisions
+        and proceed with local state only — trust broker > local, but never
+        destroy local state based on an API glitch.
         """
         local_count = self.position_mgr.get_position_count()
         broker_count = self.position_mgr.broker_position_count()
 
-        if local_count == 0 and broker_count == 0:
-            logger.info("All positions closed locally and at broker - exit complete")
-            self.stage_exit_done = True
-            self._save_state()
-            return
+        # If broker API failed, skip state-comparison decisions entirely
+        if broker_count < 0:
+            logger.warning("Broker API unreachable — skipping state comparison, using local state only")
+            if local_count == 0:
+                return  # Nothing to manage
+            # Fall through to manage exits based on local state
+        else:
+            if local_count == 0 and broker_count == 0:
+                logger.info("All positions closed locally and at broker - exit complete")
+                self.stage_exit_done = True
+                self._save_state()
+                return
 
         # ── Periodic symbol-level broker reconciliation (every 60s) ──
         # This catches late fills, symbol mismatches, and wrong quantities.
@@ -609,46 +620,48 @@ class GapMomentumBot:
                 local_count = self.position_mgr.get_position_count()
                 broker_count = self.position_mgr.broker_position_count()
 
-        if local_count == 0 and broker_count == 0:
-            logger.info("All positions closed locally and at broker - exit complete")
-            self.stage_exit_done = True
-            self._save_state()
-            return
-
-        if local_count == 0 and broker_count > 0:
-            # Guard: don't flatten during entry grace period (before 9:40).
-            if current_time < dt_time(9, 40):
-                logger.warning(
-                    f"Local empty but broker shows {broker_count} positions — "
-                    f"in entry grace period (before 9:40), NOT flattening"
-                )
+        # Only make state-comparison decisions if broker API succeeded
+        if broker_count >= 0:
+            if local_count == 0 and broker_count == 0:
+                logger.info("All positions closed locally and at broker - exit complete")
+                self.stage_exit_done = True
+                self._save_state()
                 return
 
-            if not self.mismatch_flatten_done:
-                logger.warning(
-                    f"Local positions empty but broker shows {broker_count} live positions - "
-                    f"running immediate broker flatten"
-                )
-                self._run_failsafe_flatten("intraday broker/local mismatch")
-                self.mismatch_flatten_done = True
-                self._save_state()
-            else:
-                logger.warning(
-                    f"Broker still shows {broker_count} positions after mismatch flatten - "
-                    f"waiting for failsafe sweeps"
-                )
-            return
+            if local_count == 0 and broker_count > 0:
+                # Guard: don't flatten during entry grace period (before 9:40).
+                if current_time < dt_time(9, 40):
+                    logger.warning(
+                        f"Local empty but broker shows {broker_count} positions — "
+                        f"in entry grace period (before 9:40), NOT flattening"
+                    )
+                    return
 
-        if local_count > 0 and broker_count == 0:
-            logger.warning(
-                f"Local shows {local_count} positions but broker is flat - "
-                f"clearing stale local state"
-            )
-            self.position_mgr.positions.clear()
-            self.position_mgr.exit_slicers.clear()
-            self.stage_exit_done = True
-            self._save_state()
-            return
+                if not self.mismatch_flatten_done:
+                    logger.warning(
+                        f"Local positions empty but broker shows {broker_count} live positions - "
+                        f"running immediate broker flatten"
+                    )
+                    self._run_failsafe_flatten("intraday broker/local mismatch")
+                    self.mismatch_flatten_done = True
+                    self._save_state()
+                else:
+                    logger.warning(
+                        f"Broker still shows {broker_count} positions after mismatch flatten - "
+                        f"waiting for failsafe sweeps"
+                    )
+                return
+
+            if local_count > 0 and broker_count == 0:
+                logger.warning(
+                    f"Local shows {local_count} positions but broker is flat - "
+                    f"clearing stale local state"
+                )
+                self.position_mgr.positions.clear()
+                self.position_mgr.exit_slicers.clear()
+                self.stage_exit_done = True
+                self._save_state()
+                return
 
         current_prices = self.position_mgr.update_positions()
         exited = self.position_mgr.check_exits(current_time, self.vix_level, current_prices)
@@ -754,7 +767,10 @@ class GapMomentumBot:
         live_broker_positions = self.position_mgr.get_broker_positions()
         local_count = self.position_mgr.get_position_count()
 
-        if live_broker_positions:
+        if live_broker_positions is None:
+            # Broker API failed — preserve local state, don't make destructive decisions
+            logger.error("Startup: broker API unreachable — preserving local state as-is")
+        elif live_broker_positions:
             logger.warning(f"Startup: broker shows {len(live_broker_positions)} live positions")
             for pos in live_broker_positions:
                 logger.warning(f"  Broker: {pos.get('symbol')} qty={pos.get('qty')} side={pos.get('side')}")
@@ -874,7 +890,7 @@ class GapMomentumBot:
             os.remove(pre_trade_file)
 
     def _run_failsafe_flatten(self, label: str):
-        """Broker-based catch-all flatten."""
+        """Broker-based catch-all flatten with multi-layer retry."""
         logger.warning(f"{label}: starting broker-based failsafe flatten")
 
         summary = self.position_mgr.force_flatten_broker_positions(label)
@@ -887,14 +903,48 @@ class GapMomentumBot:
             f"errors={len(summary['errors'])}"
         )
 
+        # Log any symbols that need manual intervention
+        manual = summary.get("manual_required", [])
+        if manual:
+            for item in manual:
+                logger.critical(f"{label}: {item}")
+
         # If broker is flat, mark exits complete and clear any stale local state
-        if self.position_mgr.broker_position_count() == 0:
+        remaining = self.position_mgr.broker_position_count()
+        if remaining == 0:
             self.stage_exit_done = True
             self.position_mgr.positions.clear()
             self.position_mgr.exit_slicers.clear()
             logger.warning(f"{label}: broker confirmed flat — local state cleared")
+        elif remaining < 0:
+            logger.error(f"{label}: broker API unreachable after failsafe — cannot confirm flat")
         else:
-            logger.error(f"{label}: broker still shows open positions after failsafe")
+            logger.error(f"{label}: broker still shows {remaining} open positions after failsafe")
+
+        self._save_state()
+
+    def _run_nuclear_flatten(self):
+        """3:58 PM nuclear option: ignore all circuit breakers, spam sells until flat."""
+        logger.critical("3:58 PM NUCLEAR FLATTEN: ignoring circuit breakers, must flatten before close")
+
+        summary = self.position_mgr.nuclear_flatten(max_rounds=5)
+
+        logger.critical(
+            f"NUCLEAR FLATTEN result: rounds={summary['rounds']} | "
+            f"sells={summary['total_sells']} | filled={summary['total_filled']} | "
+            f"still_open={summary['still_open']}"
+        )
+
+        remaining = self.position_mgr.broker_position_count()
+        if remaining == 0:
+            self.stage_exit_done = True
+            self.position_mgr.positions.clear()
+            self.position_mgr.exit_slicers.clear()
+            logger.critical("NUCLEAR FLATTEN: broker confirmed flat — local state cleared")
+        elif remaining < 0:
+            logger.critical("NUCLEAR FLATTEN: broker API unreachable — cannot confirm flat, MANUAL CHECK NEEDED")
+        else:
+            logger.critical(f"NUCLEAR FLATTEN: broker STILL shows {remaining} positions — MANUAL ACTION NEEDED")
 
         self._save_state()
 
@@ -908,6 +958,9 @@ class GapMomentumBot:
             self.position_mgr.force_flatten_broker_positions("finalize_day")
 
         broker_count_after = self.position_mgr.broker_position_count()
+        if broker_count_after < 0:
+            logger.critical("FINALIZE DAY: broker API unreachable — cannot confirm flat, preserving state")
+            return
         if broker_count_after > 0:
             logger.critical(
                 f"FAILED TO FLATTEN BROKER POSITIONS AT END OF DAY - "
