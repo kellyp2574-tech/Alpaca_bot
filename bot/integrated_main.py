@@ -648,6 +648,22 @@ class GapMomentumBot:
                 self.state_mgr.clear_bot_state()
                 self._clear_pre_trade_state()
 
+                # Reset ALL stage flags that may have been prematurely set by
+                # position loading above (lines 581-583). Stale positions from
+                # yesterday must not lock out today's universe/candidate/entry flow.
+                self.stage_universe_done = False
+                self.stage_candidates_done = False
+                self.stage_entry_done = False
+                self.stage_exit_done = False
+                self.entry_submission_locked = False
+                self.position_mgr.entry_stage1_done = False
+                self.position_mgr.entry_stage2_done = False
+                self.position_mgr.entry_plans.clear()
+                self.position_mgr.positions.clear()
+                self.position_mgr.exit_slicers.clear()
+                self.state_mgr.save_positions({})
+                logger.info("Stale state fully cleared — all stages reset for fresh day")
+
         # CRITICAL: Cancel orphaned open buy orders, but preserve legitimate ones with matching entry_plans
         # Only cancel if we don't have restored staged-entry state, or reconcile against saved order IDs
         has_valid_entry_plans = bool(self.position_mgr.entry_plans)
