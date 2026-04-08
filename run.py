@@ -1,5 +1,5 @@
 """
-Entry point for Gap Momentum Bot.
+Entry point for Overnight Momentum Bot.
 Run daily at 9:00 AM ET.
 
 Usage:

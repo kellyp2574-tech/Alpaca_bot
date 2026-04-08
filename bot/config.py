@@ -1,109 +1,48 @@
 """
-Gap Momentum Bot Configuration — API keys, state paths, logging, strategy parameters.
+Overnight Momentum Bot — Unified config re-export.
+
+All settings live in their dedicated files:
+  config_broker.py   — API credentials, endpoints, data feed
+  config_runtime.py  — state paths, logging
+  config_universe.py — price/ADV filters, presets, lookback periods
+  config_strategy.py — scoring weights, selection tiers, exit rules, timing
+
+This file re-exports everything so that existing code using
+``from bot import config; config.X`` continues to work.
 """
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# Broker
+from bot.config_broker import (          # noqa: F401
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER,
+    ALPACA_BASE_URL, ALPACA_DATA_URL, DATA_FEED,
+    MASSIVE_API_KEY, MASSIVE_BASE_URL,
+)
 
-# ═══════════════════════════════════════════════════
-# Alpaca API
-# ═══════════════════════════════════════════════════
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+# Runtime
+from bot.config_runtime import (         # noqa: F401
+    STATE_DIR, STATE_FILE, LOG_DIR, LOG_FILE, TRADE_LOG_FILE,
+    LOG_LEVEL, LOG_FORMAT,
+    POSITIONS_FILE, DAILY_LOG_FILE,
+)
 
-# ═══════════════════════════════════════════════════
-# Massive API (for universe reduction)
-# ═══════════════════════════════════════════════════
-MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "")
+# Universe
+from bot.config_universe import (        # noqa: F401
+    UNIVERSE_PRESET, UNIVERSE_PRESETS,
+    MIN_PRICE, MAX_PRICE, MIN_ADV_DOLLARS,
+    ADV_LOOKBACK_DAYS, ATR_LOOKBACK_DAYS,
+    UNIVERSE_MAX_RETRIES,
+)
 
-# ═══════════════════════════════════════════════════
-# State & Logging
-# ═══════════════════════════════════════════════════
-STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state")
-STATE_FILE = os.path.join(STATE_DIR, "bot_state.json")
-LOG_DIR = os.path.join(STATE_DIR, "logs")
-LOG_FILE = os.path.join(LOG_DIR, "bot.log")
-TRADE_LOG_FILE = os.path.join(LOG_DIR, "trades.log")
-
-# Logging config
-LOG_LEVEL = "INFO"
-LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-# State files
-POSITIONS_FILE = os.path.join(STATE_DIR, "positions.json")
-DAILY_LOG_FILE = os.path.join(STATE_DIR, "daily_log.json")
-
-# ═══════════════════════════════════════════════════
-# Gap Momentum Strategy Parameters
-# ═══════════════════════════════════════════════════
-
-# Trading hours (Eastern Time)
-START_TIME = "09:00"
-SNAPSHOT_TIME = "09:29"
-ENTRY_TIME = "09:30"
-
-# Price filters (Step 1: Universe reduction via Massive)
-MIN_PRICE = 0.50
-MAX_PRICE = 5.00
-
-# Gap filters (Step 2: Signal engine via Alpaca)
-MIN_GAP_PCT = 3.0
-MAX_GAP_PCT = 50.0
-
-# Volume filter
-MIN_ADV_DOLLARS = 5_000_000  # $5M minimum average daily dollar volume
-
-# Position sizing
-LIQUIDITY_CAP_PCT = 0.003  # 0.3% of ADV max position size
-MAX_POSITIONS = 100  # Maximum positions to hold at once
-MAX_POSITION_DOLLARS = 50_000  # Maximum dollars per position (absolute cap)
-MAX_POSITION_SHARES = 50_000  # Maximum shares per position (absolute cap)
-
-# Exit rules (VIX-conditioned)
-VIX_LOW_THRESHOLD = 12.0
-VIX_HIGH_THRESHOLD = 22.0
-EXIT_TIME_LOW_VIX = "14:30"  # 2:30 PM
-EXIT_TIME_MIDDLE_VIX = "15:30"  # 3:30 PM (VIX 12-22)
-EXIT_TIME_HIGH_VIX = "15:30"  # 3:30 PM
-
-# Trailing stop (for middle VIX regime: 12-22)
-TRAILING_STOP_ACTIVATION = 0.15  # 15% gain to activate
-TRAILING_STOP_PCT = 0.03  # 3% trail
-
-# API endpoints
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if ALPACA_PAPER else "https://api.alpaca.markets"
-ALPACA_DATA_URL = "https://data.alpaca.markets"
-
-# Massive API (for universe reduction)
-MASSIVE_BASE_URL = "https://api.massive.com"
-UNIVERSE_MAX_RETRIES = 3  # Max retries for Massive universe building before Alpaca fallback
-
-# Data feed (IEX for free tier)
-DATA_FEED = "iex"
-
-# ═══════════════════════════════════════════════════
-# Staged Entry Execution Model (Market Orders at Open + Rescue Passes)
-# ═══════════════════════════════════════════════════
-
-# Enable staged entry: submit market orders at 9:30:00, rescue passes after
-USE_STAGED_OPEN_ENTRY = True
-
-# Percent of target size sent as initial market order at 9:30:00 (1.0 = 100%)
-OPEN_ENTRY_PCT = 1.0
-
-# Timing for reconciliation and rescue passes
-POST_OPEN_ENTRY_TIME_1 = "09:31:00"  # Reconcile initial market order fills
-POST_OPEN_ENTRY_TIME_2 = "09:31:30"  # Rescue passes for remaining size
-
-# Aggressive marketable limit buffer for buy orders (0.005 = 50 bps)
-POST_OPEN_BUY_LIMIT_BUFFER = 0.005
-
-# Optionally avoid chasing if price runs too far from expected open (0.03 = 3%)
-MAX_CHASE_FROM_OPEN_PCT = 0.03
-
-# Skip tiny leftovers
-MIN_RESCUE_NOTIONAL = 100.0
-MIN_RESCUE_SHARES = 1
+# Strategy
+from bot.config_strategy import (        # noqa: F401
+    SCORE_WEIGHT_INTRADAY_RETURN, SCORE_WEIGHT_PROXIMITY_HIGH,
+    SCORE_WEIGHT_VOLUME_VS_AVG, SCORE_WEIGHT_VOLUME_TREND,
+    SCORE_WEIGHT_VS_MARKET, SCORE_WEIGHT_ATR_PCT,
+    STRATEGY_TIERS,
+    MAX_LEVERAGE, ADV_CAP_PCT, MAX_POSITION_DOLLARS, MAX_POSITIONS,
+    HARD_STOP_PCT, DROP_STOP_PCT, EXIT_TIME,
+    DATA_COLLECTION_TIME, SCORING_TIME, ENTRY_TIME,
+    MARKET_OPEN_TIME, FIRST_CHECKPOINT_TIME,
+    SECTOR_ETFS, MARKET_BENCHMARK,
+)
 

@@ -1,29 +1,54 @@
-"""Gap Momentum Bot - Main Orchestrator
+"""Overnight Momentum Bot — Main Orchestrator
 
-Daily Schedule (ET):
-- 09:00: Pull full market snapshot from Massive, filter by price ($0.50-$5.00)
-- 09:25: Compute gaps from Massive data, build candidate list (core 4%+, filler 3-4%)
-- 09:30:00: Submit full-size market orders at open for all candidates
-- 09:31:00: Reconcile market order fills; if OPEN_ENTRY_PCT=1.0, finalize immediately
-- 09:31:30: Rescue passes for partial fills (only when OPEN_ENTRY_PCT<1.0), finalize positions
-- Variable exit: VIX-conditioned exits (2:30 PM low VIX, 3:30 PM high VIX, or trailing stop)
-- 3:30/3:45/3:58 PM: Broker-based failsafe flatten sweeps
+Daily Schedule (ET) — bot starts at 9:00 AM:
+
+MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
+  09:00  Start, detect overnight positions from broker
+  09:30  Market open — check hard stops (entry_price × 0.95)
+  09:35  First checkpoint — check 6% drop-stop from open high
+  11:00  Exit ALL remaining positions at market price
+  11:05  Post-exit failsafe verification
+
+AFTERNOON (T-1 entries — new positions for tomorrow's exits):
+  15:30  Build universe (Massive + Alpaca asset filter + daily bars + ADV)
+  15:48  Fetch 9:30-3:50 minute bars → build & score candidates (350 model)
+  15:50  Select positions (account-tier), size, EXECUTE ENTRIES (market)
+  16:00  Confirm positions held overnight, save state, done
 """
 import logging
 import os
 import sys
 import time
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta, date
 from typing import List, Optional, Dict, Any, Tuple
-import json
 
 from bot import config
 from bot.massive_client import MassiveClient
 from bot.market_data import AlpacaDataClient
-from bot.gap_calculator import GapCalculator, GapCandidate
-from bot.position_manager import PositionManager
-from bot.vix_fetcher import VIXFetcher
+from bot.momentum_scorer import (
+    MomentumCandidate,
+    SelectionConfig,
+    get_selection_config,
+    build_signal_candidates_350,
+    compute_raw_metrics_350,
+    normalize_and_score_350,
+    assign_buckets,
+    select_positions,
+)
+from bot.position_manager_overnight import PositionManager, Position
+from bot.rate_limiter import get_api_call_count
 from bot.state_manager import StateManager
+from bot.universe_builder import (
+    build_universe,
+    filter_minute_data_quality,
+    filter_execution_ready,
+    save_universe_audit,
+    save_candidates_audit,
+    save_run_health,
+    save_execution_audit,
+    UniverseDiagnostics,
+    ExecutionDiagnostics,
+)
 
 # Setup logging
 os.makedirs(config.LOG_DIR, exist_ok=True)
@@ -38,856 +63,604 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class GapMomentumBot:
-    """Main bot orchestrator for gap momentum strategy"""
+class OvernightMomentumBot:
+    """Main bot orchestrator for overnight momentum strategy"""
 
     def __init__(self):
         self.massive = MassiveClient()
         self.alpaca = AlpacaDataClient()
-        self.gap_calc = GapCalculator()
         self.position_mgr = PositionManager()
-        self.vix_fetcher = VIXFetcher()
         self.state_mgr = StateManager()
 
+        # Universe & candidates
         self.universe: List[str] = []
-        self.candidates: List[GapCandidate] = []
-        self.core_candidates: List[GapCandidate] = []  # 4%+ gaps
-        self.filler_candidates: List[GapCandidate] = []  # 3-4% gaps
-        self.massive_snapshots: Dict[str, Any] = {}
-        self.vix_level: float = 15.0
+        self.scored_candidates: List[MomentumCandidate] = []
+        self._universe_diag: Optional[UniverseDiagnostics] = None
 
         # Stage flags
-        self.stage_universe_done = False
-        self.stage_candidates_done = False
-        self.stage_entry_done = False
-        self.stage_exit_done = False
+        self.morning_exits_done = False   # All overnight positions exited
+        self.data_collected = False       # Universe + daily bars ready
+        self.scoring_done = False         # 3:48 PM scoring complete
+        self.entries_done = False         # 3:50 PM entries executed
 
-        # Staged entry control (prevents duplicate market order submission, NOT same as stage_entry_done)
-        self.entry_submission_locked = False
+        # Morning stop tracking
+        self.hard_stops_checked = False
+        self.drop_stops_checked = False
+        self.final_exit_done = False
 
-        # Failsafe flags for broker-based flatten sweeps before market close
-        self.failsafe_330_done = False
-        self.failsafe_345_done = False
-        self.failsafe_358_done = False
+        # Open prices captured at market open (for drop-stop calculation)
+        self.open_prices: Dict[str, float] = {}
 
-        # Post-close flatten retry cap (prevents infinite loop if positions can't close)
-        self.post_close_flatten_attempts = 0
-        self.max_post_close_flatten_attempts = 3
-
-        # Cooldown: prevent mismatch flatten from firing every poll cycle
-        self.mismatch_flatten_done = False
-
-        # Periodic broker reconciliation timer (symbol-level sync every 60s during exits)
-        self._last_broker_reconcile_time: Optional[datetime] = None
-
-        # Rate-limit exit checks to stay under 200 API calls/min
-        self.last_exit_check_time: Optional[datetime] = None
-        self.exit_check_interval_seconds = 30
+        # Failsafe
+        self.post_exit_failsafe_done = False
 
         # Retry counters
         self.universe_retry_count = 0
-        self.max_universe_retries = config.UNIVERSE_MAX_RETRIES
 
-        # Timing - Market orders at 9:30:00, reconcile at 9:31:00, rescue passes after
-        self.target_universe = dt_time(9, 0)
-        self.target_candidates = dt_time(9, 25)
-        self.target_entry = dt_time(9, 30, 0)  # Submit market orders at 9:30:00
-        self.market_close = dt_time(16, 0)
+        # Data collection results (stored between steps)
+        self._minute_bars: Dict[str, List[dict]] = {}
+        self._daily_bars: Dict[str, List[dict]] = {}
+        self._etf_returns: Dict[str, float] = {}
+        self._adv_cache: Dict[str, Tuple[float, float]] = {}
+        self._atr_cache: Dict[str, float] = {}
+        self._exec_stats: Dict[str, Any] = {}
+        self._exec_diag: Optional[ExecutionDiagnostics] = None
 
     def run(self):
-        """Main bot loop - runs once per trading day"""
+        """Main bot loop - runs from 9:00 AM until after market close"""
         logger.info("=" * 60)
-        logger.info("Gap Momentum Bot Starting")
+        logger.info("Overnight Momentum Bot Starting")
         logger.info("=" * 60)
 
-        # Load any existing state (for recovery)
+        # Load any saved state and detect mode
         self._load_state()
 
-        # Startup market-hours guard (AFTER state load so we check restored entry_plans)
+        # Check if we have overnight positions to manage
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("Cannot reach broker API at startup — will retry in main loop")
+        elif broker_positions:
+            logger.info(f"Detected {len(broker_positions)} overnight positions — morning exit mode")
+            for pos in broker_positions:
+                logger.info(f"  Overnight: {pos.get('symbol')} qty={pos.get('qty')} avg_entry={pos.get('avg_entry_price')}")
+            # Reconcile local state with broker
+            self.position_mgr.reconcile_local_positions_from_broker()
+            self._save_state()
+        else:
+            logger.info("No overnight positions — skipping morning exits")
+            self.morning_exits_done = True
+
+        # If starting after 11:00 AM with positions, flatten immediately
         current_time = datetime.now().time()
-        
-        # After market close: do not run
-        if current_time >= self.market_close:
-            logger.error(f"Current time {current_time} is after market close ({self.market_close}) - exiting")
+        if current_time >= dt_time(11, 5) and self.position_mgr.get_position_count() > 0:
+            logger.warning("Started after 11:05 AM with positions — flattening immediately")
+            self._run_failsafe_flatten("late-start flatten")
+            self.morning_exits_done = True
+
+        # If starting after 4:00 PM, nothing to do
+        if current_time >= dt_time(16, 0):
+            logger.error("Started after market close — nothing to do")
             return
-        
-        # After 9:30:00 but before 9:31:00 with no saved staged-entry state: disable new entries
-        if dt_time(9, 30, 0) <= current_time < dt_time(9, 31, 0) and not self.position_mgr.entry_plans:
-            logger.warning("Startup in entry dead zone (9:30:00-9:31:00) with no saved entry plans - disabling new entries for the day")
-            self.stage_entry_done = True
-        
-        # After 9:35:00 with no positions and no saved entry plans: disable entries, only run exit/failsafe
-        # (Phase 3 broker repair runs at 9:35, so don't give up on entries until after that)
-        if current_time >= dt_time(9, 35, 0) and self.position_mgr.get_position_count() == 0 and not self.position_mgr.entry_plans:
-            logger.warning("Startup after 9:35:00 with no positions and no entry plans - disabling entries, will only run exit/failsafe logic")
-            self.stage_entry_done = True
-            self.stage_exit_done = True  # Nothing to exit
 
         # Main event loop
         while True:
             now = datetime.now()
             current_time = now.time()
 
-            # Step 1: Universe reduction via Massive
-            if not self.stage_universe_done and current_time >= self.target_universe:
-                if current_time < self.target_candidates:
-                    self._step1_build_universe()
+            # ════════════════════════════════════════════
+            # MORNING: Manage overnight position exits
+            # ════════════════════════════════════════════
+
+            if not self.morning_exits_done:
+                has_positions = self.position_mgr.get_position_count() > 0
+
+                if not has_positions:
+                    # Verify with broker
+                    bc = self.position_mgr.broker_position_count()
+                    if bc == 0:
+                        logger.info("Morning exits complete — no positions remaining")
+                        self.morning_exits_done = True
+                    elif bc > 0:
+                        # Broker has positions we don't know about locally
+                        logger.warning(f"Local empty but broker has {bc} positions — reconciling")
+                        self.position_mgr.reconcile_local_positions_from_broker()
+                        self._save_state()
+
+                if has_positions and not self.morning_exits_done:
+                    # 9:30 AM — Hard stop check at market open
+                    if not self.hard_stops_checked and current_time >= dt_time(9, 30):
+                        self._check_hard_stops()
+                        self.hard_stops_checked = True
+                        self._save_state()
+
+                    # 9:35 AM — Drop-stop check
+                    if not self.drop_stops_checked and current_time >= dt_time(9, 35):
+                        self._check_drop_stops()
+                        self.drop_stops_checked = True
+                        self._save_state()
+
+                    # 11:00 AM — Exit ALL remaining positions
+                    if not self.final_exit_done and current_time >= dt_time(11, 0):
+                        self._exit_all_positions("11:00 AM scheduled exit")
+                        self.final_exit_done = True
+                        self.morning_exits_done = True
+                        self._save_state()
+
+                    # 11:05 AM — Post-exit failsafe
+                    if not self.post_exit_failsafe_done and current_time >= dt_time(11, 5):
+                        bc = self.position_mgr.broker_position_count()
+                        if bc > 0:
+                            logger.warning(f"Post-exit failsafe: broker still has {bc} positions")
+                            self._run_failsafe_flatten("11:05 AM post-exit failsafe")
+                        elif bc == 0:
+                            logger.info("Post-exit failsafe: broker confirmed flat")
+                        self.post_exit_failsafe_done = True
+                        self.morning_exits_done = True
+                        self._save_state()
+
+            # ════════════════════════════════════════════
+            # AFTERNOON: Score universe and enter new positions
+            # ════════════════════════════════════════════
+
+            # 3:30 PM — Data collection
+            if not self.data_collected and current_time >= dt_time(15, 30):
+                if current_time < dt_time(15, 45):
+                    self._step_collect_data()
                 else:
-                    logger.warning("Skipped Step 1 - past candidate window")
-                    self.stage_universe_done = True
+                    logger.warning("Past 3:45 PM without data collection — attempting now")
+                    self._step_collect_data()
 
-            # Step 2: Gap calculation via Massive
-            if not self.stage_candidates_done and current_time >= self.target_candidates:
-                if current_time < self.target_entry:
-                    self._step2_find_candidates()
+            # 3:48 PM — Score and rank (requires data collection)
+            if self.data_collected and not self.scoring_done and current_time >= dt_time(15, 48):
+                self._step_score_and_rank()
+
+            # 3:50 PM — Execute entries (requires scoring)
+            if self.scoring_done and not self.entries_done and current_time >= dt_time(15, 50):
+                self._step_execute_entries()
+
+            # ════════════════════════════════════════════
+            # Day completion check
+            # ════════════════════════════════════════════
+
+            if current_time >= dt_time(16, 0):
+                if self.entries_done:
+                    logger.info("Market closed — positions held overnight. Day complete.")
+                    self._save_end_of_day_reports()
+                    self._save_state()
+                    break
+                elif self.position_mgr.get_position_count() > 0:
+                    logger.info("Market closed with positions — holding overnight as intended.")
+                    self._save_end_of_day_reports()
+                    self._save_state()
+                    break
                 else:
-                    logger.warning("Skipped Step 2 - past entry window")
-                    self.stage_candidates_done = True
-
-            # Step 3: Market entry at 9:30:00, poll at 9:31:00, broker repair at 9:35:00
-            # Uses three-phase staged entry: submit → poll → broker repair sync
-            if config.USE_STAGED_OPEN_ENTRY:
-                self._step3_manage_staged_entry(current_time)
-            elif not self.stage_entry_done and current_time >= self.target_entry:
-                self._step3_enter_positions()
-
-            # Hard broker-based failsafe exits, independent of local bot memory
-            if self.stage_entry_done and not self.failsafe_330_done and current_time >= dt_time(15, 30):
-                # Clear exit slicers first so they don't fight with the failsafe
-                self.position_mgr.exit_slicers.clear()
-                self._run_failsafe_flatten("3:30 PM failsafe")
-                self.failsafe_330_done = True
-
-            if self.stage_entry_done and not self.failsafe_345_done and current_time >= dt_time(15, 45):
-                self._run_failsafe_flatten("3:45 PM failsafe")
-                self.failsafe_345_done = True
-
-            if self.stage_entry_done and not self.failsafe_358_done and current_time >= dt_time(15, 58):
-                self._run_nuclear_flatten()
-                self.failsafe_358_done = True
-
-            # Step 4: Manage exits (rate-limited to every 30s to stay under 200 API calls/min)
-            if self.stage_entry_done and not self.stage_exit_done:
-                if current_time < self.market_close:
-                    # Throttle exit checks: only run every exit_check_interval_seconds
-                    should_check = (
-                        self.last_exit_check_time is None
-                        or (now - self.last_exit_check_time).total_seconds() >= self.exit_check_interval_seconds
-                    )
-                    if should_check:
-                        self._step4_manage_exits(current_time)
-                        self.last_exit_check_time = now
-                else:
-                    # Post-close: retry flatten with a cap to prevent infinite loop
-                    if self.post_close_flatten_attempts < self.max_post_close_flatten_attempts:
-                        self.post_close_flatten_attempts += 1
-                        logger.warning(
-                            f"Market close reached - flatten attempt "
-                            f"{self.post_close_flatten_attempts}/{self.max_post_close_flatten_attempts}"
-                        )
-                        self._run_failsafe_flatten("4:00 PM market-close failsafe")
-                    elif not self.stage_exit_done:
-                        broker_count = self.position_mgr.broker_position_count()
-                        if broker_count > 0:
-                            logger.critical(
-                                f"FAILED TO FLATTEN after {self.max_post_close_flatten_attempts} attempts - "
-                                f"{broker_count} broker positions remain. Manual intervention required."
-                            )
-                        self.stage_exit_done = True
-
-            # Check if day is complete
-            if current_time >= self.market_close and self.stage_entry_done and self.stage_exit_done:
-                logger.info("Market closed - day complete")
-                self._finalize_day()
-                break
+                    logger.info("Market closed — no entries made today.")
+                    self._finalize_day()
+                    break
 
             time.sleep(1)
 
-    def _step1_build_universe(self):
-        """Step 1: Pull full market snapshot from Massive, filter by price range"""
-        logger.info("STEP 1: Building universe from Massive")
+    # ════════════════════════════════════════════════════════════
+    # MORNING EXIT METHODS
+    # ════════════════════════════════════════════════════════════
 
-        try:
-            snapshots = self.massive.get_full_market_snapshot()
-            if not snapshots:
-                self.universe_retry_count += 1
-                if self.universe_retry_count >= self.max_universe_retries:
-                    logger.error(f"Failed to get Massive snapshot after {self.max_universe_retries} retries")
-                    self._fallback_to_alpaca_universe()
-                else:
-                    logger.warning(f"Empty Massive snapshot, retry {self.universe_retry_count}/{self.max_universe_retries}")
-                    time.sleep(5)
-                return
+    def _check_hard_stops(self):
+        """9:30 AM: Check if any position opened below hard stop level (entry × 0.95)."""
+        logger.info("HARD STOP CHECK: checking opening prices against entry stops")
 
-            self.universe = self.massive.filter_by_price_range(
-                snapshots, config.MIN_PRICE, config.MAX_PRICE
-            )
-            
-            # First-pass filter: remove symbols Alpaca marks as non-tradable (OTC, halted, etc.)
-            # Uses bulk GET /v2/assets (1 API call). NOTE: this is not a complete shield —
-            # symbols can still become close-only or restricted intraday due to broker
-            # controls, corporate actions, or special restrictions.
-            pre_filter_count = len(self.universe)
-            tradable_set = set(self.alpaca.get_tradable_assets())
-            if tradable_set:
-                rejected = [s for s in self.universe if s not in tradable_set]
-                self.universe = [s for s in self.universe if s in tradable_set]
-                if rejected:
-                    logger.info(f"Tradability filter: {pre_filter_count} -> {len(self.universe)} "
-                               f"({len(rejected)} non-tradable removed)")
-            else:
-                logger.warning("Tradability filter skipped: failed to fetch Alpaca asset list")
-
-            # Store full Massive snapshots for merging in Step 2
-            self.massive_snapshots = snapshots
-
-            logger.info(f"Universe built: {len(self.universe)} symbols")
-            self.stage_universe_done = True
-            self._save_state()
-
-        except Exception as e:
-            logger.error(f"Error in Step 1: {e}")
-            self.universe_retry_count += 1
-            if self.universe_retry_count >= self.max_universe_retries:
-                self._fallback_to_alpaca_universe()
-
-    def _fallback_to_alpaca_universe(self):
-        """Fallback: Build universe from Alpaca assets when Massive fails"""
-        logger.info("FALLBACK: Building universe from Alpaca assets")
-        
-        try:
-            assets = self.alpaca.get_tradable_assets()
-            if not assets:
-                logger.error("Alpaca fallback also failed - no universe available")
-                self.stage_universe_done = True
-                return
-            
-            chunk_size = 1000
-            min_target_universe = 500
-            
-            self.universe = []
-            snapshots_received = False
-            
-            for i in range(0, len(assets), chunk_size):
-                chunk = assets[i:i + chunk_size]
-                snapshots = self.alpaca.get_snapshots(chunk)
-                
-                if snapshots:
-                    snapshots_received = True
-                
-                for symbol, data in snapshots.items():
-                    price = (
-                        data.get("last_price")
-                        or data.get("close")
-                        or data.get("prev_close")
-                        or 0
-                    )
-                    if price and config.MIN_PRICE <= price <= config.MAX_PRICE:
-                        self.universe.append(symbol)
-                
-                if len(self.universe) >= min_target_universe:
-                    break
-            
-            if snapshots_received:
-                logger.info(f"Alpaca fallback universe: {len(self.universe)} symbols")
-                self.stage_universe_done = True
-                self._save_state()
-            else:
-                logger.error("Alpaca fallback: failed to get any snapshots")
-                self.stage_universe_done = True
-            
-        except Exception as e:
-            logger.error(f"Alpaca fallback error: {e}")
-            self.stage_universe_done = True
-
-    def _step2_find_candidates(self):
-        """Step 2: Compute gaps from Massive data (primary), with Alpaca fallback for universe if needed"""
-        logger.info("STEP 2: Finding gap candidates via Massive (Alpaca may be used for universe fallback in Step 1)")
-
-        if not self.universe:
-            logger.error("No universe available for Step 2")
-            time.sleep(5)
+        positions = list(self.position_mgr.positions.items())
+        if not positions:
             return
 
-        try:
-            # CRITICAL: Refresh Massive snapshot at 9:25 (don't use stale 9:00 data)
-            logger.info("Refreshing Massive snapshot for candidate selection...")
-            fresh_snapshots = self.massive.get_full_market_snapshot()
-            if not fresh_snapshots:
-                logger.error("Failed to refresh Massive snapshot - will retry")
-                time.sleep(5)
-                return
+        # Get current prices (opening prints)
+        symbols = [s for s, _ in positions]
+        snapshots = self.alpaca.get_snapshots(symbols)
 
-            # Filter to universe only (critical fix - was using full snapshot before)
-            filtered_snapshots = {
-                symbol: fresh_snapshots[symbol]
-                for symbol in self.universe
-                if symbol in fresh_snapshots
-            }
-            logger.info(f"Filtered to {len(filtered_snapshots)} universe symbols from Massive")
+        exits_triggered = []
+        for symbol, position in positions:
+            snap = snapshots.get(symbol, {})
+            open_price = snap.get("open") or snap.get("last_price")
+            if not open_price:
+                logger.warning(f"No opening price for {symbol} — skipping hard stop")
+                continue
 
-            # Store for pre-trade state save
-            self.massive_snapshots = filtered_snapshots
+            # Record opening price for drop-stop calculation later
+            self.open_prices[symbol] = open_price
+            position.current_price = open_price
 
-            self.candidates = self.gap_calc.find_candidates(filtered_snapshots)
-
-            # Split candidates: core (4%+) vs filler (3-4%)
-            all_candidates = self.candidates
-            core_candidates = [c for c in all_candidates if c.gap_pct >= 4.0]
-            filler_candidates = [c for c in all_candidates if 3.0 <= c.gap_pct < 4.0]
-
-            # Apply liquidity filter: core gets priority, filler gets remaining slots
-            core_candidates = self.gap_calc.select_by_liquidity_and_gap(
-                core_candidates, max_positions=config.MAX_POSITIONS
-            )
-            remaining_slots = max(0, config.MAX_POSITIONS - len(core_candidates))
-            filler_candidates = self.gap_calc.select_by_liquidity_and_gap(
-                filler_candidates, max_positions=remaining_slots
-            ) if remaining_slots > 0 else []
-
-            # Store both lists
-            self.core_candidates = core_candidates
-            self.filler_candidates = filler_candidates
-            # Combined for backwards compatibility
-            self.candidates = core_candidates + filler_candidates
-
-            self.vix_level = self.vix_fetcher.get_vix_level() or 15.0
-
-            logger.info(f"Candidates found: {len(self.candidates)} (core: {len(self.core_candidates)}, filler: {len(self.filler_candidates)})")
-            logger.info(f"Core candidates (4%+):")
-            for c in self.core_candidates[:5]:
-                logger.info(f"  {c.symbol}: {c.gap_pct:+.1f}% gap, ${c.adv_estimate/1e6:.1f}M ADV")
-
-            self.stage_candidates_done = True
-            self._save_state()
-
-        except Exception as e:
-            logger.error(f"Error in Step 2: {e}")
-            time.sleep(5)
-
-    def _step3_enter_positions(self):
-        """Step 3: DEPRECATED - Use _step3_manage_staged_entry for market-at-open execution.
-        
-        This legacy method sent partial OPG slices before 9:28 cutoff. The current design
-        sends full market DAY orders at 9:30:00 via submit_open_entry_orders().
-        """
-        logger.warning("STEP 3: _step3_enter_positions is deprecated. Use staged entry flow.")
-        self.stage_entry_done = True
-        self._save_state()
-
-    def _step3_manage_staged_entry(self, current_time: dt_time):
-        """Three-stage entry: submit at 9:30, poll at 9:31, broker repair at 9:35.
-        
-        Phase 1 (9:30:00): Build plans + submit market orders.
-        Phase 2 (9:31:00): Poll order status for 90s, finalize only confirmed fills.
-                           Non-terminal orders stay pending.
-        Phase 3 (9:35:00): Broker repair sync — fetch broker positions as ground truth,
-                           resolve any still-pending orders, force-finalize all.
-        """
-        try:
-            t_poll = dt_time(9, 31, 0)    # Start active polling
-            t_repair = dt_time(9, 35, 0)  # Broker repair sync
-
-            # ── Phase 1: Submit market orders at 9:30:00 ──
-            if current_time >= self.target_entry and current_time < t_poll and not self.position_mgr.entry_stage1_done:
-                logger.info("STAGED ENTRY PHASE 1: Build plans + submit market orders at open")
-
-                if self.entry_submission_locked:
-                    has_live_orders = any(
-                        plan.open_order_id is not None
-                        for plan in self.position_mgr.entry_plans.values()
-                    )
-                    if has_live_orders:
-                        logger.warning(
-                            "Crash recovery: lock set with persisted market orders but "
-                            "entry_stage1_done=False — auto-promoting to stage1_done"
-                        )
-                        self.position_mgr.entry_stage1_done = True
-                        self._save_state()
-                    else:
-                        logger.warning(
-                            "Crash recovery: lock set but no market orders persisted — "
-                            "unlocking for retry"
-                        )
-                        self.entry_submission_locked = False
-                        self._save_state()
-                    return
-
-                self.entry_submission_locked = True
-                self._save_state()
-
-                try:
-                    total_capital = self.position_mgr.get_total_capital()
-
-                    self.position_mgr.entry_plans.clear()
-                    plans_core = self.position_mgr.build_entry_plans(self.core_candidates, capital_override=total_capital)
-                    
-                    core_reserved_notional = sum(
-                        plan.target_qty * plan.expected_open_price * 1.02
-                        for plan in plans_core.values()
-                    )
-                    deployment_ratio = core_reserved_notional / total_capital if total_capital > 0 else 0
-                    remaining_capital = total_capital - core_reserved_notional
-                    remaining_slots = max(0, config.MAX_POSITIONS - len(plans_core))
-                    
-                    logger.info(f"PHASE 1: Built {len(plans_core)} core plans, "
-                               f"reserved ${core_reserved_notional:,.2f} ({deployment_ratio*100:.1f}%), "
-                               f"remaining ${remaining_capital:,.2f}, {remaining_slots} slots")
-                    
-                    plans_filler = {}
-                    MIN_FILL_CAPITAL = 1000
-                    
-                    if (deployment_ratio < 0.8 and 
-                        remaining_capital > MIN_FILL_CAPITAL and 
-                        self.filler_candidates and 
-                        remaining_slots > 0):
-                        
-                        filler_to_plan = self.filler_candidates[:remaining_slots]
-                        plans_filler = self.position_mgr.build_entry_plans(
-                            filler_to_plan, 
-                            capital_override=remaining_capital
-                        )
-                        logger.info(f"Built {len(plans_filler)} filler plans against remaining capital")
-                    else:
-                        if deployment_ratio >= 0.8:
-                            logger.info(f"Filler skipped: deployment {deployment_ratio*100:.1f}% >= 80%")
-                        elif remaining_capital <= MIN_FILL_CAPITAL:
-                            logger.info(f"Filler skipped: remaining ${remaining_capital:,.2f} <= min ${MIN_FILL_CAPITAL}")
-                        elif remaining_slots <= 0:
-                            logger.info(f"Filler skipped: no slots (core filled {len(plans_core)}/{config.MAX_POSITIONS})")
-                        else:
-                            logger.info(f"Filler skipped: no filler candidates")
-                    
-                    all_plans = {**plans_core, **plans_filler}
-                    
-                    self.position_mgr.submit_open_entry_orders(all_plans, state_saver=self._save_state)
-
-                    logger.info(f"PHASE 1 COMPLETE: {len(plans_core)} core + {len(plans_filler)} filler = {len(all_plans)} orders submitted")
-
-                    self.position_mgr.entry_stage1_done = True
-                    self._save_state()
-                    
-                except Exception as e:
-                    logger.exception(f"Error in staged entry phase 1: {e}")
-                    
-                    orders_submitted = any(
-                        plan.open_order_id is not None 
-                        for plan in self.position_mgr.entry_plans.values()
-                    )
-                    
-                    if not orders_submitted:
-                        logger.warning("No market orders were submitted - rolling back entry_submission_locked")
-                        self.entry_submission_locked = False
-                        self.position_mgr.entry_plans.clear()
-                    else:
-                        logger.warning(f"Partial submission: {sum(1 for p in self.position_mgr.entry_plans.values() if p.open_order_id)} orders submitted - keeping lock")
-                    
-                    self._save_state()
-                
-                return
-
-            # ── Phase 2: Active poll + partial finalize at 9:31:00 ──
-            # Polls for 90s. Only finalizes orders confirmed terminal.
-            # Non-terminal orders stay pending for Phase 3.
-            if current_time >= t_poll and current_time < t_repair and self.position_mgr.entry_stage1_done and not self.position_mgr.entry_stage2_done:
-                logger.info("PHASE 2: Active poll of market order fills (90s window)")
-                self.position_mgr.reconcile_open_order_fills()
-
-                # Finalize only confirmed fills (terminal orders with qty > 0)
-                confirmed = self.position_mgr.finalize_entry_positions(force=False)
-                if confirmed:
-                    logger.info(f"Phase 2: finalized {len(confirmed)} confirmed fills")
-                    for pos in confirmed:
-                        logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
-
-                # Count pending (non-terminal) orders
-                pending = sum(
-                    1 for plan in self.position_mgr.entry_plans.values()
-                    if plan.open_order_id and not plan.open_order_terminal and not plan.finalized
-                )
-                if pending > 0:
-                    logger.warning(f"Phase 2: {pending} orders still pending — will resolve at 9:35 broker repair")
-                else:
-                    logger.info("Phase 2: all orders terminal — entry complete")
-                    self.stage_entry_done = True
-
-                self.position_mgr.entry_stage2_done = True
-                self._save_state()
-                return
-
-            # ── Phase 3: Broker repair sync at 9:35:00, retries until 9:38 hard cutoff ──
-            # Resolves pending orders using broker positions as ground truth.
-            # Re-enters on each main loop iteration until all orders are resolved or 9:38 hits.
-            t_hard_cutoff = dt_time(9, 38, 0)
-
-            if current_time >= t_repair and self.position_mgr.entry_stage2_done and not self.stage_entry_done:
-                past_cutoff = current_time >= t_hard_cutoff
-
-                if past_cutoff:
-                    logger.info("PHASE 3: Broker repair sync — HARD CUTOFF 9:38, force-finalizing all")
-                else:
-                    logger.info("PHASE 3: Broker repair sync — resolving pending orders")
-
-                # If OPEN_ENTRY_PCT < 1.0, run rescue passes on first Phase 3 entry only
-                if config.OPEN_ENTRY_PCT < 1.0 and not hasattr(self, '_rescue_passes_done'):
-                    logger.info("Running rescue passes for remaining size")
-                    self.position_mgr.refresh_no_fill_prices()
-                    self.position_mgr.submit_post_open_rescue_pass("market1", state_saver=self._save_state)
-                    self.position_mgr.submit_post_open_rescue_pass("market2", state_saver=self._save_state)
-                    self._rescue_passes_done = True
-
-                # Broker repair: resolve any still-pending orders
-                repaired = self.position_mgr.broker_repair_sync()
-
-                # Check if any orders are still unresolved
-                still_pending = sum(
-                    1 for plan in self.position_mgr.entry_plans.values()
-                    if plan.open_order_id and not plan.open_order_terminal and not plan.finalized
-                )
-
-                if still_pending > 0 and not past_cutoff:
-                    # Orders still unresolved — retry on next loop iteration
-                    # Finalize only what's confirmed so far
-                    confirmed = self.position_mgr.finalize_entry_positions(force=False)
-                    if confirmed:
-                        logger.info(f"Phase 3: finalized {len(confirmed)} newly confirmed fills")
-                    logger.warning(
-                        f"Phase 3: {still_pending} orders still unresolved — "
-                        f"will retry next cycle (hard cutoff at 9:38)"
-                    )
-                    self._save_state()
-                    return
-
-                # All resolved or past hard cutoff — force-finalize everything
-                positions = self.position_mgr.finalize_entry_positions(force=True)
-                total_positions = self.position_mgr.get_position_count()
-
-                logger.info(
-                    f"PHASE 3 COMPLETE: {len(repaired)} repaired from broker, "
-                    f"{len(positions)} new positions finalized, "
-                    f"{total_positions} total positions"
-                )
-                for pos in positions:
-                    logger.info(f"  {pos.symbol}: {pos.quantity} @ ${pos.entry_price:.4f}")
-
-                self.stage_entry_done = True
-                self._save_state()
-                return
-        except Exception as e:
-            logger.exception(f"Error in staged entry flow: {e}")
-            self._save_state()
-
-    def _step4_manage_exits(self, current_time: dt_time):
-        """Step 4: Monitor and execute exits based on VIX regime.
-        
-        Includes periodic symbol-level broker reconciliation (every 60s) to catch:
-        - Late fills that slipped past the Phase 3 hard cutoff
-        - Symbol mismatches (local and broker have same count but different names)
-        - Wrong local quantities from partial fill desync
-        
-        If broker API returns -1 (unreachable), skip destructive state decisions
-        and proceed with local state only — trust broker > local, but never
-        destroy local state based on an API glitch.
-        """
-        local_count = self.position_mgr.get_position_count()
-        broker_count = self.position_mgr.broker_position_count()
-
-        # If broker API failed, skip state-comparison decisions entirely
-        if broker_count < 0:
-            logger.warning("Broker API unreachable — skipping state comparison, using local state only")
-            if local_count == 0:
-                return  # Nothing to manage
-            # Fall through to manage exits based on local state
-        else:
-            if local_count == 0 and broker_count == 0:
-                logger.info("All positions closed locally and at broker - exit complete")
-                self.stage_exit_done = True
-                self._save_state()
-                return
-
-        # ── Periodic symbol-level broker reconciliation (every 60s) ──
-        # This catches late fills, symbol mismatches, and wrong quantities.
-        # Runs after the entry grace period (9:40+) to avoid conflicting with Phase 3.
-        now = datetime.now()
-        if current_time >= dt_time(9, 40):
-            if (self._last_broker_reconcile_time is None or
-                    (now - self._last_broker_reconcile_time).total_seconds() >= 60):
-                actions = self.position_mgr.reconcile_local_positions_from_broker()
-                self._last_broker_reconcile_time = now
-                if actions:
-                    self._save_state()
-                # Re-read counts after reconciliation
-                local_count = self.position_mgr.get_position_count()
-                broker_count = self.position_mgr.broker_position_count()
-
-        # Only make state-comparison decisions if broker API succeeded
-        if broker_count >= 0:
-            if local_count == 0 and broker_count == 0:
-                logger.info("All positions closed locally and at broker - exit complete")
-                self.stage_exit_done = True
-                self._save_state()
-                return
-
-            if local_count == 0 and broker_count > 0:
-                # Guard: don't flatten during entry grace period (before 9:40).
-                if current_time < dt_time(9, 40):
-                    logger.warning(
-                        f"Local empty but broker shows {broker_count} positions — "
-                        f"in entry grace period (before 9:40), NOT flattening"
-                    )
-                    return
-
-                if not self.mismatch_flatten_done:
-                    logger.warning(
-                        f"Local positions empty but broker shows {broker_count} live positions - "
-                        f"running immediate broker flatten"
-                    )
-                    self._run_failsafe_flatten("intraday broker/local mismatch")
-                    self.mismatch_flatten_done = True
-                    self._save_state()
-                else:
-                    logger.warning(
-                        f"Broker still shows {broker_count} positions after mismatch flatten - "
-                        f"waiting for failsafe sweeps"
-                    )
-                return
-
-            if local_count > 0 and broker_count == 0:
+            # Hard stop: entry_price × (1 + HARD_STOP_PCT)
+            stop_level = position.entry_price * (1.0 + config.HARD_STOP_PCT)
+            if open_price <= stop_level:
                 logger.warning(
-                    f"Local shows {local_count} positions but broker is flat - "
-                    f"clearing stale local state"
+                    f"HARD STOP TRIGGERED: {symbol} open={open_price:.4f} "
+                    f"<= stop={stop_level:.4f} (entry={position.entry_price:.4f})"
                 )
-                self.position_mgr.positions.clear()
-                self.position_mgr.exit_slicers.clear()
-                self.stage_exit_done = True
-                self._save_state()
+                exits_triggered.append(symbol)
+
+        # Execute exits for triggered stops
+        for symbol in exits_triggered:
+            self._exit_single_position(symbol, "hard stop at open")
+
+        if exits_triggered:
+            logger.info(f"Hard stops: exited {len(exits_triggered)} positions")
+        else:
+            logger.info(f"Hard stops: no triggers ({len(positions)} positions checked)")
+
+    def _check_drop_stops(self):
+        """9:35 AM: Check for 6% drop from open high."""
+        logger.info("DROP STOP CHECK: checking 9:35 prices for 6% drop from open high")
+
+        positions = list(self.position_mgr.positions.items())
+        if not positions:
+            return
+
+        symbols = [s for s, _ in positions]
+        snapshots = self.alpaca.get_snapshots(symbols)
+
+        exits_triggered = []
+        for symbol, position in positions:
+            snap = snapshots.get(symbol, {})
+            price_935 = snap.get("last_price") or snap.get("close")
+            if not price_935:
+                logger.warning(f"No 9:35 price for {symbol} — skipping drop stop")
+                continue
+
+            position.current_price = price_935
+
+            # open_high = max(open_price, price_at_935)
+            open_price = self.open_prices.get(symbol, position.entry_price)
+            open_high = max(open_price, price_935)
+
+            if open_high > 0:
+                drop_from_high = (open_high - price_935) / open_high
+                if drop_from_high >= config.DROP_STOP_PCT:
+                    logger.warning(
+                        f"DROP STOP TRIGGERED: {symbol} drop={drop_from_high:.2%} "
+                        f"(open_high={open_high:.4f}, price_935={price_935:.4f})"
+                    )
+                    exits_triggered.append(symbol)
+
+        for symbol in exits_triggered:
+            self._exit_single_position(symbol, "6% drop-stop at 9:35")
+
+        if exits_triggered:
+            logger.info(f"Drop stops: exited {len(exits_triggered)} positions")
+        else:
+            logger.info(f"Drop stops: no triggers ({len(positions)} positions checked)")
+
+    def _exit_single_position(self, symbol: str, reason: str):
+        """Exit a single position with market sell."""
+        position = self.position_mgr.positions.get(symbol)
+        if not position:
+            return
+
+        qty = position.quantity
+        sell_resp = self.position_mgr._submit_sell_order(symbol, qty)
+        if not sell_resp:
+            # Fallback: limit sell
+            last_price = self.position_mgr._get_last_price(symbol)
+            if last_price and last_price > 0:
+                limit_price = round(last_price * 0.97, 4)
+                sell_resp = self.position_mgr._submit_sell_order(symbol, qty, "limit", limit_price)
+
+        if not sell_resp:
+            logger.error(f"Failed to exit {symbol} ({reason})")
+            return
+
+        order_id = sell_resp.get("id")
+        if order_id:
+            fill = self.position_mgr.get_order_fill(order_id, max_wait=30)
+            if fill:
+                filled_qty = int(fill["filled_qty"])
+                exit_price = fill["filled_avg_price"]
+                pnl = (exit_price - position.entry_price) * filled_qty
+                pnl_pct = ((exit_price / position.entry_price) - 1) * 100
+                logger.info(
+                    f"EXIT {symbol}: {filled_qty} @ {exit_price:.4f} "
+                    f"(P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) — {reason}"
+                )
+                if filled_qty >= position.quantity:
+                    self.position_mgr.positions.pop(symbol, None)
+                else:
+                    position.quantity -= filled_qty
+                    logger.warning(f"Partial exit {symbol}: {filled_qty}/{qty}, {position.quantity} remaining")
+            else:
+                logger.error(f"No fill confirmation for {symbol} exit")
+
+    def _exit_all_positions(self, reason: str):
+        """Exit ALL remaining positions with market sells."""
+        positions = list(self.position_mgr.positions.keys())
+        if not positions:
+            logger.info(f"{reason}: no positions to exit")
+            return
+
+        logger.info(f"{reason}: exiting {len(positions)} positions")
+        for symbol in positions:
+            self._exit_single_position(symbol, reason)
+
+        # Check what's left
+        remaining = self.position_mgr.get_position_count()
+        if remaining > 0:
+            logger.warning(f"{reason}: {remaining} positions still remaining after exit attempt")
+        else:
+            logger.info(f"{reason}: all positions exited successfully")
+
+    # ════════════════════════════════════════════════════════════
+    # AFTERNOON DATA & SCORING METHODS
+    # ════════════════════════════════════════════════════════════
+
+    def _step_collect_data(self):
+        """~3:30 PM: Build base universe (Stages A+B+D). Stage C runs at 3:48."""
+        logger.info("=" * 50)
+        logger.info("DATA COLLECTION: Building base universe (staged pipeline)")
+        logger.info("=" * 50)
+
+        try:
+            final, diag, adv_cache, atr_cache = build_universe(
+                self.massive, self.alpaca,
+            )
+
+            self.universe = final
+            self._universe_diag = diag
+            self._adv_cache = adv_cache
+            self._atr_cache = atr_cache
+
+            if not self.universe:
+                logger.error("Empty universe after pipeline — cannot proceed")
                 return
 
-        current_prices = self.position_mgr.update_positions()
-        exited = self.position_mgr.check_exits(current_time, self.vix_level, current_prices)
-        if exited:
-            logger.info(f"Exited {len(exited)} positions: {exited}")
+            save_universe_audit(diag, final)
+
+            self.data_collected = True
+            self._save_state()
+            logger.info(f"Base universe ready: {len(self.universe)} symbols (Stage C deferred to 3:48)")
+
+        except Exception as e:
+            logger.exception(f"Error in data collection: {e}")
+
+    def _step_score_and_rank(self):
+        """~3:48 PM: Fetch 9:30-3:50 bars, build 350-model candidates, score."""
+        logger.info("=" * 50)
+        logger.info("SCORING (350 model): Fetching signal bars and scoring")
+        logger.info("=" * 50)
+
+        try:
+            today = date.today().isoformat()
+
+            # 1. Fetch 9:30-3:50 minute bars for the full base universe
+            logger.info(f"Fetching 9:30-3:50 minute bars for {len(self.universe)} symbols...")
+            self._minute_bars = self.alpaca.get_intraday_bars_for_signal(
+                self.universe, today, start="09:30", end="15:50",
+            )
+
+            # 2. Stage C: minute-bar data quality filter
+            pre_c_count = len(self.universe)
+            quality_passed = filter_minute_data_quality(
+                self.universe,
+                self._minute_bars,
+                min_minute_bars=30,
+                diag=self._universe_diag,
+            )
+            logger.info(f"Stage C data quality: {pre_c_count} → {len(quality_passed)}")
+            self.universe = quality_passed
+
+            if not self.universe:
+                logger.error("Empty universe after Stage C data quality — cannot score")
+                self.scoring_done = True
+                return
+
+            # 3. Fetch SPY return (open to current)
+            spy_snap = self.alpaca.get_snapshots([config.MARKET_BENCHMARK])
+            spy_data = spy_snap.get(config.MARKET_BENCHMARK, {})
+            spy_open = spy_data.get("open") or 0
+            spy_last = spy_data.get("last_price") or spy_data.get("close") or 0
+            spy_return = (spy_last - spy_open) / spy_open if spy_open > 0 else 0.0
+            logger.info(f"SPY return: {spy_return:.4f} (open={spy_open}, last={spy_last})")
+
+            # 4. Build volume profiles (60-min)
+            volume_last_60min: Dict[str, int] = {}
+            volume_avg_60min: Dict[str, float] = {}
+            for symbol in self.universe:
+                bars = self._minute_bars.get(symbol, [])
+                vol_60, avg_60 = self.alpaca.get_volume_profile_60min(bars)
+                volume_last_60min[symbol] = vol_60
+                volume_avg_60min[symbol] = avg_60
+
+            # 5. Build candidates from minute bars
+            candidates = build_signal_candidates_350(
+                self.universe, self._minute_bars,
+                self._adv_cache, self._atr_cache,
+            )
+
+            if not candidates:
+                logger.error("No valid candidates after build_signal_candidates_350")
+                self.scoring_done = True
+                return
+
+            # 5. Compute raw metrics
+            candidates = compute_raw_metrics_350(
+                candidates, spy_return,
+                volume_last_60min, volume_avg_60min,
+            )
+
+            # 6. Normalize, score, bucket
+            candidates = normalize_and_score_350(candidates)
+            candidates = assign_buckets(candidates)
+            candidates.sort(key=lambda c: c.composite_score, reverse=True)
+
+            self.scored_candidates = candidates
+            self.scoring_done = True
             self._save_state()
 
-    def _load_state(self):
-        """Load state from previous run (for same-day crash recovery only).
-        
-        Rules:
-        1. Non-today state → nuke everything, start completely fresh.
-        2. Same-day state → restore only if backing data is complete.
-        3. Broker positions are always ground truth at the end.
-        """
-        today = datetime.now().strftime("%Y-%m-%d")
-        bot_state = self.state_mgr.load_bot_state()
-        saved_date = bot_state.get("date") if bot_state else None
-        is_same_day = saved_date == today
+            # Log top 10
+            logger.info(f"Scoring complete: {len(candidates)} scored")
+            for c in candidates[:10]:
+                logger.info(
+                    f"  {c.symbol}: score={c.composite_score:.3f} bucket={c.bucket} "
+                    f"ret={c.intraday_return:.2%} prox={c.proximity_to_high:.3f} "
+                    f"vol_vs_avg={c.volume_vs_avg:.2f} atr%={c.atr_percent:.3f}"
+                )
 
-        # ── Step 1: If not same-day, clear everything ──
-        if not is_same_day:
-            if saved_date:
-                logger.warning(f"Stale state from {saved_date} — clearing all state for fresh start")
-            else:
-                logger.info("No saved state found — fresh start")
-            self.state_mgr.clear_bot_state()
-            self.state_mgr.save_positions({})
-            self._clear_pre_trade_state()
-            self.position_mgr.positions.clear()
-            self.position_mgr.entry_plans.clear()
-            self.position_mgr.exit_slicers.clear()
-            # All stage flags stay at __init__ defaults (False)
+            # Save candidates audit artifact
+            top_20_dicts = [
+                {
+                    "symbol": c.symbol, "score": round(c.composite_score, 4),
+                    "bucket": c.bucket, "intraday_return": round(c.intraday_return, 4),
+                    "proximity_to_high": round(c.proximity_to_high, 4),
+                    "volume_vs_avg": round(c.volume_vs_avg, 2),
+                    "volume_trend": round(c.volume_trend, 2),
+                    "vs_market": round(c.vs_market, 4),
+                    "atr_percent": round(c.atr_percent, 4),
+                    "signal_price": round(c.signal_price, 4),
+                    "adv_dollars": round(c.adv_dollars, 0),
+                }
+                for c in candidates[:20]
+            ]
+            save_candidates_audit(top_20_dicts)
 
-        # ── Step 2: Same-day recovery ──
-        else:
-            logger.info(f"Same-day state found — attempting recovery")
+            # Also update universe audit with top 20
+            if self._universe_diag:
+                save_universe_audit(self._universe_diag, self.universe, scored_top20=top_20_dicts)
 
-            # Restore entry plans if saved
-            entry_plans_data = bot_state.get("entry_plans", {})
-            if entry_plans_data:
-                from bot.position_manager import EntryExecutionPlan
-                for symbol, plan_data in entry_plans_data.items():
-                    self.position_mgr.entry_plans[symbol] = EntryExecutionPlan(**plan_data)
-                logger.info(f"Restored {len(entry_plans_data)} entry plans")
+        except Exception as e:
+            logger.exception(f"Error in scoring: {e}")
+            self.scoring_done = True
 
-            # Restore positions from file
-            positions = self.state_mgr.load_positions()
-            if positions:
-                self.position_mgr.load_positions(positions)
-                logger.info(f"Restored {len(positions)} positions from state")
+    def _step_execute_entries(self):
+        """3:50 PM: Select positions via account tier, size, execute market buys."""
+        logger.info("=" * 50)
+        logger.info("ENTRY EXECUTION: Submitting market buy orders")
+        logger.info("=" * 50)
 
-            # Restore pre-trade data (universe, candidates, Massive snapshots)
-            pre_trade = self._load_pre_trade_state()
-            if pre_trade:
-                self.universe = pre_trade.get("universe", [])
-                self.massive_snapshots = pre_trade.get("massive_snapshots", {})
-                candidates_data = pre_trade.get("candidates", [])
-                if candidates_data:
-                    self.candidates = [GapCandidate(**c) for c in candidates_data]
-                    self.core_candidates = [c for c in self.candidates if c.gap_pct >= 4.0]
-                    self.filler_candidates = [c for c in self.candidates if 3.0 <= c.gap_pct < 4.0]
-                    logger.info(f"Restored {len(self.candidates)} candidates: {len(self.core_candidates)} core, {len(self.filler_candidates)} filler")
+        exec_diag = ExecutionDiagnostics()
+        self._exec_diag = exec_diag
 
-            # Restore stage flags ONLY if we have the backing data to support them
-            has_universe = bool(self.universe)
-            has_candidates = bool(self.candidates)
-            has_entry_plans = bool(self.position_mgr.entry_plans)
-            has_positions = self.position_mgr.get_position_count() > 0
+        try:
+            if not self.scored_candidates:
+                logger.warning("No scored candidates — skipping entries")
+                self.entries_done = True
+                return
 
-            if has_universe:
-                self.stage_universe_done = bot_state.get("stage_universe_done", False)
-            if has_candidates:
-                self.stage_candidates_done = bot_state.get("stage_candidates_done", False)
-            if has_entry_plans or has_positions:
-                self.stage_entry_done = bot_state.get("stage_entry_done", False)
-                self.entry_submission_locked = bot_state.get("entry_submission_locked", False)
-                self.position_mgr.entry_stage1_done = bot_state.get("entry_stage1_done", False)
-                self.position_mgr.entry_stage2_done = bot_state.get("entry_stage2_done", False)
-            if has_positions:
-                self.stage_exit_done = bot_state.get("stage_exit_done", False)
+            # Get account equity and choose tier
+            equity = self.position_mgr.get_account_equity()
+            if not equity or equity <= 0:
+                logger.error("Cannot determine account equity — skipping entries")
+                self.entries_done = True
+                return
 
-            self.vix_level = bot_state.get("vix_level", self.vix_level)
+            logger.info(f"Account equity: ${equity:,.2f}")
+            sel = get_selection_config(equity)
+
+            # Select and size positions
+            selected, sizing = select_positions(self.scored_candidates, equity, sel)
+
+            if not sizing:
+                logger.warning("No positions selected after sizing — skipping entries")
+                self.entries_done = True
+                return
+
+            exec_diag.selected_symbols = [c.symbol for c in selected if sizing.get(c.symbol, 0) > 0]
+
+            # Execution eligibility gate — fetch fresh snapshots, reject unorderable
+            fresh_snaps = self.alpaca.get_snapshots(exec_diag.selected_symbols)
+            orderable, exec_rejected = filter_execution_ready(
+                exec_diag.selected_symbols, fresh_snaps,
+                max_spread_pct=0.05, require_quote=True,
+            )
+            exec_diag.orderable_symbols = list(orderable)
+            exec_diag.rejected_symbols = dict(exec_rejected)
+            orderable_set = set(orderable)
+
+            if exec_rejected:
+                for sym, reason in exec_rejected.items():
+                    logger.warning(f"Execution reject {sym}: {reason}")
+                    sizing.pop(sym, None)
+
+            # Submit market buy orders
+            total_deployed = 0.0
+
+            for candidate in selected:
+                if candidate.symbol not in orderable_set:
+                    continue
+                symbol = candidate.symbol
+                qty = sizing.get(symbol, 0)
+                if qty <= 0:
+                    continue
+
+                buy_resp = self.position_mgr.submit_buy_order(symbol, qty)
+                if not buy_resp:
+                    logger.error(f"Failed to submit buy for {symbol} x{qty}")
+                    exec_diag.failed_submissions[symbol] = "submit_failed"
+                    continue
+
+                order_id = buy_resp.get("id")
+                if not order_id:
+                    exec_diag.failed_submissions[symbol] = "no_order_id"
+                    continue
+
+                exec_diag.submitted_symbols.append(symbol)
+
+                fill = self.position_mgr.get_order_fill(order_id, max_wait=30)
+                if fill and int(fill["filled_qty"]) > 0:
+                    filled_qty = int(fill["filled_qty"])
+                    fill_price = fill["filled_avg_price"]
+
+                    position = Position(
+                        symbol=symbol,
+                        entry_price=fill_price,
+                        quantity=filled_qty,
+                        entry_time=datetime.now(),
+                        entry_gap_pct=0.0,
+                        adv_estimate=candidate.adv_dollars,
+                        peak_price=fill_price,
+                        current_price=fill_price,
+                    )
+                    self.position_mgr.positions[symbol] = position
+                    total_deployed += fill_price * filled_qty
+                    exec_diag.filled_symbols.append(symbol)
+                    exec_diag.fill_details[symbol] = {
+                        "qty": filled_qty, "price": round(fill_price, 4),
+                        "score": round(candidate.composite_score, 4),
+                        "bucket": candidate.bucket,
+                    }
+
+                    logger.info(
+                        f"ENTRY {symbol}: {filled_qty} @ {fill_price:.4f} "
+                        f"(score={candidate.composite_score:.3f}, bucket={candidate.bucket})"
+                    )
+                else:
+                    logger.warning(f"No fill for {symbol} buy order")
+                    exec_diag.failed_submissions[symbol] = "no_fill"
+
+            self.entries_done = True
+            self._save_state()
+
+            # Store execution stats for health report
+            self._exec_stats = {
+                "selected": len(exec_diag.selected_symbols),
+                "orderable": len(exec_diag.orderable_symbols),
+                "exec_rejected": len(exec_diag.rejected_symbols),
+                "exec_rejected_reasons": exec_diag.rejected_symbols,
+                "orders_submitted": len(exec_diag.submitted_symbols),
+                "entries_filled": len(exec_diag.filled_symbols),
+                "total_deployed": total_deployed,
+                "equity": equity,
+            }
 
             logger.info(
-                f"Recovery: universe={len(self.universe)}, candidates={len(self.candidates)}, "
-                f"plans={len(self.position_mgr.entry_plans)}, positions={self.position_mgr.get_position_count()}, "
-                f"stages: U={self.stage_universe_done} C={self.stage_candidates_done} "
-                f"E={self.stage_entry_done} X={self.stage_exit_done}"
+                f"Entry execution complete: {len(exec_diag.filled_symbols)} filled, "
+                f"{len(exec_diag.rejected_symbols)} rejected at execution gate, "
+                f"${total_deployed:,.2f} deployed "
+                f"({total_deployed / equity * 100:.1f}% of equity)"
             )
 
-        # ── Step 3: Cancel orphaned orders ──
-        if self.position_mgr.entry_plans:
-            canceled = self.position_mgr.cancel_orphaned_open_orders()
-            if canceled > 0:
-                logger.warning(f"Startup: Canceled {canceled} orphaned open orders (not matching restored entry_plans)")
-        else:
-            canceled = self.position_mgr.cancel_open_buy_orders()
-            if canceled > 0:
-                logger.warning(f"Startup: Canceled {canceled} orphaned open buy orders")
-
-        # ── Step 4: Broker is ground truth — reconcile ──
-        live_broker_positions = self.position_mgr.get_broker_positions()
-        local_count = self.position_mgr.get_position_count()
-
-        if live_broker_positions is None:
-            # Broker API failed — preserve local state, don't make destructive decisions
-            logger.error("Startup: broker API unreachable — preserving local state as-is")
-        elif live_broker_positions:
-            logger.warning(f"Startup: broker shows {len(live_broker_positions)} live positions")
-            for pos in live_broker_positions:
-                logger.warning(f"  Broker: {pos.get('symbol')} qty={pos.get('qty')} side={pos.get('side')}")
-            self.position_mgr.reconcile_local_positions_from_broker()
-            # If broker has positions, entries are done.
-            # NOTE: reconcile_local_positions_from_broker rebuilds positions with
-            # zeroed entry metadata (gap_pct=0, adv_estimate=0). Exit logic that
-            # depends on original entry context (e.g., gap-based trailing stops)
-            # will lose fidelity. This is an acceptable tradeoff vs losing positions.
-            self.stage_entry_done = True
-            self.stage_universe_done = True
-            self.stage_candidates_done = True
-        elif local_count > 0:
-            logger.warning(f"Local shows {local_count} positions but broker is flat — clearing stale local state")
-            self.position_mgr.positions.clear()
-            self.position_mgr.exit_slicers.clear()
-
-    def _save_state(self):
-        """Save current state including positions and bot state"""
-        self.state_mgr.save_positions(self.position_mgr.positions)
-        
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        # Serialize entry plans for persistence
-        entry_plans_data = {}
-        for symbol, plan in self.position_mgr.entry_plans.items():
-            entry_plans_data[symbol] = {
-                "symbol": plan.symbol,
-                "target_qty": plan.target_qty,
-                "open_qty": plan.open_qty,
-                "planned_remaining_qty": plan.planned_remaining_qty,
-                "expected_open_price": plan.expected_open_price,
-                "gap_pct": plan.gap_pct,
-                "adv_estimate": plan.adv_estimate,
-                "open_order_id": plan.open_order_id,
-                "open_filled_qty": plan.open_filled_qty,
-                "open_filled_avg_price": plan.open_filled_avg_price,
-                "market1_order_id": plan.market1_order_id,
-                "market1_filled_qty": plan.market1_filled_qty,
-                "market1_filled_avg_price": plan.market1_filled_avg_price,
-                "market2_order_id": plan.market2_order_id,
-                "market2_filled_qty": plan.market2_filled_qty,
-                "market2_filled_avg_price": plan.market2_filled_avg_price,
-                "finalized": plan.finalized,
-                "open_order_terminal": plan.open_order_terminal,
-            }
-        
-        self.state_mgr.save_bot_state({
-            "date": today,
-            "vix_level": self.vix_level,
-            "stage_universe_done": self.stage_universe_done,
-            "stage_candidates_done": self.stage_candidates_done,
-            "stage_entry_done": self.stage_entry_done,
-            "stage_exit_done": self.stage_exit_done,
-            # Staged entry state
-            "entry_submission_locked": self.entry_submission_locked,
-            "entry_stage1_done": self.position_mgr.entry_stage1_done,
-            "entry_stage2_done": self.position_mgr.entry_stage2_done,
-            "entry_plans": entry_plans_data,
-        })
-        
-        # CRITICAL FIX: Also save pre-trade state (universe, candidates, Massive snapshots)
-        self._save_pre_trade_state()
-
-    def _save_pre_trade_state(self):
-        """Save universe, candidates, and Massive snapshots for recovery with date"""
-        pre_trade_file = os.path.join(config.STATE_DIR, "pre_trade_state.json")
-        today = datetime.now().strftime("%Y-%m-%d")
-        state = {
-            "date": today,
-            "universe": self.universe,
-            "massive_snapshots": self.massive_snapshots,
-        }
-        if self.candidates:
-            state["candidates"] = [
-                {
-                    "symbol": c.symbol,
-                    "open_price": c.open_price,
-                    "prev_close": c.prev_close,
-                    "gap_pct": c.gap_pct,
-                    "volume": c.volume,
-                    "adv_estimate": c.adv_estimate,
-                }
-                for c in self.candidates
-            ]
-        try:
-            with open(pre_trade_file, 'w') as f:
-                json.dump(state, f, indent=2)
         except Exception as e:
-            logger.error(f"Error saving pre-trade state: {e}")
+            logger.exception(f"Error in entry execution: {e}")
+            self.entries_done = True
 
-    def _load_pre_trade_state(self) -> Optional[dict]:
-        """Load universe and Massive data for recovery with date validation"""
-        pre_trade_file = os.path.join(config.STATE_DIR, "pre_trade_state.json")
-        if not os.path.exists(pre_trade_file):
-            return None
-        try:
-            with open(pre_trade_file, 'r') as f:
-                state = json.load(f)
-            
-            # Validate date - don't use stale pre-trade state
-            today = datetime.now().strftime("%Y-%m-%d")
-            state_date = state.get("date")
-            if state_date != today:
-                logger.warning(f"Pre-trade state from {state_date} is stale (today: {today}) - ignoring")
-                return None
-            
-            return state
-        except Exception as e:
-            logger.error(f"Error loading pre-trade state: {e}")
-            return None
-
-    def _clear_pre_trade_state(self):
-        """Clear pre-trade state file"""
-        pre_trade_file = os.path.join(config.STATE_DIR, "pre_trade_state.json")
-        if os.path.exists(pre_trade_file):
-            os.remove(pre_trade_file)
+    # ════════════════════════════════════════════════════════════
+    # INFRASTRUCTURE (failsafe, state, etc.)
+    # ════════════════════════════════════════════════════════════
 
     def _run_failsafe_flatten(self, label: str):
         """Broker-based catch-all flatten with multi-layer retry."""
@@ -903,18 +676,14 @@ class GapMomentumBot:
             f"errors={len(summary['errors'])}"
         )
 
-        # Log any symbols that need manual intervention
         manual = summary.get("manual_required", [])
         if manual:
             for item in manual:
                 logger.critical(f"{label}: {item}")
 
-        # If broker is flat, mark exits complete and clear any stale local state
         remaining = self.position_mgr.broker_position_count()
         if remaining == 0:
-            self.stage_exit_done = True
             self.position_mgr.positions.clear()
-            self.position_mgr.exit_slicers.clear()
             logger.warning(f"{label}: broker confirmed flat — local state cleared")
         elif remaining < 0:
             logger.error(f"{label}: broker API unreachable after failsafe — cannot confirm flat")
@@ -923,112 +692,123 @@ class GapMomentumBot:
 
         self._save_state()
 
-    def _run_nuclear_flatten(self):
-        """3:58 PM nuclear option: ignore all circuit breakers, spam sells until flat."""
-        logger.critical("3:58 PM NUCLEAR FLATTEN: ignoring circuit breakers, must flatten before close")
-
-        summary = self.position_mgr.nuclear_flatten(max_rounds=5)
-
-        logger.critical(
-            f"NUCLEAR FLATTEN result: rounds={summary['rounds']} | "
-            f"sells={summary['total_sells']} | filled={summary['total_filled']} | "
-            f"still_open={summary['still_open']}"
-        )
-
-        remaining = self.position_mgr.broker_position_count()
-        if remaining == 0:
-            self.stage_exit_done = True
-            self.position_mgr.positions.clear()
-            self.position_mgr.exit_slicers.clear()
-            logger.critical("NUCLEAR FLATTEN: broker confirmed flat — local state cleared")
-        elif remaining < 0:
-            logger.critical("NUCLEAR FLATTEN: broker API unreachable — cannot confirm flat, MANUAL CHECK NEEDED")
-        else:
-            logger.critical(f"NUCLEAR FLATTEN: broker STILL shows {remaining} positions — MANUAL ACTION NEEDED")
-
-        self._save_state()
-
-    def _finalize_day(self):
-        """Finalize trading day, log summary"""
-        logger.info("Finalizing trading day")
-
-        broker_count_before = self.position_mgr.broker_position_count()
-        if broker_count_before > 0:
-            logger.warning(f"Finalize day: broker shows {broker_count_before} open positions, flattening")
-            self.position_mgr.force_flatten_broker_positions("finalize_day")
-
-        broker_count_after = self.position_mgr.broker_position_count()
-        if broker_count_after < 0:
-            logger.critical("FINALIZE DAY: broker API unreachable — cannot confirm flat, preserving state")
-            return
-        if broker_count_after > 0:
-            logger.critical(
-                f"FAILED TO FLATTEN BROKER POSITIONS AT END OF DAY - "
-                f"{broker_count_after} still open, preserving state"
+    def _save_end_of_day_reports(self):
+        """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
+        try:
+            stats = self._exec_stats
+            save_run_health(
+                diag=self._universe_diag,
+                scored_count=len(self.scored_candidates),
+                selected_count=stats.get("selected", 0),
+                orderable_count=stats.get("orderable", 0),
+                filled_count=stats.get("entries_filled", 0),
+                total_deployed=stats.get("total_deployed", 0.0),
+                equity=stats.get("equity", 0.0),
+                exec_rejected=stats.get("exec_rejected_reasons"),
+                extra={"api_calls_total": get_api_call_count()},
             )
+        except Exception as e:
+            logger.error(f"Failed to save health report: {e}")
+
+        try:
+            if self._universe_diag:
+                save_universe_audit(self._universe_diag, self.universe)
+        except Exception as e:
+            logger.error(f"Failed to save universe audit: {e}")
+
+        try:
+            if self.scored_candidates:
+                top_20 = [
+                    {
+                        "symbol": c.symbol, "score": round(c.composite_score, 4),
+                        "bucket": c.bucket, "intraday_return": round(c.intraday_return, 4),
+                    }
+                    for c in self.scored_candidates[:20]
+                ]
+                save_candidates_audit(top_20)
+        except Exception as e:
+            logger.error(f"Failed to save candidates audit: {e}")
+
+        try:
+            if self._exec_diag:
+                save_execution_audit(self._exec_diag)
+        except Exception as e:
+            logger.error(f"Failed to save execution audit: {e}")
+
+    def _finalize_day(self, clear_state: bool = True):
+        """End-of-day: write reports, optionally clear state.
+
+        When clear_state=True (no-entry day), we clear bot flags so tomorrow
+        starts fresh, and only persist positions (which should be empty).
+        We deliberately do NOT call _save_state() after clearing, because
+        _save_state() would re-write the bot flags we just cleared.
+        """
+        logger.info("Finalizing trading day")
+        self._save_end_of_day_reports()
+        if clear_state:
+            self.state_mgr.clear_bot_state()
+            # Only persist positions (should be empty); do NOT re-save bot flags
+            self.state_mgr.save_positions(self.position_mgr.positions)
+        else:
+            self._save_state()
+
+    def _save_state(self):
+        """Persist current state to disk."""
+        try:
+            # Save positions
+            self.state_mgr.save_positions(self.position_mgr.positions)
+
+            # Save bot state
+            bot_state = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "morning_exits_done": self.morning_exits_done,
+                "hard_stops_checked": self.hard_stops_checked,
+                "drop_stops_checked": self.drop_stops_checked,
+                "final_exit_done": self.final_exit_done,
+                "data_collected": self.data_collected,
+                "scoring_done": self.scoring_done,
+                "entries_done": self.entries_done,
+                "open_prices": self.open_prices,
+            }
+            self.state_mgr.save_bot_state(bot_state)
+        except Exception as e:
+            logger.error(f"Error saving state: {e}")
+
+    def _load_state(self):
+        """Load state from previous run (same-day recovery only)."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        bot_state = self.state_mgr.load_bot_state()
+
+        if not bot_state or bot_state.get("date") != today:
+            logger.info("No same-day state to restore — fresh start")
+            # Load positions from file (may have overnight holds from yesterday's entries)
+            saved = self.state_mgr.load_positions()
+            if saved:
+                self.position_mgr.load_positions(saved)
+                logger.info(f"Loaded {len(saved)} saved positions")
             return
 
-        self.state_mgr.clear_positions()
-        self.state_mgr.clear_bot_state()
-        self._clear_pre_trade_state()
+        # Same-day state: restore flags
+        logger.info("Restoring same-day bot state")
+        self.morning_exits_done = bot_state.get("morning_exits_done", False)
+        self.hard_stops_checked = bot_state.get("hard_stops_checked", False)
+        self.drop_stops_checked = bot_state.get("drop_stops_checked", False)
+        self.final_exit_done = bot_state.get("final_exit_done", False)
+        self.data_collected = bot_state.get("data_collected", False)
+        self.scoring_done = bot_state.get("scoring_done", False)
+        self.entries_done = bot_state.get("entries_done", False)
+        self.open_prices = bot_state.get("open_prices", {})
 
-        # CRITICAL: Explicitly clear staged entry state to prevent leakage to next day
-        self.position_mgr.entry_plans.clear()
-        self.position_mgr.entry_stage1_done = False
-        self.position_mgr.entry_stage2_done = False
-        self.entry_submission_locked = False
-        logger.info("Cleared staged entry state (entry_plans, stage flags, lock)")
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        summary = {
-            "universe_size": len(self.universe),
-            "candidates_found": len(self.candidates),
-            "vix_level": self.vix_level,
-            "stage_entry_done": self.stage_entry_done,
-            "stage_exit_done": self.stage_exit_done,
-        }
-        self.state_mgr.log_daily_summary(today, summary)
-
-        logger.info("Day complete - Goodbye!")
+        # Load positions
+        saved = self.state_mgr.load_positions()
+        if saved:
+            self.position_mgr.load_positions(saved)
+            logger.info(f"Loaded {len(saved)} saved positions")
 
 
 def main():
-    bot = GapMomentumBot()
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        current_time = datetime.now().time()
-        logger.warning(f"Interrupted by user at {current_time}")
-        
-        # Only flatten if after market close or in failsafe window
-        if current_time >= dt_time(16, 0):
-            logger.info("After market close - running finalize_day")
-            bot._finalize_day()
-        elif current_time >= dt_time(15, 30):
-            logger.warning("In failsafe window - running broker flatten only")
-            bot._run_failsafe_flatten("KeyboardInterrupt during failsafe window")
-            bot._save_state()
-        else:
-            logger.warning("During market hours - preserving state, NOT flattening positions")
-            logger.warning("Positions remain open. Manual intervention required if liquidation needed.")
-            bot._save_state()
-    except Exception as e:
-        current_time = datetime.now().time()
-        logger.exception(f"Fatal error at {current_time}: {e}")
-        
-        # Only flatten if after market close or in failsafe window
-        if current_time >= dt_time(16, 0):
-            logger.info("After market close - running finalize_day")
-            bot._finalize_day()
-        elif current_time >= dt_time(15, 30):
-            logger.warning("In failsafe window - running broker flatten only")
-            bot._run_failsafe_flatten("Exception during failsafe window")
-            bot._save_state()
-        else:
-            logger.critical("FATAL ERROR DURING MARKET HOURS - preserving state, NOT flattening positions")
-            logger.critical("Positions remain open. Manual intervention required.")
-            bot._save_state()
-        raise
+    bot = OvernightMomentumBot()
+    bot.run()
 
 
 if __name__ == "__main__":

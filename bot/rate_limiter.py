@@ -25,6 +25,7 @@ class SlidingWindowLimiter:
         self.window_seconds = window_seconds
         self._timestamps: deque = deque()
         self._lock = threading.Lock()
+        self._total_calls: int = 0  # lifetime counter for diagnostics
 
     def acquire(self):
         """Block until a request slot is available, then record the timestamp."""
@@ -37,14 +38,26 @@ class SlidingWindowLimiter:
                 while self._timestamps and self._timestamps[0] <= cutoff:
                     self._timestamps.popleft()
 
-                if len(self._timestamps) < self.max_calls:
+                in_window = len(self._timestamps)
+                if in_window < self.max_calls:
                     self._timestamps.append(now)
+                    self._total_calls += 1
+                    # Early warning at 70% utilization
+                    if in_window >= int(self.max_calls * 0.7):
+                        logger.warning(
+                            f"Rate limiter: high usage {in_window + 1}/{self.max_calls} "
+                            f"in last {self.window_seconds:.0f}s"
+                        )
                     return
 
                 # Window is full — calculate wait time until the oldest entry expires
                 wait = self._timestamps[0] - cutoff
+                in_window = len(self._timestamps)
 
-            logger.debug(f"Rate limiter: {self.max_calls}/{self.window_seconds}s limit reached, waiting {wait:.1f}s")
+            logger.warning(
+                f"Rate limiter: {in_window}/{self.max_calls} calls in last "
+                f"{self.window_seconds:.0f}s — throttling {wait:.1f}s"
+            )
             time.sleep(wait)
 
 
@@ -64,10 +77,26 @@ class RateLimitedSession(requests.Session):
         return super().request(method, url, **kwargs)
 
 
-# Module-level shared limiter: 100 requests per 60 seconds across all Alpaca sessions
-_alpaca_limiter = SlidingWindowLimiter(max_calls=100, window_seconds=60.0)
+# Module-level shared limiter: 80 requests per 60 seconds across all Alpaca sessions
+# (20-call buffer under Alpaca's 100/min hard limit for retries and bursts)
+_alpaca_limiter = SlidingWindowLimiter(max_calls=80, window_seconds=60.0)
 
 
 def create_alpaca_session() -> RateLimitedSession:
     """Create a rate-limited session that shares the global Alpaca budget."""
     return RateLimitedSession(_alpaca_limiter)
+
+
+def get_api_call_count() -> int:
+    """Return total lifetime API calls through the shared limiter."""
+    return _alpaca_limiter._total_calls
+
+
+def get_calls_in_window() -> int:
+    """Return how many calls are currently in the sliding window."""
+    with _alpaca_limiter._lock:
+        now = time.monotonic()
+        cutoff = now - _alpaca_limiter.window_seconds
+        while _alpaca_limiter._timestamps and _alpaca_limiter._timestamps[0] <= cutoff:
+            _alpaca_limiter._timestamps.popleft()
+        return len(_alpaca_limiter._timestamps)
