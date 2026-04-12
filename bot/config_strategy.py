@@ -32,8 +32,11 @@ MAX_POSITION_DOLLARS = 50_000  # Absolute dollar cap per position
 # Exit rules (morning of T+1)
 # ═══════════════════════════════════════════════════
 HARD_STOP_PCT = -0.05       # -5% from entry price → exit at 9:30 open
-DROP_STOP_PCT = 0.06         # 6% drop from open-to-9:35 high → exit at 9:35
-EXIT_TIME = "11:00"          # Exit ALL remaining positions at this time
+
+# V2 adaptive exit — positions classified at 9:35 into timed buckets.
+# Thresholds live in exit_classifier.py (STRONG_MOVE_PCT, WEAK_MOVE_PCT).
+# Bucket schedule: 09:35 / 10:00 / 11:00 / 14:00
+V2_FAILSAFE_TIME = "14:05"   # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
 # Afternoon timeline (T-1 entry day)
@@ -46,7 +49,10 @@ ENTRY_TIME = "15:50"             # Execute entries (market orders)
 # Morning timeline (T+1 exit day)
 # ═══════════════════════════════════════════════════
 MARKET_OPEN_TIME = "09:30"
-FIRST_CHECKPOINT_TIME = "09:35"  # 6% drop-stop check
+V2_CLASSIFY_TIME = "09:35"       # V2 exit classification + immediate 9:35 exits
+EXIT_BUCKET_1000_TIME = "10:00"  # Default bucket exit
+EXIT_BUCKET_1100_TIME = "11:00"  # Strong-but-flat bucket exit
+EXIT_BUCKET_1400_TIME = "14:00"  # Weak/dropping bucket exit
 
 # ═══════════════════════════════════════════════════
 # Sector ETFs — kept for future use when sector mapping is added

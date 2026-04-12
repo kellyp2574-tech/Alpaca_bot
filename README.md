@@ -37,9 +37,11 @@ The bot scores stocks based on 6 metrics computed from 9:30 AM - 3:50 PM intrada
 |-----------|----------|---------||
 | **9:00 AM** | Startup | Detect overnight positions from broker, reconcile local state |
 | **9:30 AM** | Hard Stop Check | Exit if open ≤ entry × 0.95 (-5% stop) |
-| **9:35 AM** | Drop Stop Check | Exit if price dropped ≥6% from open high |
-| **11:00 AM** | Final Exit | Exit ALL remaining positions at market |
-| **11:05 AM** | Post-Exit Failsafe | Verify broker flat, run failsafe if needed |
+| **9:35 AM** | V2 Classification | Classify positions by 5-min move + VWAP, exit 9:35 bucket |
+| **10:00 AM** | Default Bucket Exit | Exit positions with flat/neutral opens (-1% to +1%) |
+| **11:00 AM** | Strong-Flat Bucket Exit | Exit positions with strong open but below VWAP |
+| **2:00 PM** | Weak/Drop Bucket Exit | Exit positions with weak/dropping opens (<-1%) |
+| **2:05 PM** | Post-Exit Failsafe | Verify broker flat, run failsafe if needed |
 
 ### Afternoon Session (T-1 - Entry Day)
 
@@ -61,23 +63,42 @@ The bot scores stocks based on 6 metrics computed from 9:30 AM - 3:50 PM intrada
 
 **Purpose:** Protects against overnight gap-down or weak opening
 
-### Drop Stop (6% from open high)
-**Trigger:** 9:35 AM  
-**Condition:** `current_price drops ≥6% from open_high`  
-**Calculation:** `open_high = max(open_price, price_at_935)`  
-**Action:** Immediate market sell
+---
 
-**Purpose:** Protects against early morning reversal after strong open
+### V2 Adaptive Exit System (9:35 AM Classification)
 
-### Time Stop (11:00 AM)
-**Trigger:** 11:00 AM  
-**Condition:** Unconditional  
-**Action:** Exit ALL remaining positions at market
+At 9:35 AM, all remaining positions are classified into exit time buckets based on the first 5 minutes of price action and VWAP trend.
 
-**Purpose:** Captures overnight momentum before midday chop
+**Classification Inputs:**
+- `move_5m_pct` = (price_935 - open_price) / open_price × 100
+- `above_vwap` = price_935 > 5-min VWAP (volume-weighted average price)
 
-### Failsafe (11:05 AM)
-**Trigger:** 11:05 AM  
+**Exit Buckets:**
+
+#### 1. Exit at 9:35 AM (Immediate) - Strong + Above VWAP
+**Condition:** `move_5m_pct > +1.0%` AND `above_vwap = True`  
+**Rationale:** Strong momentum continuation with price above VWAP → take profits immediately
+
+#### 2. Exit at 10:00 AM (Default) - Flat/Neutral
+**Condition:** `-1.0% ≤ move_5m_pct ≤ +1.0%`  
+**Rationale:** No strong signal in either direction → exit at default time
+
+#### 3. Exit at 11:00 AM (Strong but No Trend) - Strong + Below VWAP
+**Condition:** `move_5m_pct > +1.0%` AND `above_vwap = False`  
+**Rationale:** Strong gap but price already below VWAP = potential reversal → hold longer for recovery
+
+#### 4. Exit at 2:00 PM (Weak/Dropping) - Weak Open
+**Condition:** `move_5m_pct < -1.0%`  
+**Rationale:** Weak open or early drop → give time to recover before exiting
+
+**Partial Fill Re-Routing:**  
+If a position doesn't fully exit, it's automatically re-scheduled to the next bucket:
+- 9:35 → 10:00 → 11:00 → 2:00 → 2:05 failsafe
+
+---
+
+### Failsafe (2:05 PM)
+**Trigger:** 2:05 PM  
 **Condition:** Broker still shows positions  
 **Action:** Multi-layer flatten (market → limit -3% → limit -5%)
 
@@ -209,9 +230,10 @@ time_in_force = "day"
 
 **`state/bot_state.json`** - Same-day recovery state
 - Date stamp (only restores if same day)
-- Morning exit flags (hard_stops_checked, drop_stops_checked, final_exit_done)
+- Morning exit flags (hard_stops_checked, v2_classified, exits_1000_done, exits_1100_done, exits_1400_done)
 - Afternoon entry flags (data_collected, scoring_done, entries_done)
 - Open prices captured at 9:30 AM
+- Exit schedule (symbol → exit_bucket mapping)
 
 ### Recovery Logic
 
@@ -240,6 +262,7 @@ run.py                              # Entry point
 bot/
   integrated_main.py                # OvernightMomentumBot orchestrator
   position_manager_overnight.py     # Position & order management, exits, failsafe
+  exit_classifier.py                # V2 adaptive exit classification (9:35 AM)
   momentum_scorer.py                # 350-model scoring, bucket assignment, selection
   universe_builder.py               # 4-stage pipeline, diagnostics, audit trails
   massive_client.py                 # Massive API client
@@ -311,21 +334,21 @@ python run.py
 ```
 
 Start the bot at **9:00 AM ET**. It will:
-1. Manage morning exits (9:30-11:05 AM) if overnight positions exist
+1. Manage morning exits (9:30-2:05 PM) if overnight positions exist
 2. Wait for afternoon entry window (3:30-4:00 PM)
 3. Score universe and enter new positions at 3:50 PM
 4. Shut down at 4:00 PM, holding positions overnight
 
 ### Late Start Behavior
 
-**Started after 11:05 AM with positions:**
+**Started after 2:05 PM with positions:**
 - Immediately runs failsafe flatten
 - Exits all positions at market
 
 **Started after 4:00 PM:**
 - Logs error and exits (nothing to do)
 
-**Started between 11:05 AM - 3:30 PM:**
+**Started between 2:05 PM - 3:30 PM:**
 - Waits for 3:30 PM data collection
 - Continues with afternoon entry flow
 
@@ -378,9 +401,14 @@ MAX_POSITION_DOLLARS = 50_000 # Absolute dollar cap
 
 ### Exit Rules (`config_strategy.py`)
 ```python
-HARD_STOP_PCT = -0.05         # -5% from entry
-DROP_STOP_PCT = 0.06          # 6% drop from open high
-EXIT_TIME = "11:00"           # Final exit time
+HARD_STOP_PCT = -0.05         # -5% from entry at 9:30 open
+V2_FAILSAFE_TIME = "14:05"    # Post-exit failsafe verification
+
+# V2 adaptive exit buckets (classified at 9:35 AM)
+V2_CLASSIFY_TIME = "09:35"
+EXIT_BUCKET_1000_TIME = "10:00"  # Default bucket
+EXIT_BUCKET_1100_TIME = "11:00"  # Strong-but-flat bucket
+EXIT_BUCKET_1400_TIME = "14:00"  # Weak/dropping bucket
 ```
 
 ### Timing (`config_strategy.py`)

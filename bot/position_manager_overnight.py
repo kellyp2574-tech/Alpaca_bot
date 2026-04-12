@@ -278,8 +278,8 @@ class PositionManager:
                         time.sleep(3.0)
                         continue
 
-                    logger.info(f"Order {order_id} partially filled: {filled_qty} shares - waiting 3s for more fills")
-                    time.sleep(3)
+                    logger.info(f"Order {order_id} partially filled: {filled_qty} shares - waiting 10s for more fills")
+                    time.sleep(10)
 
                     try:
                         recheck = self.session.get(url, timeout=10).json()
@@ -346,8 +346,8 @@ class PositionManager:
                 if not allow_partial_cancel:
                     return {"order_id": order_id, "filled_qty": filled_qty, "filled_avg_price": float(filled_avg_price), "status": "timeout_with_fill"}
 
-                logger.info(f"Order {order_id} timeout with {filled_qty} shares filled - waiting 3s")
-                time.sleep(3)
+                logger.info(f"Order {order_id} timeout with {filled_qty} shares filled - waiting 10s")
+                time.sleep(10)
 
                 try:
                     recheck = self.session.get(url, timeout=10).json()

@@ -4,10 +4,16 @@ Daily Schedule (ET) — bot starts at 9:00 AM:
 
 MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
   09:00  Start, detect overnight positions from broker
-  09:30  Market open — check hard stops (entry_price × 0.95)
-  09:35  First checkpoint — check 6% drop-stop from open high
-  11:00  Exit ALL remaining positions at market price
-  11:05  Post-exit failsafe verification
+  09:30  Market open — hard-stop check (entry_price × 0.95)
+  09:35  V2 classification — classify each position by 5-min move + VWAP:
+           move < -1%               → hold to 14:00
+           move > +1% AND VWAP up   → exit immediately at 09:35
+           move > +1%               → hold to 11:00
+           else                     → exit at 10:00 (default)
+  10:00  Exit "default" bucket
+  11:00  Exit "strong-but-flat" bucket
+  14:00  Exit "weak/dropping" bucket
+  14:05  Post-exit failsafe verification
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca asset filter + daily bars + ADV)
@@ -21,6 +27,7 @@ import sys
 import time
 from datetime import datetime, time as dt_time, timedelta, date
 from typing import List, Optional, Dict, Any, Tuple
+from zoneinfo import ZoneInfo
 
 from bot import config
 from bot.massive_client import MassiveClient
@@ -34,6 +41,14 @@ from bot.momentum_scorer import (
     normalize_and_score_350,
     assign_buckets,
     select_positions,
+)
+from bot.exit_classifier import (
+    classify_positions,
+    ExitClassification,
+    EXIT_BUCKET_935,
+    EXIT_BUCKET_1000,
+    EXIT_BUCKET_1100,
+    EXIT_BUCKET_1400,
 )
 from bot.position_manager_overnight import PositionManager, Position
 from bot.rate_limiter import get_api_call_count
@@ -62,6 +77,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_ET = ZoneInfo("America/New_York")
+
+
+def _et_utc_offset_str() -> str:
+    """Return the current America/New_York UTC offset as an RFC-3339 string.
+
+    Returns "-04:00" during EDT and "-05:00" during EST.
+    """
+    now_et = datetime.now(_ET)
+    offset = now_et.utcoffset()
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    hours, remainder = divmod(abs(total_seconds), 3600)
+    minutes = remainder // 60
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def _parse_config_time(time_str: str) -> dt_time:
+    """Parse an 'HH:MM' config string into a datetime.time object."""
+    parts = time_str.split(":")
+    return dt_time(int(parts[0]), int(parts[1]))
+
 
 class OvernightMomentumBot:
     """Main bot orchestrator for overnight momentum strategy"""
@@ -85,10 +122,15 @@ class OvernightMomentumBot:
 
         # Morning stop tracking
         self.hard_stops_checked = False
-        self.drop_stops_checked = False
-        self.final_exit_done = False
 
-        # Open prices captured at market open (for drop-stop calculation)
+        # V2 adaptive exit state
+        self.v2_classified = False                    # 9:35 classification done
+        self.exit_schedule: Dict[str, str] = {}       # {symbol: exit_bucket}
+        self.exits_1000_done = False
+        self.exits_1100_done = False
+        self.exits_1400_done = False
+
+        # Open prices captured at market open (for V2 move calculation)
         self.open_prices: Dict[str, float] = {}
 
         # Failsafe
@@ -130,21 +172,33 @@ class OvernightMomentumBot:
             logger.info("No overnight positions — skipping morning exits")
             self.morning_exits_done = True
 
-        # If starting after 11:00 AM with positions, flatten immediately
-        current_time = datetime.now().time()
-        if current_time >= dt_time(11, 5) and self.position_mgr.get_position_count() > 0:
-            logger.warning("Started after 11:05 AM with positions — flattening immediately")
+        # Pre-compute schedule times from config
+        t_market_open = _parse_config_time(config.MARKET_OPEN_TIME)         # 09:30
+        t_v2_classify = _parse_config_time(config.V2_CLASSIFY_TIME)         # 09:35
+        t_bucket_1000 = _parse_config_time(config.EXIT_BUCKET_1000_TIME)    # 10:00
+        t_bucket_1100 = _parse_config_time(config.EXIT_BUCKET_1100_TIME)    # 11:00
+        t_bucket_1400 = _parse_config_time(config.EXIT_BUCKET_1400_TIME)    # 14:00
+        t_failsafe    = _parse_config_time(config.V2_FAILSAFE_TIME)         # 14:05
+        t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)     # 15:30
+        t_scoring     = _parse_config_time(config.SCORING_TIME)              # 15:48
+        t_entry       = _parse_config_time(config.ENTRY_TIME)                # 15:50
+        t_market_close = dt_time(16, 0)
+
+        # If starting after failsafe time with positions, flatten immediately
+        current_time = datetime.now(_ET).time()
+        if current_time >= t_failsafe and self.position_mgr.get_position_count() > 0:
+            logger.warning(f"Started after {config.V2_FAILSAFE_TIME} — flattening immediately")
             self._run_failsafe_flatten("late-start flatten")
             self.morning_exits_done = True
 
         # If starting after 4:00 PM, nothing to do
-        if current_time >= dt_time(16, 0):
+        if current_time >= t_market_close:
             logger.error("Started after market close — nothing to do")
             return
 
         # Main event loop
         while True:
-            now = datetime.now()
+            now = datetime.now(_ET)
             current_time = now.time()
 
             # ════════════════════════════════════════════
@@ -168,33 +222,52 @@ class OvernightMomentumBot:
 
                 if has_positions and not self.morning_exits_done:
                     # 9:30 AM — Hard stop check at market open
-                    if not self.hard_stops_checked and current_time >= dt_time(9, 30):
+                    if not self.hard_stops_checked and current_time >= t_market_open:
                         self._check_hard_stops()
                         self.hard_stops_checked = True
                         self._save_state()
 
-                    # 9:35 AM — Drop-stop check
-                    if not self.drop_stops_checked and current_time >= dt_time(9, 35):
-                        self._check_drop_stops()
-                        self.drop_stops_checked = True
+                    # 9:35 AM — V2 classification + immediate 9:35 exits
+                    if not self.v2_classified and current_time >= t_v2_classify:
+                        self._classify_and_exit_v2()
+                        self.v2_classified = True
                         self._save_state()
 
-                    # 11:00 AM — Exit ALL remaining positions
-                    if not self.final_exit_done and current_time >= dt_time(11, 0):
-                        self._exit_all_positions("11:00 AM scheduled exit")
-                        self.final_exit_done = True
-                        self.morning_exits_done = True
+                    # 10:00 AM — Exit "default" bucket
+                    if self.v2_classified and not self.exits_1000_done and current_time >= t_bucket_1000:
+                        self._exit_bucket(EXIT_BUCKET_1000, "V2 scheduled 10:00 AM exit")
+                        self.exits_1000_done = True
                         self._save_state()
 
-                    # 11:05 AM — Post-exit failsafe
-                    if not self.post_exit_failsafe_done and current_time >= dt_time(11, 5):
+                    # 11:00 AM — Exit "strong-but-flat" bucket
+                    if self.v2_classified and not self.exits_1100_done and current_time >= t_bucket_1100:
+                        self._exit_bucket(EXIT_BUCKET_1100, "V2 scheduled 11:00 AM exit")
+                        self.exits_1100_done = True
+                        self._save_state()
+
+                    # 14:00 — Exit "weak/dropping" bucket
+                    if self.v2_classified and not self.exits_1400_done and current_time >= t_bucket_1400:
+                        self._exit_bucket(EXIT_BUCKET_1400, "V2 scheduled 14:00 exit")
+                        self.exits_1400_done = True
+                        self._save_state()
+
+                    # 14:05 — Post-exit failsafe
+                    if not self.post_exit_failsafe_done and current_time >= t_failsafe:
                         bc = self.position_mgr.broker_position_count()
                         if bc > 0:
                             logger.warning(f"Post-exit failsafe: broker still has {bc} positions")
-                            self._run_failsafe_flatten("11:05 AM post-exit failsafe")
+                            self._run_failsafe_flatten(f"{config.V2_FAILSAFE_TIME} post-exit failsafe")
                         elif bc == 0:
                             logger.info("Post-exit failsafe: broker confirmed flat")
                         self.post_exit_failsafe_done = True
+                        self.morning_exits_done = True
+                        self._save_state()
+
+                    # Early completion — all positions exited before last bucket
+                    if (self.v2_classified
+                            and self.position_mgr.get_position_count() == 0
+                            and not self.morning_exits_done):
+                        logger.info("All V2 exits complete — no positions remaining")
                         self.morning_exits_done = True
                         self._save_state()
 
@@ -203,7 +276,7 @@ class OvernightMomentumBot:
             # ════════════════════════════════════════════
 
             # 3:30 PM — Data collection
-            if not self.data_collected and current_time >= dt_time(15, 30):
+            if not self.data_collected and current_time >= t_data_collect:
                 if current_time < dt_time(15, 45):
                     self._step_collect_data()
                 else:
@@ -211,18 +284,18 @@ class OvernightMomentumBot:
                     self._step_collect_data()
 
             # 3:48 PM — Score and rank (requires data collection)
-            if self.data_collected and not self.scoring_done and current_time >= dt_time(15, 48):
+            if self.data_collected and not self.scoring_done and current_time >= t_scoring:
                 self._step_score_and_rank()
 
             # 3:50 PM — Execute entries (requires scoring)
-            if self.scoring_done and not self.entries_done and current_time >= dt_time(15, 50):
+            if self.scoring_done and not self.entries_done and current_time >= t_entry:
                 self._step_execute_entries()
 
             # ════════════════════════════════════════════
             # Day completion check
             # ════════════════════════════════════════════
 
-            if current_time >= dt_time(16, 0):
+            if current_time >= t_market_close:
                 if self.entries_done:
                     logger.info("Market closed — positions held overnight. Day complete.")
                     self._save_end_of_day_reports()
@@ -259,12 +332,18 @@ class OvernightMomentumBot:
         exits_triggered = []
         for symbol, position in positions:
             snap = snapshots.get(symbol, {})
-            open_price = snap.get("open") or snap.get("last_price")
-            if not open_price:
-                logger.warning(f"No opening price for {symbol} — skipping hard stop")
+            open_price = snap.get("open")
+
+            if not open_price or open_price <= 0:
+                # Do NOT fall back to last_price — it may already be a moving
+                # market price that would distort V2 move_5m_pct classification.
+                logger.warning(
+                    f"No RTH open for {symbol} (snapshot open={snap.get('open')}) "
+                    f"— will attempt first minute bar at 9:35; skipping hard stop"
+                )
                 continue
 
-            # Record opening price for drop-stop calculation later
+            # Record real RTH open for V2 classification at 9:35
             self.open_prices[symbol] = open_price
             position.current_price = open_price
 
@@ -286,104 +365,125 @@ class OvernightMomentumBot:
         else:
             logger.info(f"Hard stops: no triggers ({len(positions)} positions checked)")
 
-    def _check_drop_stops(self):
-        """9:35 AM: Check for 6% drop from open high."""
-        logger.info("DROP STOP CHECK: checking 9:35 prices for 6% drop from open high")
+    def _classify_and_exit_v2(self):
+        """9:35 AM: V2 exit classification + immediate 9:35 bucket exits.
 
+        Collects 9:35 snapshots and 9:30-9:35 minute bars, classifies each
+        position by 5-min move + VWAP trend, stores the exit schedule, and
+        immediately exits any positions assigned to the 09:35 bucket.
+        """
         positions = list(self.position_mgr.positions.items())
         if not positions:
+            logger.info("V2 CLASSIFY: no positions to classify")
             return
 
         symbols = [s for s, _ in positions]
+        logger.info(f"V2 CLASSIFY: classifying {len(symbols)} positions")
+
+        # 1) Fetch 9:35 snapshots (current prices)
         snapshots = self.alpaca.get_snapshots(symbols)
 
-        exits_triggered = []
-        for symbol, position in positions:
-            snap = snapshots.get(symbol, {})
-            price_935 = snap.get("last_price") or snap.get("close")
-            if not price_935:
-                logger.warning(f"No 9:35 price for {symbol} — skipping drop stop")
-                continue
+        # 2) Fetch 9:30-9:35 minute bars for VWAP + open-price fallback
+        today = date.today().isoformat()
+        et_offset = _et_utc_offset_str()
+        minute_bars = self.alpaca.get_minute_bars(
+            symbols,
+            f"{today}T09:30:00{et_offset}",
+            f"{today}T09:35:00{et_offset}",
+        )
 
-            position.current_price = price_935
-
-            # open_high = max(open_price, price_at_935)
-            open_price = self.open_prices.get(symbol, position.entry_price)
-            open_high = max(open_price, price_935)
-
-            if open_high > 0:
-                drop_from_high = (open_high - price_935) / open_high
-                if drop_from_high >= config.DROP_STOP_PCT:
-                    logger.warning(
-                        f"DROP STOP TRIGGERED: {symbol} drop={drop_from_high:.2%} "
-                        f"(open_high={open_high:.4f}, price_935={price_935:.4f})"
-                    )
-                    exits_triggered.append(symbol)
-
-        for symbol in exits_triggered:
-            self._exit_single_position(symbol, "6% drop-stop at 9:35")
-
-        if exits_triggered:
-            logger.info(f"Drop stops: exited {len(exits_triggered)} positions")
-        else:
-            logger.info(f"Drop stops: no triggers ({len(positions)} positions checked)")
-
-    def _exit_single_position(self, symbol: str, reason: str):
-        """Exit a single position with market sell."""
-        position = self.position_mgr.positions.get(symbol)
-        if not position:
-            return
-
-        qty = position.quantity
-        sell_resp = self.position_mgr._submit_sell_order(symbol, qty)
-        if not sell_resp:
-            # Fallback: limit sell
-            last_price = self.position_mgr._get_last_price(symbol)
-            if last_price and last_price > 0:
-                limit_price = round(last_price * 0.97, 4)
-                sell_resp = self.position_mgr._submit_sell_order(symbol, qty, "limit", limit_price)
-
-        if not sell_resp:
-            logger.error(f"Failed to exit {symbol} ({reason})")
-            return
-
-        order_id = sell_resp.get("id")
-        if order_id:
-            fill = self.position_mgr.get_order_fill(order_id, max_wait=30)
-            if fill:
-                filled_qty = int(fill["filled_qty"])
-                exit_price = fill["filled_avg_price"]
-                pnl = (exit_price - position.entry_price) * filled_qty
-                pnl_pct = ((exit_price / position.entry_price) - 1) * 100
-                logger.info(
-                    f"EXIT {symbol}: {filled_qty} @ {exit_price:.4f} "
-                    f"(P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) — {reason}"
-                )
-                if filled_qty >= position.quantity:
-                    self.position_mgr.positions.pop(symbol, None)
+        # 3) Fill missing open prices from first minute bar
+        for symbol in symbols:
+            if symbol not in self.open_prices:
+                bars = minute_bars.get(symbol, [])
+                if bars:
+                    bar_open = bars[0].get("o")
+                    if bar_open and bar_open > 0:
+                        self.open_prices[symbol] = bar_open
+                        logger.info(f"V2 CLASSIFY: {symbol} open from first minute bar: {bar_open:.4f}")
+                    else:
+                        logger.warning(f"V2 CLASSIFY: {symbol} no usable open price — will default to 10:00")
                 else:
-                    position.quantity -= filled_qty
-                    logger.warning(f"Partial exit {symbol}: {filled_qty}/{qty}, {position.quantity} remaining")
-            else:
-                logger.error(f"No fill confirmation for {symbol} exit")
+                    logger.warning(f"V2 CLASSIFY: {symbol} no minute bars and no open — will default to 10:00")
 
-    def _exit_all_positions(self, reason: str):
-        """Exit ALL remaining positions with market sells."""
-        positions = list(self.position_mgr.positions.keys())
-        if not positions:
-            logger.info(f"{reason}: no positions to exit")
+        # 4) Build entry_prices for gap logging
+        entry_prices = {s: p.entry_price for s, p in positions}
+
+        # 5) Classify all positions
+        classifications = classify_positions(
+            symbols=symbols,
+            open_prices=self.open_prices,
+            snapshots_935=snapshots,
+            minute_bars=minute_bars,
+            entry_prices=entry_prices,
+        )
+
+        # 5) Store schedule (symbol → exit_bucket)
+        self.exit_schedule = {sym: cls.exit_time for sym, cls in classifications.items()}
+
+        # 6) Execute immediate 9:35 exits
+        exits_935 = [sym for sym, cls in classifications.items()
+                     if cls.exit_time == EXIT_BUCKET_935]
+        if exits_935:
+            logger.info(f"V2 EXIT: executing {len(exits_935)} immediate 9:35 exits")
+            for symbol in exits_935:
+                self._exit_single_position(symbol, "V2: strong open + above VWAP → 9:35 exit")
+        else:
+            logger.info("V2 EXIT: no positions in 9:35 bucket")
+
+    def _exit_bucket(self, bucket: str, reason: str):
+        """Exit all positions scheduled for the given time bucket."""
+        symbols = [sym for sym, t in self.exit_schedule.items()
+                   if t == bucket and sym in self.position_mgr.positions]
+        if not symbols:
+            logger.info(f"{reason}: no positions in this bucket")
             return
 
-        logger.info(f"{reason}: exiting {len(positions)} positions")
-        for symbol in positions:
+        logger.info(f"{reason}: exiting {len(symbols)} positions: {symbols}")
+        for symbol in symbols:
             self._exit_single_position(symbol, reason)
 
         # Check what's left
         remaining = self.position_mgr.get_position_count()
-        if remaining > 0:
-            logger.warning(f"{reason}: {remaining} positions still remaining after exit attempt")
-        else:
-            logger.info(f"{reason}: all positions exited successfully")
+        logger.info(f"{reason}: done — {remaining} total positions remaining")
+
+    def _exit_single_position(self, symbol: str, reason: str):
+        """Exit a single position — delegates to position_mgr._exit_position().
+
+        That method handles: market sell → limit fallback → partial fill
+        resubmit → local state cleanup.  We only need to check whether the
+        symbol is fully gone afterwards and persist state.
+        """
+        if symbol not in self.position_mgr.positions:
+            return
+
+        self.position_mgr._exit_position(symbol, reason)
+
+        still_held = symbol in self.position_mgr.positions
+        if still_held:
+            remaining = self.position_mgr.positions[symbol].quantity
+            # Re-route to next bucket so leftovers are retried automatically
+            current_bucket = self.exit_schedule.get(symbol)
+            next_bucket = None
+            if current_bucket == EXIT_BUCKET_935:
+                next_bucket = EXIT_BUCKET_1000
+            elif current_bucket == EXIT_BUCKET_1000:
+                next_bucket = EXIT_BUCKET_1100
+            elif current_bucket == EXIT_BUCKET_1100:
+                next_bucket = EXIT_BUCKET_1400
+
+            if next_bucket:
+                self.exit_schedule[symbol] = next_bucket
+                logger.warning(
+                    f"EXIT INCOMPLETE {symbol}: {remaining} shares still held — "
+                    f"re-routed {current_bucket} → {next_bucket}"
+                )
+            else:
+                logger.warning(
+                    f"EXIT INCOMPLETE {symbol}: {remaining} shares still held in "
+                    f"last bucket ({current_bucket}) — failsafe will catch"
+                )
+        self._save_state()
 
     # ════════════════════════════════════════════════════════════
     # AFTERNOON DATA & SCORING METHODS
@@ -609,7 +709,7 @@ class OvernightMomentumBot:
                         symbol=symbol,
                         entry_price=fill_price,
                         quantity=filled_qty,
-                        entry_time=datetime.now(),
+                        entry_time=datetime.now(_ET),
                         entry_gap_pct=0.0,
                         adv_estimate=candidate.adv_dollars,
                         peak_price=fill_price,
@@ -760,11 +860,15 @@ class OvernightMomentumBot:
 
             # Save bot state
             bot_state = {
-                "date": datetime.now().strftime("%Y-%m-%d"),
+                "date": datetime.now(_ET).strftime("%Y-%m-%d"),
                 "morning_exits_done": self.morning_exits_done,
                 "hard_stops_checked": self.hard_stops_checked,
-                "drop_stops_checked": self.drop_stops_checked,
-                "final_exit_done": self.final_exit_done,
+                "v2_classified": self.v2_classified,
+                "exit_schedule": self.exit_schedule,
+                "exits_1000_done": self.exits_1000_done,
+                "exits_1100_done": self.exits_1100_done,
+                "exits_1400_done": self.exits_1400_done,
+                "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
                 "scoring_done": self.scoring_done,
                 "entries_done": self.entries_done,
@@ -776,7 +880,7 @@ class OvernightMomentumBot:
 
     def _load_state(self):
         """Load state from previous run (same-day recovery only)."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(_ET).strftime("%Y-%m-%d")
         bot_state = self.state_mgr.load_bot_state()
 
         if not bot_state or bot_state.get("date") != today:
@@ -792,8 +896,12 @@ class OvernightMomentumBot:
         logger.info("Restoring same-day bot state")
         self.morning_exits_done = bot_state.get("morning_exits_done", False)
         self.hard_stops_checked = bot_state.get("hard_stops_checked", False)
-        self.drop_stops_checked = bot_state.get("drop_stops_checked", False)
-        self.final_exit_done = bot_state.get("final_exit_done", False)
+        self.v2_classified = bot_state.get("v2_classified", False)
+        self.exit_schedule = bot_state.get("exit_schedule", {})
+        self.exits_1000_done = bot_state.get("exits_1000_done", False)
+        self.exits_1100_done = bot_state.get("exits_1100_done", False)
+        self.exits_1400_done = bot_state.get("exits_1400_done", False)
+        self.post_exit_failsafe_done = bot_state.get("post_exit_failsafe_done", False)
         self.data_collected = bot_state.get("data_collected", False)
         self.scoring_done = bot_state.get("scoring_done", False)
         self.entries_done = bot_state.get("entries_done", False)
