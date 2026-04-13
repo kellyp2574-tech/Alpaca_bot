@@ -566,7 +566,7 @@ class PositionManager:
 
     def build_entry_plans(self, candidates: List, capital_override: Optional[float] = None) -> Dict[str, EntryExecutionPlan]:
         """LEGACY — staged gap-strategy entry plans. Not used by overnight momentum."""
-        raise NotImplementedError("build_entry_plans is legacy code; overnight strategy sizes in momentum_scorer.select_positions")
+        raise NotImplementedError("build_entry_plans is legacy code; overnight strategy sizes in momentum_scorer.allocate_head_tail")
 
     def submit_open_entry_orders(self, plans: Dict[str, EntryExecutionPlan], state_saver=None) -> None:
         """LEGACY — gap-strategy open entry orders. Not used by overnight momentum."""

@@ -8,9 +8,10 @@ Pipeline:
 2. compute_raw_metrics_350()      — populate 7 raw metrics
 3. normalize_and_score_350()      — z-score + weighted composite
 4. assign_buckets()               — decile 1-10
-5. select_positions()             — pick + size using SelectionConfig
+5. allocate_head_tail()            — HEAD/TAIL position sizing
 """
 import logging
+import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -258,75 +259,156 @@ def assign_buckets(candidates: List[MomentumCandidate]) -> List[MomentumCandidat
 
 
 # ──────────────────────────────────────────────────────────────
-# Step 5: Selection + sizing
+# Step 5: HEAD / TAIL position allocation
 # ──────────────────────────────────────────────────────────────
 
-def select_positions(
+@dataclass
+class Allocation:
+    """Single position allocation produced by the HEAD/TAIL allocator."""
+    symbol: str
+    shares: int
+    rank: int
+    alloc_bucket: str            # "HEAD" or "TAIL"
+    candidate: MomentumCandidate # reference to scored candidate
+
+
+def allocate_head_tail(
     candidates: List[MomentumCandidate],
-    equity: float,
-    sel: Optional[SelectionConfig] = None,
-) -> Tuple[List[MomentumCandidate], Dict[str, int]]:
-    """Select positions and compute share quantities.
+    total_capital: float,
+    min_bucket: int = 4,
+) -> List[Allocation]:
+    """HEAD/TAIL position allocator — runs once per day before entry.
+
+    Decision tree:
+      1. Rank candidates by composite_score descending.
+      2. Split: head = top MAX_HEAD_POSITIONS, tail = rest.
+      3. HEAD (HEAD_PCT of capital): equal-weight, ADV-capped, MIN_SHARES gate.
+         Unspent capital rolls into tail.
+      4. TAIL (TAIL_PCT + leftover): waterfall until capital or position cap exhausted.
+      5. Combine and return.
 
     Args:
         candidates: Scored + bucketed candidates.
-        equity: Current account equity.
-        sel: Runtime selection config (from get_selection_config). Falls back
-             to default if None.
+        total_capital: Deployable cash (equity × leverage).
+        min_bucket: Minimum score-decile to be eligible (default 4).
 
     Returns:
-        (selected_candidates, {symbol: num_shares})
+        List[Allocation] ordered head-first then tail by rank.
     """
-    if sel is None:
-        sel = get_selection_config(equity)
+    adv_cap_pct = config.ADV_CAP_PCT
+    min_shares = config.MIN_SHARES
+    max_head = config.MAX_HEAD_POSITIONS
+    max_total = config.MAX_TOTAL_POSITIONS
+    head_pct = config.HEAD_PCT
+    tail_pct = config.TAIL_PCT
 
-    # Filter by minimum bucket
-    eligible = [c for c in candidates if c.bucket >= sel.min_bucket]
+    # ── Step 1: filter + rank ────────────────────────────
+    eligible = [c for c in candidates if c.bucket >= min_bucket]
     if not eligible:
-        logger.warning(f"No candidates with bucket >= {sel.min_bucket}")
-        return [], {}
+        logger.warning(f"No candidates with bucket >= {min_bucket}")
+        return []
 
-    # Sort by composite score descending
     eligible.sort(key=lambda c: c.composite_score, reverse=True)
 
-    # Select based on mode
-    if sel.selection_mode == "top10":
-        selected = eligible[:10]
-    elif sel.selection_mode == "top20":
-        selected = eligible[:20]
-    elif sel.selection_mode == "bucket":
-        selected = eligible
-    else:
-        logger.error(f"Unknown selection mode: {sel.selection_mode}")
-        selected = eligible[:10]
+    # ── Step 2: split HEAD / TAIL ────────────────────────
+    head_candidates = eligible[:max_head]
+    tail_candidates = eligible[max_head:]
 
-    selected = selected[:sel.max_positions]
-    if not selected:
-        return [], {}
+    # ── Step 3: allocate HEAD (equal-weight) ─────────────
+    head_capital = total_capital * head_pct
+    slot_size = head_capital / len(head_candidates) if head_candidates else 0
 
-    # Position sizing: equal weight, ADV-capped
-    deployable = equity * sel.max_leverage
-    weight = 1.0 / len(selected)
-    dollar_per_position = deployable * weight
+    head_allocations: List[Allocation] = []
+    head_leftover = 0.0
 
-    sizing: Dict[str, int] = {}
-    for c in selected:
-        alloc = min(dollar_per_position, sel.max_position_dollars)
+    for rank, c in enumerate(head_candidates, start=1):
+        if c.signal_price <= 0:
+            head_leftover += slot_size
+            continue
+
+        max_dollars = min(slot_size, c.adv_dollars * adv_cap_pct) if c.adv_dollars > 0 else slot_size
+        shares = math.floor(max_dollars / c.signal_price)
+
+        if shares < min_shares:
+            head_leftover += slot_size      # roll full slot forward
+            logger.info(
+                f"HEAD skip {c.symbol}: {shares} shares < {min_shares} min "
+                f"(price={c.signal_price:.2f}, slot=${slot_size:,.0f}, "
+                f"adv_cap=${c.adv_dollars * adv_cap_pct:,.0f})"
+            )
+            continue
+
+        cost = shares * c.signal_price
+        head_allocations.append(Allocation(
+            symbol=c.symbol,
+            shares=shares,
+            rank=rank,
+            alloc_bucket="HEAD",
+            candidate=c,
+        ))
+        head_leftover += (slot_size - cost)
+
+    # ── Step 4: allocate TAIL (waterfall) ────────────────
+    tail_capital = total_capital * tail_pct + head_leftover
+    remaining_cash = tail_capital
+    positions_count = len(head_allocations)
+
+    tail_allocations: List[Allocation] = []
+
+    for rank_offset, c in enumerate(tail_candidates, start=max_head + 1):
+        if positions_count >= max_total:
+            break
         if c.signal_price <= 0:
             continue
-        desired_shares = int(alloc / c.signal_price)
+        if remaining_cash < c.signal_price * min_shares:
+            break
 
-        # ADV cap
-        if c.adv_dollars > 0:
-            adv_dollar_cap = c.adv_dollars * sel.adv_cap_pct
-            max_shares_by_adv = int(adv_dollar_cap / c.signal_price)
-            desired_shares = min(desired_shares, max_shares_by_adv)
+        max_dollars = min(remaining_cash, c.adv_dollars * adv_cap_pct) if c.adv_dollars > 0 else remaining_cash
+        shares = math.floor(max_dollars / c.signal_price)
 
-        if desired_shares > 0:
-            sizing[c.symbol] = desired_shares
+        if shares < min_shares:
+            continue        # skip, do NOT consume cash
 
+        cost = shares * c.signal_price
+        tail_allocations.append(Allocation(
+            symbol=c.symbol,
+            shares=shares,
+            rank=rank_offset,
+            alloc_bucket="TAIL",
+            candidate=c,
+        ))
+        remaining_cash -= cost
+        positions_count += 1
+
+    # ── Step 5: combine ──────────────────────────────────
+    final = head_allocations + tail_allocations
+
+    # ── Step 6: safety ───────────────────────────────────
+    total_cost = sum(a.shares * a.candidate.signal_price for a in final)
+    if total_cost > total_capital * 1.001:  # tiny float tolerance
+        logger.error(
+            f"Allocation exceeds capital: ${total_cost:,.2f} > ${total_capital:,.2f}"
+        )
+
+    # ── Logging ──────────────────────────────────────────
+    head_cost = sum(a.shares * a.candidate.signal_price for a in head_allocations)
+    tail_cost = sum(a.shares * a.candidate.signal_price for a in tail_allocations)
     logger.info(
-        f"Selection: {len(sizing)} positions from {len(eligible)} eligible "
-        f"(mode={sel.selection_mode}, equity=${equity:,.0f}, deployable=${deployable:,.0f})"
+        f"HEAD/TAIL allocation: {len(final)} positions from {len(eligible)} eligible "
+        f"(capital=${total_capital:,.0f})"
     )
-    return selected, sizing
+    logger.info(
+        f"  HEAD: {len(head_allocations)} positions, ${head_cost:,.0f} deployed "
+        f"({head_cost / total_capital * 100:.1f}%)"
+    )
+    logger.info(
+        f"  TAIL: {len(tail_allocations)} positions, ${tail_cost:,.0f} deployed "
+        f"({tail_cost / total_capital * 100:.1f}%)"
+    )
+    logger.info(
+        f"  Total: ${total_cost:,.0f} deployed "
+        f"({total_cost / total_capital * 100:.1f}%), "
+        f"${total_capital - total_cost:,.0f} undeployed"
+    )
+
+    return final

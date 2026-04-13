@@ -49,7 +49,7 @@ The bot scores stocks based on 6 metrics computed from 9:30 AM - 3:50 PM intrada
 |-----------|----------|---------||
 | **3:30 PM** | Data Collection | Build universe (Massive + Alpaca), fetch daily bars for ADV/ATR |
 | **3:48 PM** | Scoring | Fetch 9:30-3:50 minute bars, compute 6 metrics, score & bucket |
-| **3:50 PM** | Entry Execution | Select positions by tier, size, submit market buy orders |
+| **3:50 PM** | Entry Execution | HEAD/TAIL allocation → execution gate → market buy orders |
 | **4:00 PM** | Market Close | Save positions to state, hold overnight |
 
 ---
@@ -106,40 +106,89 @@ If a position doesn't fully exit, it's automatically re-scheduled to the next bu
 
 ## Position Sizing & Selection
 
-### Account Tier System
+### HEAD/TAIL Allocation System
 
-Positions selected based on account equity:
+Capital is split into two pools with different allocation strategies:
 
-| Equity Range | Selection Mode | Min Bucket | Max Positions |
-|--------------|----------------|------------|---------------|
-| < $25,000 | Top 10 | 4 | 10 |
-| $25,000 - $100,000 | Top 20 | 4 | 20 |
-| > $100,000 | All bucket ≥4 | 4 | 100 |
+**Capital Split:**
+- **HEAD**: 70% of deployable capital → top 10 positions (equal-weight)
+- **TAIL**: 30% of deployable capital + leftover → remaining positions (waterfall)
 
-### Position Sizing
-
-**Equal weight allocation:**
+**Deployable Capital:**
 ```python
-per_position_budget = equity / num_positions
+deployable = equity × MAX_LEVERAGE  # 1.0 = cash account
 ```
+
+---
+
+### HEAD Allocation (Top 10 - Equal Weight)
+
+**Slot Size:**
+```python
+slot_size = (deployable × 0.70) / 10
+```
+
+**Per-Position Sizing:**
+```python
+max_dollars = min(slot_size, ADV × 0.003)  # ADV cap
+shares = floor(max_dollars / price)
+
+if shares < 25:  # MIN_SHARES gate
+    skip position, roll full slot to TAIL
+```
+
+**Characteristics:**
+- Concentrates capital in highest-conviction positions
+- Equal weight ensures balanced exposure
+- Unspent slots (price too high, ADV too low) roll to TAIL
+
+---
+
+### TAIL Allocation (Positions 11+ - Waterfall)
+
+**Starting Capital:**
+```python
+tail_capital = (deployable × 0.30) + HEAD_leftover
+```
+
+**Waterfall Logic:**
+```python
+for each candidate (ranked 11+):
+    max_dollars = min(remaining_cash, ADV × 0.003)
+    shares = floor(max_dollars / price)
+    
+    if shares < 25:
+        skip (do NOT consume cash)
+    
+    deploy shares, subtract cost from remaining_cash
+    
+    stop when:
+        - remaining_cash < (price × 25)
+        - OR total_positions >= 50
+```
+
+**Characteristics:**
+- Opportunistic: takes as many positions as capital allows
+- Diversification: spreads remaining capital across lower-ranked candidates
+- Hard cap: 50 total positions (HEAD + TAIL)
+
+---
+
+### Sizing Constraints
 
 **Liquidity cap (0.3% of ADV):**
 ```python
-max_shares = (ADV × 0.003) / current_price
+max_shares = (ADV × 0.003) / price
 ```
 
-**Absolute cap:**
+**Minimum position:**
 ```python
-max_position_dollars = $50,000
+MIN_SHARES = 25  # Skip if below this threshold
 ```
 
-**Final quantity:**
+**Maximum positions:**
 ```python
-qty = min(
-    per_position_budget / price,
-    ADV × 0.003 / price,
-    $50,000 / price
-)
+MAX_TOTAL_POSITIONS = 50  # Hard cap (HEAD + TAIL)
 ```
 
 ### Universe Filters
@@ -396,7 +445,13 @@ SCORE_WEIGHT_ATR_PCT = -0.10  # Negative = volatility penalty
 ```python
 MAX_LEVERAGE = 1.0            # No margin (cash account)
 ADV_CAP_PCT = 0.003           # 0.3% of ADV max position
-MAX_POSITION_DOLLARS = 50_000 # Absolute dollar cap
+MIN_SHARES = 25               # Minimum position size
+
+# HEAD/TAIL allocation
+HEAD_PCT = 0.70               # 70% capital to top 10
+TAIL_PCT = 0.30               # 30% capital to rest
+MAX_HEAD_POSITIONS = 10       # Equal-weight top N
+MAX_TOTAL_POSITIONS = 50      # Hard cap (HEAD + TAIL)
 ```
 
 ### Exit Rules (`config_strategy.py`)

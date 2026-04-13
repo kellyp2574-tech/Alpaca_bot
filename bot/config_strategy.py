@@ -22,11 +22,17 @@ STRATEGY_TIERS = [
 ]
 
 # ═══════════════════════════════════════════════════
-# Position sizing
+# Position sizing — HEAD / TAIL allocation
 # ═══════════════════════════════════════════════════
 MAX_LEVERAGE = 1.0          # 1.0 = no margin (cash account)
 ADV_CAP_PCT = 0.003         # 0.3% of ADV max position size
-MAX_POSITION_DOLLARS = 50_000  # Absolute dollar cap per position
+MAX_POSITION_DOLLARS = 50_000  # Legacy: absolute dollar cap (used by position_manager)
+MIN_SHARES = 25             # Minimum share count per position
+
+HEAD_PCT = 0.70             # 70% of capital to top-ranked positions
+TAIL_PCT = 0.30             # 30% of capital to remaining candidates
+MAX_HEAD_POSITIONS = 10     # Equal-weight top N
+MAX_TOTAL_POSITIONS = 50    # Hard cap including head + tail
 
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
@@ -73,5 +79,4 @@ SECTOR_ETFS = {
 MARKET_BENCHMARK = "SPY"
 
 # Compat: legacy position_manager methods reference MAX_POSITIONS directly.
-# Resolved from the largest tier so old code doesn't crash if invoked.
-MAX_POSITIONS = max(t["max_positions"] for t in STRATEGY_TIERS)
+MAX_POSITIONS = MAX_TOTAL_POSITIONS

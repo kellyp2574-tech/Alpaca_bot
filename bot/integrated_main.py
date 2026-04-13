@@ -34,13 +34,12 @@ from bot.massive_client import MassiveClient
 from bot.market_data import AlpacaDataClient
 from bot.momentum_scorer import (
     MomentumCandidate,
-    SelectionConfig,
-    get_selection_config,
+    Allocation,
     build_signal_candidates_350,
     compute_raw_metrics_350,
     normalize_and_score_350,
     assign_buckets,
-    select_positions,
+    allocate_head_tail,
 )
 from bot.exit_classifier import (
     classify_positions,
@@ -627,7 +626,7 @@ class OvernightMomentumBot:
             self.scoring_done = True
 
     def _step_execute_entries(self):
-        """3:50 PM: Select positions via account tier, size, execute market buys."""
+        """3:50 PM: HEAD/TAIL allocation → execution-gate → market buys."""
         logger.info("=" * 50)
         logger.info("ENTRY EXECUTION: Submitting market buy orders")
         logger.info("=" * 50)
@@ -641,25 +640,25 @@ class OvernightMomentumBot:
                 self.entries_done = True
                 return
 
-            # Get account equity and choose tier
+            # Get account equity → deployable capital
             equity = self.position_mgr.get_account_equity()
             if not equity or equity <= 0:
                 logger.error("Cannot determine account equity — skipping entries")
                 self.entries_done = True
                 return
 
-            logger.info(f"Account equity: ${equity:,.2f}")
-            sel = get_selection_config(equity)
+            deployable = equity * config.MAX_LEVERAGE
+            logger.info(f"Account equity: ${equity:,.2f}, deployable: ${deployable:,.2f}")
 
-            # Select and size positions
-            selected, sizing = select_positions(self.scored_candidates, equity, sel)
+            # HEAD/TAIL allocation
+            allocations = allocate_head_tail(self.scored_candidates, deployable)
 
-            if not sizing:
-                logger.warning("No positions selected after sizing — skipping entries")
+            if not allocations:
+                logger.warning("No positions allocated — skipping entries")
                 self.entries_done = True
                 return
 
-            exec_diag.selected_symbols = [c.symbol for c in selected if sizing.get(c.symbol, 0) > 0]
+            exec_diag.selected_symbols = [a.symbol for a in allocations]
 
             # Execution eligibility gate — fetch fresh snapshots, reject unorderable
             fresh_snaps = self.alpaca.get_snapshots(exec_diag.selected_symbols)
@@ -674,18 +673,16 @@ class OvernightMomentumBot:
             if exec_rejected:
                 for sym, reason in exec_rejected.items():
                     logger.warning(f"Execution reject {sym}: {reason}")
-                    sizing.pop(sym, None)
 
             # Submit market buy orders
             total_deployed = 0.0
 
-            for candidate in selected:
-                if candidate.symbol not in orderable_set:
+            for alloc in allocations:
+                symbol = alloc.symbol
+                if symbol not in orderable_set:
                     continue
-                symbol = candidate.symbol
-                qty = sizing.get(symbol, 0)
-                if qty <= 0:
-                    continue
+                qty = alloc.shares
+                candidate = alloc.candidate
 
                 buy_resp = self.position_mgr.submit_buy_order(symbol, qty)
                 if not buy_resp:
@@ -722,10 +719,13 @@ class OvernightMomentumBot:
                         "qty": filled_qty, "price": round(fill_price, 4),
                         "score": round(candidate.composite_score, 4),
                         "bucket": candidate.bucket,
+                        "alloc_bucket": alloc.alloc_bucket,
+                        "rank": alloc.rank,
                     }
 
                     logger.info(
                         f"ENTRY {symbol}: {filled_qty} @ {fill_price:.4f} "
+                        f"[{alloc.alloc_bucket} #{alloc.rank}] "
                         f"(score={candidate.composite_score:.3f}, bucket={candidate.bucket})"
                     )
                 else:
@@ -736,6 +736,10 @@ class OvernightMomentumBot:
             self._save_state()
 
             # Store execution stats for health report
+            head_filled = sum(1 for s in exec_diag.filled_symbols
+                              if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "HEAD")
+            tail_filled = len(exec_diag.filled_symbols) - head_filled
+
             self._exec_stats = {
                 "selected": len(exec_diag.selected_symbols),
                 "orderable": len(exec_diag.orderable_symbols),
@@ -743,12 +747,15 @@ class OvernightMomentumBot:
                 "exec_rejected_reasons": exec_diag.rejected_symbols,
                 "orders_submitted": len(exec_diag.submitted_symbols),
                 "entries_filled": len(exec_diag.filled_symbols),
+                "head_filled": head_filled,
+                "tail_filled": tail_filled,
                 "total_deployed": total_deployed,
                 "equity": equity,
             }
 
             logger.info(
-                f"Entry execution complete: {len(exec_diag.filled_symbols)} filled, "
+                f"Entry execution complete: {len(exec_diag.filled_symbols)} filled "
+                f"({head_filled} HEAD + {tail_filled} TAIL), "
                 f"{len(exec_diag.rejected_symbols)} rejected at execution gate, "
                 f"${total_deployed:,.2f} deployed "
                 f"({total_deployed / equity * 100:.1f}% of equity)"

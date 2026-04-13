@@ -19,12 +19,12 @@ UNIVERSE_PRESETS = {
     "midcap": {
         "min_price": 5.0,
         "max_price": 50.0,
-        "min_adv_dollars": 5_000_000,
+        "min_adv_dollars": 3_000_000,
     },
     "higher_capacity": {
         "min_price": 5.0,
         "max_price": 100.0,
-        "min_adv_dollars": 10_000_000,
+        "min_adv_dollars": 3_000_000,
     },
 }
 
