@@ -174,7 +174,9 @@ class PositionManager:
             "time_in_force": "day",
         }
         if order_type == "limit" and limit_price is not None:
-            order_data["limit_price"] = f"{limit_price:.4f}"
+            limit_price = self.round_limit_price(limit_price)
+            decimals = 2 if limit_price >= 1.0 else 4
+            order_data["limit_price"] = f"{limit_price:.{decimals}f}"
 
         try:
             response = self.session.post(url, json=order_data, timeout=10)
@@ -226,6 +228,40 @@ class PositionManager:
             snap = snapshots.get(symbol, {}) if snapshots else {}
             return snap.get("last_price") or snap.get("close")
         except Exception:
+            return None
+
+    @staticmethod
+    def round_limit_price(price: float) -> float:
+        """Round a limit price to a valid Alpaca increment.
+
+        Stocks >= $1.00 must use 2 decimal places.
+        Stocks  < $1.00 may use up to 4 decimal places.
+        """
+        if price >= 1.0:
+            return round(price, 2)
+        return round(price, 4)
+
+    # Sentinel returned by get_broker_position when the broker confirms
+    # it does NOT hold the symbol (HTTP 404).  Distinct from None (API error).
+    BROKER_NOT_FOUND: dict = {}
+
+    def get_broker_position(self, symbol: str) -> Optional[dict]:
+        """Query Alpaca for a single position by symbol.
+
+        Returns:
+            Position dict    — broker holds this symbol.
+            BROKER_NOT_FOUND — broker confirmed it does NOT hold the symbol (404).
+            None             — API / network error (unknown state).
+        """
+        url = f"{self.base_url}/v2/positions/{symbol}"
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 404:
+                return self.BROKER_NOT_FOUND
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error querying broker position for {symbol}: {e}")
             return None
 
     # ────────────────────────────────────────────────────────
@@ -411,42 +447,98 @@ class PositionManager:
         logger.debug(f"Circuit breaker active for {symbol}: {failures} failures, {remaining:.0f}s cooldown remaining")
         return True
 
-    def _exit_position(self, symbol: str, reason: str):
-        """Exit a full position via market sell with limit fallback + partial resubmit."""
+    def _exit_position(self, symbol: str, reason: str) -> dict:
+        """Exit a full position via market sell with limit fallback + partial resubmit.
+
+        Safety checks:
+        - Verifies broker actually holds the position before selling.
+        - Uses round_limit_price() for fallback limit to avoid sub-penny errors.
+        - Never removes local position unless a fill is confirmed.
+
+        Returns:
+            {"filled_qty": int, "fully_closed": bool, "submitted": bool}
+        """
+        result = {"filled_qty": 0, "fully_closed": False, "submitted": False}
+
         position = self.positions.get(symbol)
         if not position:
-            return
+            result["fully_closed"] = True       # nothing to close
+            return result
 
         if self._is_exit_blocked(symbol):
-            return
+            return result
 
-        qty = position.quantity
+        # ── Verify broker actually holds this position ───────────
+        broker_pos = self.get_broker_position(symbol)
+
+        if broker_pos is None:
+            # API error — unknown state; keep local position for retry
+            logger.warning(
+                f"EXIT DEFER {symbol}: broker API error — keeping local position "
+                f"(qty={position.quantity}) for retry"
+            )
+            return result
+
+        if broker_pos is self.BROKER_NOT_FOUND:
+            # Confirmed 404 — broker does NOT hold this symbol
+            logger.warning(
+                f"EXIT SKIP {symbol}: broker confirmed no position "
+                f"(local qty={position.quantity}) — removing from local state"
+            )
+            self.positions.pop(symbol, None)
+            result["fully_closed"] = True
+            return result
+
+        broker_qty = abs(int(float(broker_pos.get("qty", 0))))
+        if broker_qty <= 0:
+            logger.warning(
+                f"EXIT SKIP {symbol}: broker qty=0 — removing from local state"
+            )
+            self.positions.pop(symbol, None)
+            result["fully_closed"] = True
+            return result
+
+        # Use the smaller of local vs broker qty to be safe
+        qty = min(position.quantity, broker_qty)
+        if qty != position.quantity:
+            logger.warning(
+                f"EXIT {symbol}: local qty={position.quantity} but broker qty={broker_qty} "
+                f"— selling {qty}"
+            )
+            position.quantity = qty
+
+        # ── Market sell attempt ──────────────────────────────────
         sell_resp = self._submit_sell_order(symbol, qty)
 
+        # ── Limit fallback with proper price rounding ────────────
         if not sell_resp:
             last_price = self._get_last_price(symbol)
             if last_price and last_price > 0:
-                limit_price = round(last_price * 0.97, 4)
-                logger.warning(f"Market sell failed for {symbol}, trying limit sell @ {limit_price:.4f}")
+                limit_price = self.round_limit_price(last_price * 0.97)
+                logger.warning(f"Market sell failed for {symbol}, trying limit sell @ {limit_price}")
                 sell_resp = self._submit_sell_order(symbol, qty, "limit", limit_price)
 
         if not sell_resp:
             logger.error(f"Failed to exit {symbol} (market + limit both failed) - {reason}")
-            return
+            return result   # position stays for re-routing / retry
+
+        result["submitted"] = True
 
         order_id = sell_resp.get("id")
         if not order_id:
             logger.error(f"Sell order response missing order ID for {symbol}")
-            return
+            return result
 
         fill = self.get_order_fill(order_id, max_wait=30)
+
         if not fill:
-            logger.error(f"Failed to get exit fill for {symbol}")
-            return
+            logger.error(f"No exit fill for {symbol} — position kept for retry ({reason})")
+            return result
 
         exit_price = fill["filled_avg_price"]
         filled_qty = int(fill["filled_qty"])
         fill_status = fill.get("status", "unknown")
+        result["filled_qty"] = filled_qty
 
         pnl = (exit_price - position.entry_price) * filled_qty
         pnl_pct = ((exit_price / position.entry_price) - 1) * 100
@@ -467,11 +559,13 @@ class PositionManager:
                         if resub_fill:
                             resub_qty = int(resub_fill["filled_qty"])
                             remaining -= resub_qty
+                            result["filled_qty"] += resub_qty
                             position.quantity = remaining
 
             if remaining <= 0:
                 logger.info(f"FINAL EXIT {symbol} (resubmit completed): {reason}, status={fill_status}")
                 self.positions.pop(symbol, None)
+                result["fully_closed"] = True
             else:
                 logger.info(
                     f"EXIT {symbol}: {filled_qty} @ {exit_price:.2f} "
@@ -483,6 +577,9 @@ class PositionManager:
                 f"(P&L: {pnl:+.2f}, {pnl_pct:+.1f}%) - {reason}, status={fill_status}"
             )
             del self.positions[symbol]
+            result["fully_closed"] = True
+
+        return result
 
     def force_exit_all(self, reason: str = "force"):
         logger.warning(f"Force exiting all positions: {reason}")
@@ -702,7 +799,7 @@ class PositionManager:
                 if remaining_qty > 0:
                     last_price = self._get_last_price(symbol)
                     if last_price and last_price > 0:
-                        limit_price = round(last_price * 0.97, 4)
+                        limit_price = self.round_limit_price(last_price * 0.97)
                         logger.warning(f"FAILSAFE L2 {symbol}: trying limit sell {remaining_qty} @ {limit_price:.4f}")
                         sell_resp = self._submit_sell_order(symbol, remaining_qty, "limit", limit_price)
                         if sell_resp:
@@ -719,7 +816,7 @@ class PositionManager:
                 if remaining_qty > 0:
                     last_price = self._get_last_price(symbol) or last_price
                     if last_price and last_price > 0:
-                        limit_price = round(last_price * 0.95, 4)
+                        limit_price = self.round_limit_price(last_price * 0.95)
                         half_qty = max(1, remaining_qty // 2)
                         sell_resp = self._submit_sell_order(symbol, half_qty, "limit", limit_price)
                         if sell_resp:

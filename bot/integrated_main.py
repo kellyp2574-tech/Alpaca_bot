@@ -34,6 +34,8 @@ from bot.massive_client import MassiveClient
 from bot.market_data import AlpacaDataClient
 from bot.momentum_scorer import (
     MomentumCandidate,
+    SelectionConfig,
+    get_selection_config,
     Allocation,
     build_signal_candidates_350,
     compute_raw_metrics_350,
@@ -134,6 +136,9 @@ class OvernightMomentumBot:
 
         # Failsafe
         self.post_exit_failsafe_done = False
+
+        # PDT guard: symbols sold today (no same-day re-entry when equity < $50k)
+        self.sold_today: set = set()
 
         # Retry counters
         self.universe_retry_count = 0
@@ -442,21 +447,30 @@ class OvernightMomentumBot:
         for symbol in symbols:
             self._exit_single_position(symbol, reason)
 
-        # Check what's left
+        # Fix 4: reconcile local state with broker after each exit wave
+        actions = self.position_mgr.reconcile_local_positions_from_broker()
+        if actions:
+            logger.info(f"{reason}: post-exit reconciliation adjustments: {actions}")
+            self._save_state()
+
         remaining = self.position_mgr.get_position_count()
         logger.info(f"{reason}: done — {remaining} total positions remaining")
 
     def _exit_single_position(self, symbol: str, reason: str):
         """Exit a single position — delegates to position_mgr._exit_position().
 
-        That method handles: market sell → limit fallback → partial fill
-        resubmit → local state cleanup.  We only need to check whether the
-        symbol is fully gone afterwards and persist state.
+        That method handles: broker position check → market sell → limit
+        fallback → partial fill resubmit → local state cleanup.
+        We check whether the symbol is fully gone afterwards and persist state.
         """
         if symbol not in self.position_mgr.positions:
             return
 
-        self.position_mgr._exit_position(symbol, reason)
+        result = self.position_mgr._exit_position(symbol, reason)
+
+        # PDT guard: only mark as sold if shares actually changed hands
+        if result.get("filled_qty", 0) > 0:
+            self.sold_today.add(symbol)
 
         still_held = symbol in self.position_mgr.positions
         if still_held:
@@ -640,23 +654,39 @@ class OvernightMomentumBot:
                 self.entries_done = True
                 return
 
-            # Get account equity → deployable capital
+            # Get account equity → tier config → deployable capital
             equity = self.position_mgr.get_account_equity()
             if not equity or equity <= 0:
                 logger.error("Cannot determine account equity — skipping entries")
                 self.entries_done = True
                 return
 
-            deployable = equity * config.MAX_LEVERAGE
+            sel = get_selection_config(equity)
+            deployable = equity * sel.max_leverage
             logger.info(f"Account equity: ${equity:,.2f}, deployable: ${deployable:,.2f}")
 
-            # HEAD/TAIL allocation
-            allocations = allocate_head_tail(self.scored_candidates, deployable)
+            # HEAD/TAIL allocation (tier-aware)
+            allocations = allocate_head_tail(self.scored_candidates, deployable, sel=sel)
 
             if not allocations:
                 logger.warning("No positions allocated — skipping entries")
                 self.entries_done = True
                 return
+
+            # Fix 5: PDT guard — skip same-day re-entry when equity < $50k
+            if equity < 50_000 and self.sold_today:
+                before = len(allocations)
+                allocations = [a for a in allocations if a.symbol not in self.sold_today]
+                blocked = before - len(allocations)
+                if blocked:
+                    logger.warning(
+                        f"PDT guard: blocked {blocked} same-day re-entries "
+                        f"(equity ${equity:,.0f} < $50k, sold_today={self.sold_today})"
+                    )
+                if not allocations:
+                    logger.warning("No positions remaining after PDT filter — skipping entries")
+                    self.entries_done = True
+                    return
 
             exec_diag.selected_symbols = [a.symbol for a in allocations]
 
@@ -880,6 +910,7 @@ class OvernightMomentumBot:
                 "scoring_done": self.scoring_done,
                 "entries_done": self.entries_done,
                 "open_prices": self.open_prices,
+                "sold_today": list(self.sold_today),
             }
             self.state_mgr.save_bot_state(bot_state)
         except Exception as e:
@@ -913,6 +944,7 @@ class OvernightMomentumBot:
         self.scoring_done = bot_state.get("scoring_done", False)
         self.entries_done = bot_state.get("entries_done", False)
         self.open_prices = bot_state.get("open_prices", {})
+        self.sold_today = set(bot_state.get("sold_today", []))
 
         # Load positions
         saved = self.state_mgr.load_positions()

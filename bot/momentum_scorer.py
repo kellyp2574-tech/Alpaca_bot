@@ -30,9 +30,11 @@ class SelectionConfig:
     selection_mode: str = "top10"   # "top10", "top20", "bucket"
     min_bucket: int = 4
     max_positions: int = 10
+    max_head_positions: int = 10
     max_leverage: float = 1.0
     adv_cap_pct: float = 0.003
     max_position_dollars: float = 50_000
+    min_shares: int = 25
 
 
 def get_selection_config(equity: float) -> SelectionConfig:
@@ -44,9 +46,11 @@ def get_selection_config(equity: float) -> SelectionConfig:
                 selection_mode=tier["selection_mode"],
                 min_bucket=tier["min_bucket"],
                 max_positions=tier["max_positions"],
+                max_head_positions=min(tier["max_positions"], config.MAX_HEAD_POSITIONS),
                 max_leverage=config.MAX_LEVERAGE,
                 adv_cap_pct=config.ADV_CAP_PCT,
                 max_position_dollars=config.MAX_POSITION_DOLLARS,
+                min_shares=config.MIN_SHARES,
             )
             logger.info(
                 f"Account ${equity:,.0f} → tier {tier['selection_mode']} "
@@ -275,13 +279,13 @@ class Allocation:
 def allocate_head_tail(
     candidates: List[MomentumCandidate],
     total_capital: float,
-    min_bucket: int = 4,
+    sel: Optional[SelectionConfig] = None,
 ) -> List[Allocation]:
     """HEAD/TAIL position allocator — runs once per day before entry.
 
     Decision tree:
       1. Rank candidates by composite_score descending.
-      2. Split: head = top MAX_HEAD_POSITIONS, tail = rest.
+      2. Split: head = top max_head_positions, tail = rest.
       3. HEAD (HEAD_PCT of capital): equal-weight, ADV-capped, MIN_SHARES gate.
          Unspent capital rolls into tail.
       4. TAIL (TAIL_PCT + leftover): waterfall until capital or position cap exhausted.
@@ -290,15 +294,17 @@ def allocate_head_tail(
     Args:
         candidates: Scored + bucketed candidates.
         total_capital: Deployable cash (equity × leverage).
-        min_bucket: Minimum score-decile to be eligible (default 4).
+        sel: Runtime selection config (from get_selection_config). Uses
+             global defaults when None.
 
     Returns:
         List[Allocation] ordered head-first then tail by rank.
     """
-    adv_cap_pct = config.ADV_CAP_PCT
-    min_shares = config.MIN_SHARES
-    max_head = config.MAX_HEAD_POSITIONS
-    max_total = config.MAX_TOTAL_POSITIONS
+    min_bucket = sel.min_bucket if sel else 4
+    adv_cap_pct = sel.adv_cap_pct if sel else config.ADV_CAP_PCT
+    min_shares = sel.min_shares if sel else config.MIN_SHARES
+    max_head = sel.max_head_positions if sel else config.MAX_HEAD_POSITIONS
+    max_total = sel.max_positions if sel else config.MAX_TOTAL_POSITIONS
     head_pct = config.HEAD_PCT
     tail_pct = config.TAIL_PCT
 
