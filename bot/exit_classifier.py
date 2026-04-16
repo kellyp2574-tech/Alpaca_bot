@@ -3,10 +3,10 @@
 At 9:35 AM, each overnight position is classified into an exit time bucket
 based on the first 5 minutes of price action and VWAP trend:
 
-  move_5m_pct < -1.0                       → hold to 2:00 PM  (weak / dropping)
-  move_5m_pct > +1.0  AND  above_vwap      → exit at 9:35     (strong + above VWAP)
-  move_5m_pct > +1.0                        → exit at 11:00 AM (strong, no trend)
-  otherwise                                 → exit at 10:00 AM (default)
+  move_5m_pct < -1.0                       -> hold to 2:00 PM  (weak / dropping)
+  move_5m_pct > +1.0  AND  above_vwap      -> exit at 9:35     (strong + above VWAP)
+  move_5m_pct > +1.0                        -> exit at 11:00 AM (strong, no trend)
+  otherwise                                 -> exit at 10:00 AM (default)
 """
 import logging
 from dataclasses import dataclass, field
@@ -90,19 +90,19 @@ def get_v2_exit_time(move_5m_pct: float, above_vwap: bool) -> str:
     Returns:
         Exit time bucket string ("09:35", "10:00", "11:00", "14:00")
     """
-    # 1) Weak open / drop after open → hold to 2pm
+    # 1) Weak open / drop after open -> hold to 2pm
     if move_5m_pct < WEAK_MOVE_PCT:
         return EXIT_BUCKET_1400
 
-    # 2) Strong open + above VWAP → exit early at 9:35
+    # 2) Strong open + above VWAP -> exit early at 9:35
     if move_5m_pct > STRONG_MOVE_PCT and above_vwap:
         return EXIT_BUCKET_935
 
-    # 3) Strong open but NOT above VWAP → hold to 11am
+    # 3) Strong open but NOT above VWAP -> hold to 11am
     if move_5m_pct > STRONG_MOVE_PCT:
         return EXIT_BUCKET_1100
 
-    # 4) Everything else → default 10am
+    # 4) Everything else -> default 10am
     return EXIT_BUCKET_1000
 
 
@@ -183,7 +183,7 @@ def classify_positions(
             f"V2 EXIT CLASSIFY: {symbol} | "
             f"open={open_price:.4f} price_935={price_935:.4f} "
             f"move_5m={move_5m_pct:+.2f}% vwap={vwap:.4f} "
-            f"above_vwap={price_above_vwap}{gap_str} → EXIT @ {exit_time}"
+            f"above_vwap={price_above_vwap}{gap_str} -> EXIT @ {exit_time}"
         )
 
     # Summary by bucket
@@ -192,6 +192,6 @@ def classify_positions(
         buckets.setdefault(cls.exit_time, []).append(sym)
 
     for bucket, syms in sorted(buckets.items()):
-        logger.info(f"V2 EXIT SCHEDULE: {bucket} → {len(syms)} positions: {syms}")
+        logger.info(f"V2 EXIT SCHEDULE: {bucket} -> {len(syms)} positions: {syms}")
 
     return classifications

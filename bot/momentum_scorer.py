@@ -53,7 +53,7 @@ def get_selection_config(equity: float) -> SelectionConfig:
                 min_shares=config.MIN_SHARES,
             )
             logger.info(
-                f"Account ${equity:,.0f} → tier {tier['selection_mode']} "
+                f"Account ${equity:,.0f} -> tier {tier['selection_mode']} "
                 f"(max_positions={cfg.max_positions})"
             )
             return cfg
@@ -361,18 +361,60 @@ def allocate_head_tail(
 
     tail_allocations: List[Allocation] = []
 
+    # Fix 3 & 4: Keep walking down ranked list until 80% deployed or out of candidates
+    min_deploy_target = total_capital * 0.80  # 80% minimum deployment target
+    deployed_so_far = sum(a.shares * a.candidate.signal_price for a in head_allocations)
+
+    # Fix 1: Track detailed skip reasons for better diagnostics
+    skip_reasons = {
+        "max_positions": 0,
+        "target_reached": 0,
+        "insufficient_cash": 0,
+        "min_shares": 0,
+        "price_zero": 0,
+    }
+
     for rank_offset, c in enumerate(tail_candidates, start=max_head + 1):
-        if positions_count >= max_total:
-            break
         if c.signal_price <= 0:
+            skip_reasons["price_zero"] += 1
             continue
-        if remaining_cash < c.signal_price * min_shares:
+        
+        # Check if we've already hit 80% deployment target
+        if deployed_so_far >= min_deploy_target:
+            skip_reasons["target_reached"] += 1
+            logger.info(f"TAIL: reached 80% deployment target (${deployed_so_far:,.0f}), stopping")
             break
+
+        # Fix 1: Allow exceeding max_positions if we haven't hit 80% target yet
+        if positions_count >= max_total and deployed_so_far < min_deploy_target:
+            logger.warning(
+                f"TAIL: exceeding tier max_positions ({max_total}) to reach 80% deployment target "
+                f"(currently {deployed_so_far / total_capital * 100:.1f}% deployed)"
+            )
+            # Continue anyway to try to reach 80% target
+        elif positions_count >= max_total:
+            skip_reasons["max_positions"] += 1
+            logger.info(f"TAIL: reached max positions ({max_total}) and target met, stopping")
+            break
+
+        # Only stop if we truly can't afford even the minimum viable position
+        min_cost_needed = c.signal_price * min_shares
+        if remaining_cash < min_cost_needed and deployed_so_far < min_deploy_target:
+            # We're below target and can't afford minimum position - keep looking
+            skip_reasons["insufficient_cash"] += 1
+            logger.debug(f"TAIL skip {c.symbol}: insufficient cash for min position (${remaining_cash:,.0f} < ${min_cost_needed:,.0f})")
+            continue
 
         max_dollars = min(remaining_cash, c.adv_dollars * adv_cap_pct) if c.adv_dollars > 0 else remaining_cash
         shares = math.floor(max_dollars / c.signal_price)
 
         if shares < min_shares:
+            # Fix 6: Log why we're skipping due to share rounding
+            skip_reasons["min_shares"] += 1
+            logger.debug(
+                f"TAIL skip {c.symbol}: {shares} shares < {min_shares} min "
+                f"(price=${c.signal_price:.2f}, max_dollars=${max_dollars:,.0f})"
+            )
             continue        # skip, do NOT consume cash
 
         cost = shares * c.signal_price
@@ -384,7 +426,12 @@ def allocate_head_tail(
             candidate=c,
         ))
         remaining_cash -= cost
+        deployed_so_far += cost
         positions_count += 1
+
+        # Log progress toward target
+        deploy_pct = deployed_so_far / total_capital * 100
+        logger.debug(f"TAIL allocated {c.symbol}: {deploy_pct:.1f}% of target deployed so far")
 
     # ── Step 5: combine ──────────────────────────────────
     final = head_allocations + tail_allocations
@@ -399,6 +446,8 @@ def allocate_head_tail(
     # ── Logging ──────────────────────────────────────────
     head_cost = sum(a.shares * a.candidate.signal_price for a in head_allocations)
     tail_cost = sum(a.shares * a.candidate.signal_price for a in tail_allocations)
+    deploy_pct = total_cost / total_capital * 100
+    
     logger.info(
         f"HEAD/TAIL allocation: {len(final)} positions from {len(eligible)} eligible "
         f"(capital=${total_capital:,.0f})"
@@ -413,8 +462,30 @@ def allocate_head_tail(
     )
     logger.info(
         f"  Total: ${total_cost:,.0f} deployed "
-        f"({total_cost / total_capital * 100:.1f}%), "
+        f"({deploy_pct:.1f}%), "
         f"${total_capital - total_cost:,.0f} undeployed"
     )
+
+    # Fix 2: Detailed skip reasons instead of misleading summary
+    skipped_head = len(head_candidates) - len(head_allocations)
+    if skipped_head > 0:
+        logger.info(f"HEAD: {skipped_head} candidates skipped (price=0, ADV caps, or min_shares={min_shares})")
+    
+    # Show detailed TAIL skip reasons
+    total_tail_skips = sum(skip_reasons.values())
+    if total_tail_skips > 0:
+        reasons_str = ", ".join(f"{k}: {v}" for k, v in skip_reasons.items() if v > 0)
+        logger.info(f"TAIL skip reasons: {reasons_str}")
+        
+        # Extra context if we exceeded max_positions
+        if skip_reasons["max_positions"] > 0 and positions_count > max_total:
+            logger.info(f"Note: Exceeded tier max_positions ({max_total}) to reach deployment target")
+    
+    # Warn if below 80% deployment target
+    if deploy_pct < 80.0:
+        logger.warning(
+            f"Deployment below 80% target: {deploy_pct:.1f}% deployed "
+            f"(${total_cost:,.0f} of ${total_capital:,.0f})"
+        )
 
     return final

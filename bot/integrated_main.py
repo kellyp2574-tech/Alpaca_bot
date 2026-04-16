@@ -6,10 +6,10 @@ MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
   09:00  Start, detect overnight positions from broker
   09:30  Market open — hard-stop check (entry_price × 0.95)
   09:35  V2 classification — classify each position by 5-min move + VWAP:
-           move < -1%               → hold to 14:00
-           move > +1% AND VWAP up   → exit immediately at 09:35
-           move > +1%               → hold to 11:00
-           else                     → exit at 10:00 (default)
+           move < -1%               -> hold to 14:00
+           move > +1% AND VWAP up   -> exit immediately at 09:35
+           move > +1%               -> hold to 11:00
+           else                     -> exit at 10:00 (default)
   10:00  Exit "default" bucket
   11:00  Exit "strong-but-flat" bucket
   14:00  Exit "weak/dropping" bucket
@@ -17,7 +17,7 @@ MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca asset filter + daily bars + ADV)
-  15:48  Fetch 9:30-3:50 minute bars → build & score candidates (350 model)
+  15:48  Fetch 9:30-3:50 minute bars -> build & score candidates (350 model)
   15:50  Select positions (account-tier), size, EXECUTE ENTRIES (market)
   16:00  Confirm positions held overnight, save state, done
 """
@@ -422,7 +422,7 @@ class OvernightMomentumBot:
             entry_prices=entry_prices,
         )
 
-        # 5) Store schedule (symbol → exit_bucket)
+        # 5) Store schedule (symbol -> exit_bucket)
         self.exit_schedule = {sym: cls.exit_time for sym, cls in classifications.items()}
 
         # 6) Execute immediate 9:35 exits
@@ -431,7 +431,7 @@ class OvernightMomentumBot:
         if exits_935:
             logger.info(f"V2 EXIT: executing {len(exits_935)} immediate 9:35 exits")
             for symbol in exits_935:
-                self._exit_single_position(symbol, "V2: strong open + above VWAP → 9:35 exit")
+                self._exit_single_position(symbol, "V2: strong open + above VWAP -> 9:35 exit")
         else:
             logger.info("V2 EXIT: no positions in 9:35 bucket")
 
@@ -459,8 +459,8 @@ class OvernightMomentumBot:
     def _exit_single_position(self, symbol: str, reason: str):
         """Exit a single position — delegates to position_mgr._exit_position().
 
-        That method handles: broker position check → market sell → limit
-        fallback → partial fill resubmit → local state cleanup.
+        That method handles: broker position check -> market sell -> limit
+        fallback -> partial fill resubmit -> local state cleanup.
         We check whether the symbol is fully gone afterwards and persist state.
         """
         if symbol not in self.position_mgr.positions:
@@ -489,7 +489,7 @@ class OvernightMomentumBot:
                 self.exit_schedule[symbol] = next_bucket
                 logger.warning(
                     f"EXIT INCOMPLETE {symbol}: {remaining} shares still held — "
-                    f"re-routed {current_bucket} → {next_bucket}"
+                    f"re-routed {current_bucket} -> {next_bucket}"
                 )
             else:
                 logger.warning(
@@ -554,7 +554,7 @@ class OvernightMomentumBot:
                 min_minute_bars=30,
                 diag=self._universe_diag,
             )
-            logger.info(f"Stage C data quality: {pre_c_count} → {len(quality_passed)}")
+            logger.info(f"Stage C data quality: {pre_c_count} -> {len(quality_passed)}")
             self.universe = quality_passed
 
             if not self.universe:
@@ -640,7 +640,7 @@ class OvernightMomentumBot:
             self.scoring_done = True
 
     def _step_execute_entries(self):
-        """3:50 PM: HEAD/TAIL allocation → execution-gate → market buys."""
+        """3:50 PM: HEAD/TAIL allocation -> execution-gate -> market buys."""
         logger.info("=" * 50)
         logger.info("ENTRY EXECUTION: Submitting market buy orders")
         logger.info("=" * 50)
@@ -654,7 +654,7 @@ class OvernightMomentumBot:
                 self.entries_done = True
                 return
 
-            # Get account equity → tier config → deployable capital
+            # Get account equity -> tier config -> deployable capital
             equity = self.position_mgr.get_account_equity()
             if not equity or equity <= 0:
                 logger.error("Cannot determine account equity — skipping entries")
@@ -665,28 +665,30 @@ class OvernightMomentumBot:
             deployable = equity * sel.max_leverage
             logger.info(f"Account equity: ${equity:,.2f}, deployable: ${deployable:,.2f}")
 
-            # HEAD/TAIL allocation (tier-aware)
-            allocations = allocate_head_tail(self.scored_candidates, deployable, sel=sel)
+            # Fix 5: PDT-aware allocation - filter candidates BEFORE allocation
+            if equity < 50_000 and self.sold_today:
+                before = len(self.scored_candidates)
+                eligible_candidates = [c for c in self.scored_candidates if c.symbol not in self.sold_today]
+                blocked = before - len(eligible_candidates)
+                if blocked:
+                    logger.warning(
+                        f"PDT guard: filtered out {blocked} same-day re-entry candidates "
+                        f"before allocation (equity ${equity:,.0f} < $50k, sold_today={self.sold_today})"
+                    )
+                if not eligible_candidates:
+                    logger.warning("No candidates remaining after PDT filter — skipping entries")
+                    self.entries_done = True
+                    return
+            else:
+                eligible_candidates = self.scored_candidates
+
+            # HEAD/TAIL allocation (tier-aware) on PDT-filtered candidates
+            allocations = allocate_head_tail(eligible_candidates, deployable, sel=sel)
 
             if not allocations:
                 logger.warning("No positions allocated — skipping entries")
                 self.entries_done = True
                 return
-
-            # Fix 5: PDT guard — skip same-day re-entry when equity < $50k
-            if equity < 50_000 and self.sold_today:
-                before = len(allocations)
-                allocations = [a for a in allocations if a.symbol not in self.sold_today]
-                blocked = before - len(allocations)
-                if blocked:
-                    logger.warning(
-                        f"PDT guard: blocked {blocked} same-day re-entries "
-                        f"(equity ${equity:,.0f} < $50k, sold_today={self.sold_today})"
-                    )
-                if not allocations:
-                    logger.warning("No positions remaining after PDT filter — skipping entries")
-                    self.entries_done = True
-                    return
 
             exec_diag.selected_symbols = [a.symbol for a in allocations]
 
@@ -783,13 +785,56 @@ class OvernightMomentumBot:
                 "equity": equity,
             }
 
+            # Fix 2: Deployment shortfall diagnostics
+            deployment_pct = total_deployed / equity * 100
             logger.info(
                 f"Entry execution complete: {len(exec_diag.filled_symbols)} filled "
                 f"({head_filled} HEAD + {tail_filled} TAIL), "
                 f"{len(exec_diag.rejected_symbols)} rejected at execution gate, "
                 f"${total_deployed:,.2f} deployed "
-                f"({total_deployed / equity * 100:.1f}% of equity)"
+                f"({deployment_pct:.1f}% of equity)"
             )
+
+            # Explicit shortfall diagnostics
+            if deployment_pct < 80.0:
+                logger.warning("=== DEPLOYMENT SHORTFALL DIAGNOSTICS ===")
+                
+                # PDT blocks (already filtered at allocation stage)
+                if equity < 50_000 and self.sold_today:
+                    blocked_by_pdt = len(self.sold_today.intersection(set([c.symbol for c in self.scored_candidates])))
+                    logger.warning(f"PDT guard blocked {blocked_by_pdt} candidates at allocation stage (equity < $50k)")
+
+                # Execution gate rejections
+                if exec_diag.rejected_symbols:
+                    reasons = {}
+                    for sym, reason in exec_diag.rejected_symbols.items():
+                        reasons.setdefault(reason, []).append(sym)
+                    for reason, syms in reasons.items():
+                        logger.warning(f"Execution gate rejected {len(syms)} symbols: {reason} (e.g., {syms[:3]})")
+
+                # Failed submissions/no fills
+                if exec_diag.failed_submissions:
+                    failed_reasons = {}
+                    for sym, reason in exec_diag.failed_submissions.items():
+                        failed_reasons.setdefault(reason, []).append(sym)
+                    for reason, syms in failed_reasons.items():
+                        logger.warning(f"Failed submissions: {len(syms)} symbols ({reason}) (e.g., {syms[:3]})")
+
+                # Sizing/rounding issues (candidates too small)
+                planned_symbols = set([a.symbol for a in allocations])
+                filled_symbols = set(exec_diag.filled_symbols)
+                not_filled = planned_symbols - filled_symbols
+                if not_filled:
+                    logger.warning(f"Symbols not filled: {len(not_filled)} (e.g., {list(not_filled)[:5]})")
+
+                # Target vs actual deployment
+                target_deploy_pct = deployable / equity * 100
+                logger.warning(
+                    f"Target deployment: ${deployable:,.2f} ({target_deploy_pct:.1f}% of equity) "
+                    f"-> Actual: ${total_deployed:,.2f} ({deployment_pct:.1f}%) "
+                    f"= Gap of ${deployable - total_deployed:,.2f}"
+                )
+                logger.warning("=== END SHORTFALL DIAGNOSTICS ===")
 
         except Exception as e:
             logger.exception(f"Error in entry execution: {e}")

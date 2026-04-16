@@ -37,7 +37,7 @@ MAX_TOTAL_POSITIONS = 50    # Hard cap including head + tail
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
 # ═══════════════════════════════════════════════════
-HARD_STOP_PCT = -0.05       # -5% from entry price → exit at 9:30 open
+HARD_STOP_PCT = -0.05       # -5% from entry price -> exit at 9:30 open
 
 # V2 adaptive exit — positions classified at 9:35 into timed buckets.
 # Thresholds live in exit_classifier.py (STRONG_MOVE_PCT, WEAK_MOVE_PCT).

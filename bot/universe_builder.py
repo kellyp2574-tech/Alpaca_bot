@@ -59,11 +59,11 @@ class UniverseDiagnostics:
     def summary(self) -> str:
         lines = [
             f"Universe pipeline: {self.raw_symbols} raw",
-            f"  → {self.after_asset_type} after asset-type filter",
-            f"  → {self.after_price} after price filter",
-            f"  → {self.after_adv} after ADV filter",
-            f"  → {self.after_data_quality} after data-quality filter",
-            f"  → {self.after_tradability} after tradability filter (final)",
+            f"  -> {self.after_asset_type} after asset-type filter",
+            f"  -> {self.after_price} after price filter",
+            f"  -> {self.after_adv} after ADV filter",
+            f"  -> {self.after_data_quality} after data-quality filter",
+            f"  -> {self.after_tradability} after tradability filter (final)",
         ]
         if self.dropped_by_reason:
             lines.append("  Rejections:")
@@ -441,7 +441,7 @@ def build_universe(
     raw_assets = alpaca.get_tradable_assets_full()
     diag.raw_symbols = len(raw_assets)
     eligible = filter_asset_type(raw_assets, diag)
-    logger.info(f"  Stage A: {diag.raw_symbols} → {diag.after_asset_type}")
+    logger.info(f"  Stage A: {diag.raw_symbols} -> {diag.after_asset_type}")
 
     # Stage B-price: Price filter using Massive snapshot
     logger.info("Universe Stage B: price filter via Massive snapshot...")
@@ -459,7 +459,7 @@ def build_universe(
         eligible, massive_snapshots,
         config.MIN_PRICE, config.MAX_PRICE, diag,
     )
-    logger.info(f"  Stage B-price: {diag.after_asset_type} → {diag.after_price}")
+    logger.info(f"  Stage B-price: {diag.after_asset_type} -> {diag.after_price}")
 
     # Stage B-adv: ADV filter using daily bars
     logger.info("Universe Stage B: ADV filter...")
@@ -471,7 +471,7 @@ def build_universe(
         price_passed, daily_bars, config.MIN_ADV_DOLLARS,
         config.ADV_LOOKBACK_DAYS, diag,
     )
-    logger.info(f"  Stage B-adv: {diag.after_price} → {diag.after_adv}")
+    logger.info(f"  Stage B-adv: {diag.after_price} -> {diag.after_adv}")
 
     # Stage C: deferred — run by orchestrator at 3:48 after minute bars arrive
     diag.after_data_quality = len(adv_passed)
@@ -488,7 +488,7 @@ def build_universe(
         if a.get("tradable") and a.get("status") == "active"
     }
     final = filter_broker_tradable(adv_passed, fresh_tradable_set, diag)
-    logger.info(f"  Stage D: {diag.after_adv} → {diag.after_tradability}")
+    logger.info(f"  Stage D: {diag.after_adv} -> {diag.after_tradability}")
 
     logger.info(diag.summary())
     return final, diag, adv_cache, atr_cache
@@ -607,7 +607,7 @@ def save_candidates_audit(candidates: List[dict]):
 
 @dataclass
 class ExecutionDiagnostics:
-    """Tracks every step from selection → fill for post-day analysis."""
+    """Tracks every step from selection -> fill for post-day analysis."""
     selected_symbols: List[str] = field(default_factory=list)
     orderable_symbols: List[str] = field(default_factory=list)
     rejected_symbols: Dict[str, str] = field(default_factory=dict)

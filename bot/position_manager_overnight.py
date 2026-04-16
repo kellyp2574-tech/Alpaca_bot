@@ -713,7 +713,7 @@ class PositionManager:
                     old_qty = local_pos.quantity
                     local_pos.quantity = qty
                     local_pos.entry_price = avg_entry
-                    logger.warning(f"Broker reconcile: CORRECTED {symbol} qty {old_qty} → {qty}, avg → {avg_entry:.4f}")
+                    logger.warning(f"Broker reconcile: CORRECTED {symbol} qty {old_qty} -> {qty}, avg -> {avg_entry:.4f}")
                     actions[symbol] = "corrected"
 
         local_only = [s for s in list(self.positions.keys()) if s not in broker_map]
