@@ -16,9 +16,9 @@ SCORE_WEIGHT_ATR_PCT = -0.10    # negative = penalty for high volatility
 # Account-tier selection presets
 # ═══════════════════════════════════════════════════
 STRATEGY_TIERS = [
-    {"max_equity": 25_000,  "selection_mode": "top10",  "min_bucket": 4, "max_positions": 10},
-    {"max_equity": 100_000, "selection_mode": "top20",  "min_bucket": 4, "max_positions": 20},
-    {"max_equity": None,    "selection_mode": "bucket",  "min_bucket": 4, "max_positions": 100},
+    {"max_equity": 25_000,  "selection_mode": "top30",  "min_bucket": 4, "max_positions": 30},
+    {"max_equity": 100_000, "selection_mode": "top30",  "min_bucket": 4, "max_positions": 30},
+    {"max_equity": None,    "selection_mode": "top30",  "min_bucket": 4, "max_positions": 30},
 ]
 
 # ═══════════════════════════════════════════════════
@@ -32,7 +32,7 @@ MIN_SHARES = 25             # Minimum share count per position
 HEAD_PCT = 0.70             # 70% of capital to top-ranked positions
 TAIL_PCT = 0.30             # 30% of capital to remaining candidates
 MAX_HEAD_POSITIONS = 10     # Equal-weight top N
-MAX_TOTAL_POSITIONS = 50    # Hard cap including head + tail
+MAX_TOTAL_POSITIONS = 30    # Hard cap including head + tail
 
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
