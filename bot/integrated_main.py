@@ -5,15 +5,11 @@ Daily Schedule (ET) — bot starts at 9:00 AM:
 MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
   09:00  Start, detect overnight positions from broker
   09:30  Market open — hard-stop check (entry_price × 0.95)
-  09:35  V2 classification — classify each position by 5-min move + VWAP:
-           move < -1%               -> hold to 14:00
-           move > +1% AND VWAP up   -> exit immediately at 09:35
-           move > +1%               -> hold to 11:00
-           else                     -> exit at 10:00 (default)
-  10:00  Exit "default" bucket
-  11:00  Exit "strong-but-flat" bucket
-  14:00  Exit "weak/dropping" bucket
-  14:05  Post-exit failsafe verification
+  09:35  Classify each position by open-to-9:35 return:
+           ret > +0.5%   -> exit immediately at 09:35
+           otherwise     -> hold to 11:30
+  11:30  Exit remaining (hold) positions
+  11:35  Post-exit failsafe verification
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca asset filter + daily bars + ADV)
@@ -47,9 +43,7 @@ from bot.exit_classifier import (
     classify_positions,
     ExitClassification,
     EXIT_BUCKET_935,
-    EXIT_BUCKET_1000,
-    EXIT_BUCKET_1100,
-    EXIT_BUCKET_1400,
+    EXIT_BUCKET_1130,
 )
 from bot.position_manager_overnight import PositionManager, Position
 from bot.rate_limiter import get_api_call_count
@@ -124,12 +118,10 @@ class OvernightMomentumBot:
         # Morning stop tracking
         self.hard_stops_checked = False
 
-        # V2 adaptive exit state
+        # Exit state
         self.v2_classified = False                    # 9:35 classification done
         self.exit_schedule: Dict[str, str] = {}       # {symbol: exit_bucket}
-        self.exits_1000_done = False
-        self.exits_1100_done = False
-        self.exits_1400_done = False
+        self.exits_1130_done = False
 
         # Open prices captured at market open (for V2 move calculation)
         self.open_prices: Dict[str, float] = {}
@@ -177,15 +169,13 @@ class OvernightMomentumBot:
             self.morning_exits_done = True
 
         # Pre-compute schedule times from config
-        t_market_open = _parse_config_time(config.MARKET_OPEN_TIME)         # 09:30
-        t_v2_classify = _parse_config_time(config.V2_CLASSIFY_TIME)         # 09:35
-        t_bucket_1000 = _parse_config_time(config.EXIT_BUCKET_1000_TIME)    # 10:00
-        t_bucket_1100 = _parse_config_time(config.EXIT_BUCKET_1100_TIME)    # 11:00
-        t_bucket_1400 = _parse_config_time(config.EXIT_BUCKET_1400_TIME)    # 14:00
-        t_failsafe    = _parse_config_time(config.V2_FAILSAFE_TIME)         # 14:05
-        t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)     # 15:30
-        t_scoring     = _parse_config_time(config.SCORING_TIME)              # 15:48
-        t_entry       = _parse_config_time(config.ENTRY_TIME)                # 15:50
+        t_market_open  = _parse_config_time(config.MARKET_OPEN_TIME)        # 09:30
+        t_v2_classify  = _parse_config_time(config.V2_CLASSIFY_TIME)        # 09:35
+        t_bucket_1130  = _parse_config_time(config.EXIT_BUCKET_1130_TIME)   # 11:30
+        t_failsafe     = _parse_config_time(config.V2_FAILSAFE_TIME)        # 11:35
+        t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)    # 15:30
+        t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:48
+        t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
         t_market_close = dt_time(16, 0)
 
         # If starting after failsafe time with positions, flatten immediately
@@ -231,31 +221,19 @@ class OvernightMomentumBot:
                         self.hard_stops_checked = True
                         self._save_state()
 
-                    # 9:35 AM — V2 classification + immediate 9:35 exits
+                    # 9:35 AM — Classify + execute immediate 9:35 exits
                     if not self.v2_classified and current_time >= t_v2_classify:
                         self._classify_and_exit_v2()
                         self.v2_classified = True
                         self._save_state()
 
-                    # 10:00 AM — Exit "default" bucket
-                    if self.v2_classified and not self.exits_1000_done and current_time >= t_bucket_1000:
-                        self._exit_bucket(EXIT_BUCKET_1000, "V2 scheduled 10:00 AM exit")
-                        self.exits_1000_done = True
+                    # 11:30 AM — Exit remaining (hold) bucket
+                    if self.v2_classified and not self.exits_1130_done and current_time >= t_bucket_1130:
+                        self._exit_bucket(EXIT_BUCKET_1130, "scheduled 11:30 AM exit")
+                        self.exits_1130_done = True
                         self._save_state()
 
-                    # 11:00 AM — Exit "strong-but-flat" bucket
-                    if self.v2_classified and not self.exits_1100_done and current_time >= t_bucket_1100:
-                        self._exit_bucket(EXIT_BUCKET_1100, "V2 scheduled 11:00 AM exit")
-                        self.exits_1100_done = True
-                        self._save_state()
-
-                    # 14:00 — Exit "weak/dropping" bucket
-                    if self.v2_classified and not self.exits_1400_done and current_time >= t_bucket_1400:
-                        self._exit_bucket(EXIT_BUCKET_1400, "V2 scheduled 14:00 exit")
-                        self.exits_1400_done = True
-                        self._save_state()
-
-                    # 14:05 — Post-exit failsafe
+                    # 11:35 — Post-exit failsafe
                     if not self.post_exit_failsafe_done and current_time >= t_failsafe:
                         bc = self.position_mgr.broker_position_count()
                         if bc > 0:
@@ -267,11 +245,11 @@ class OvernightMomentumBot:
                         self.morning_exits_done = True
                         self._save_state()
 
-                    # Early completion — all positions exited before last bucket
+                    # Early completion — all positions exited before 11:30
                     if (self.v2_classified
                             and self.position_mgr.get_position_count() == 0
                             and not self.morning_exits_done):
-                        logger.info("All V2 exits complete — no positions remaining")
+                        logger.info("All exits complete — no positions remaining")
                         self.morning_exits_done = True
                         self._save_state()
 
@@ -418,7 +396,6 @@ class OvernightMomentumBot:
             symbols=symbols,
             open_prices=self.open_prices,
             snapshots_935=snapshots,
-            minute_bars=minute_bars,
             entry_prices=entry_prices,
         )
 
@@ -431,7 +408,7 @@ class OvernightMomentumBot:
         if exits_935:
             logger.info(f"V2 EXIT: executing {len(exits_935)} immediate 9:35 exits")
             for symbol in exits_935:
-                self._exit_single_position(symbol, "V2: strong open + above VWAP -> 9:35 exit")
+                self._exit_single_position(symbol, "move > 0.5% from open -> 9:35 exit")
         else:
             logger.info("V2 EXIT: no positions in 9:35 bucket")
 
@@ -479,11 +456,7 @@ class OvernightMomentumBot:
             current_bucket = self.exit_schedule.get(symbol)
             next_bucket = None
             if current_bucket == EXIT_BUCKET_935:
-                next_bucket = EXIT_BUCKET_1000
-            elif current_bucket == EXIT_BUCKET_1000:
-                next_bucket = EXIT_BUCKET_1100
-            elif current_bucket == EXIT_BUCKET_1100:
-                next_bucket = EXIT_BUCKET_1400
+                next_bucket = EXIT_BUCKET_1130
 
             if next_bucket:
                 self.exit_schedule[symbol] = next_bucket
@@ -947,9 +920,7 @@ class OvernightMomentumBot:
                 "hard_stops_checked": self.hard_stops_checked,
                 "v2_classified": self.v2_classified,
                 "exit_schedule": self.exit_schedule,
-                "exits_1000_done": self.exits_1000_done,
-                "exits_1100_done": self.exits_1100_done,
-                "exits_1400_done": self.exits_1400_done,
+                "exits_1130_done": self.exits_1130_done,
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
                 "scoring_done": self.scoring_done,
@@ -981,9 +952,7 @@ class OvernightMomentumBot:
         self.hard_stops_checked = bot_state.get("hard_stops_checked", False)
         self.v2_classified = bot_state.get("v2_classified", False)
         self.exit_schedule = bot_state.get("exit_schedule", {})
-        self.exits_1000_done = bot_state.get("exits_1000_done", False)
-        self.exits_1100_done = bot_state.get("exits_1100_done", False)
-        self.exits_1400_done = bot_state.get("exits_1400_done", False)
+        self.exits_1130_done = bot_state.get("exits_1130_done", False)
         self.post_exit_failsafe_done = bot_state.get("post_exit_failsafe_done", False)
         self.data_collected = bot_state.get("data_collected", False)
         self.scoring_done = bot_state.get("scoring_done", False)
