@@ -39,8 +39,8 @@ MAX_TOTAL_POSITIONS = 30    # Hard cap including head + tail
 # ═══════════════════════════════════════════════════
 HARD_STOP_PCT = -0.05       # -5% from entry price -> exit at 9:30 open
 
-# Exit rule: ret_open_to_935 > 0.5% -> exit at 9:35, else -> exit at 11:30
-# Threshold lives in exit_classifier.py (UP_MOVE_PCT = 0.5)
+# Exit rule: ret_open_to_935 > EXIT_UP_MOVE_PCT -> exit at 9:35, else -> exit at 11:30
+EXIT_UP_MOVE_PCT = 0.5       # % threshold for immediate 9:35 exit (authoritative)
 V2_FAILSAFE_TIME = "11:35"   # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════

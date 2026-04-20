@@ -122,6 +122,7 @@ class OvernightMomentumBot:
         self.v2_classified = False                    # 9:35 classification done
         self.exit_schedule: Dict[str, str] = {}       # {symbol: exit_bucket}
         self.exits_1130_done = False
+        self.classification_audit: Dict[str, dict] = {}  # {symbol: classification metrics}
 
         # Open prices captured at market open (for V2 move calculation)
         self.open_prices: Dict[str, float] = {}
@@ -348,24 +349,27 @@ class OvernightMomentumBot:
             logger.info(f"Hard stops: no triggers ({len(positions)} positions checked)")
 
     def _classify_and_exit_v2(self):
-        """9:35 AM: V2 exit classification + immediate 9:35 bucket exits.
+        """9:35 AM: Classify positions and execute immediate 9:35 exits.
 
-        Collects 9:35 snapshots and 9:30-9:35 minute bars, classifies each
-        position by 5-min move + VWAP trend, stores the exit schedule, and
-        immediately exits any positions assigned to the 09:35 bucket.
+        Rule: if ret_open_to_935 > EXIT_UP_MOVE_PCT -> exit now at 9:35
+              otherwise -> hold to 11:30 bucket.
+
+        Price sourcing:
+          open_price  : 9:30 snapshot (preferred) or first minute-bar open (fallback)
+          price_935   : last 9:30-9:35 minute-bar close (preferred) or snapshot fallback
         """
         positions = list(self.position_mgr.positions.items())
         if not positions:
-            logger.info("V2 CLASSIFY: no positions to classify")
+            logger.info("EXIT CLASSIFY: no positions to classify")
             return
 
         symbols = [s for s, _ in positions]
-        logger.info(f"V2 CLASSIFY: classifying {len(symbols)} positions")
+        logger.info(f"EXIT CLASSIFY: classifying {len(symbols)} positions")
 
-        # 1) Fetch 9:35 snapshots (current prices)
+        # 1) Fetch 9:35 snapshots (used as price_935 fallback)
         snapshots = self.alpaca.get_snapshots(symbols)
 
-        # 2) Fetch 9:30-9:35 minute bars for VWAP + open-price fallback
+        # 2) Fetch 9:30-9:35 minute bars (primary source for open fallback + price_935)
         today = date.today().isoformat()
         et_offset = _et_utc_offset_str()
         minute_bars = self.alpaca.get_minute_bars(
@@ -374,19 +378,34 @@ class OvernightMomentumBot:
             f"{today}T09:35:00{et_offset}",
         )
 
-        # 3) Fill missing open prices from first minute bar
+        # 3) Resolve open prices, tracking the source for each symbol
+        open_price_sources: Dict[str, str] = {}
         for symbol in symbols:
-            if symbol not in self.open_prices:
+            if symbol in self.open_prices:
+                open_price_sources[symbol] = "snapshot"
+            else:
                 bars = minute_bars.get(symbol, [])
                 if bars:
                     bar_open = bars[0].get("o")
                     if bar_open and bar_open > 0:
                         self.open_prices[symbol] = bar_open
-                        logger.info(f"V2 CLASSIFY: {symbol} open from first minute bar: {bar_open:.4f}")
+                        open_price_sources[symbol] = "minute_bar"
+                        logger.info(
+                            f"EXIT CLASSIFY: {symbol} open from minute-bar fallback: "
+                            f"{bar_open:.4f} (snapshot not available at 9:30)"
+                        )
                     else:
-                        logger.warning(f"V2 CLASSIFY: {symbol} no usable open price — will default to 10:00")
+                        open_price_sources[symbol] = "missing"
+                        logger.warning(
+                            f"EXIT CLASSIFY: {symbol} no usable open price from "
+                            f"snapshot or minute bars — will default to 11:30"
+                        )
                 else:
-                    logger.warning(f"V2 CLASSIFY: {symbol} no minute bars and no open — will default to 10:00")
+                    open_price_sources[symbol] = "missing"
+                    logger.warning(
+                        f"EXIT CLASSIFY: {symbol} no minute bars and no snapshot open "
+                        f"— will default to 11:30"
+                    )
 
         # 4) Build entry_prices for gap logging
         entry_prices = {s: p.entry_price for s, p in positions}
@@ -395,22 +414,36 @@ class OvernightMomentumBot:
         classifications = classify_positions(
             symbols=symbols,
             open_prices=self.open_prices,
+            open_price_sources=open_price_sources,
             snapshots_935=snapshots,
+            minute_bars_935=minute_bars,
             entry_prices=entry_prices,
         )
 
-        # 5) Store schedule (symbol -> exit_bucket)
+        # 6) Store schedule and classification audit
         self.exit_schedule = {sym: cls.exit_time for sym, cls in classifications.items()}
+        self.classification_audit = {
+            sym: {
+                "open_price":        cls.open_price,
+                "price_935":         cls.price_935,
+                "move_5m_pct":       cls.move_5m_pct,
+                "exit_time":         cls.exit_time,
+                "open_price_source": cls.open_price_source,
+                "price_935_source":  cls.price_935_source,
+                "gap_pct":           cls.gap_pct,
+            }
+            for sym, cls in classifications.items()
+        }
 
-        # 6) Execute immediate 9:35 exits
+        # 7) Execute immediate 9:35 exits
         exits_935 = [sym for sym, cls in classifications.items()
                      if cls.exit_time == EXIT_BUCKET_935]
         if exits_935:
-            logger.info(f"V2 EXIT: executing {len(exits_935)} immediate 9:35 exits")
+            logger.info(f"EXIT CLASSIFY: executing {len(exits_935)} immediate 9:35 exits")
             for symbol in exits_935:
-                self._exit_single_position(symbol, "move > 0.5% from open -> 9:35 exit")
+                self._exit_single_position(symbol, f"move > {config.EXIT_UP_MOVE_PCT}% from open -> 9:35 exit")
         else:
-            logger.info("V2 EXIT: no positions in 9:35 bucket")
+            logger.info("EXIT CLASSIFY: no positions in 9:35 bucket")
 
     def _exit_bucket(self, bucket: str, reason: str):
         """Exit all positions scheduled for the given time bucket."""
@@ -921,6 +954,7 @@ class OvernightMomentumBot:
                 "v2_classified": self.v2_classified,
                 "exit_schedule": self.exit_schedule,
                 "exits_1130_done": self.exits_1130_done,
+                "classification_audit": self.classification_audit,
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
                 "scoring_done": self.scoring_done,
@@ -953,6 +987,7 @@ class OvernightMomentumBot:
         self.v2_classified = bot_state.get("v2_classified", False)
         self.exit_schedule = bot_state.get("exit_schedule", {})
         self.exits_1130_done = bot_state.get("exits_1130_done", False)
+        self.classification_audit = bot_state.get("classification_audit", {})
         self.post_exit_failsafe_done = bot_state.get("post_exit_failsafe_done", False)
         self.data_collected = bot_state.get("data_collected", False)
         self.scoring_done = bot_state.get("scoring_done", False)
