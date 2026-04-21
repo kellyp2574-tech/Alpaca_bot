@@ -11,7 +11,7 @@ Automated equity trading strategy on Alpaca that captures overnight momentum by 
 The bot runs a strict two-day cycle:
 
 - **T-1 afternoon (3:30–4:00 PM):** Build a tradeable universe, score candidates on 6 intraday metrics, allocate capital, and submit market buy orders at 3:50 PM. Positions are held overnight.
-- **T+1 morning (9:00–11:35 AM):** Exit every position. Hard stop fires at the 9:30 open. At 9:35 each position is classified by its open-to-9:35 return. Winners (>+0.5%) exit immediately; all others hold to 11:30 AM. A failsafe sweep runs at 11:35 AM.
+- **T+1 morning (9:00–11:35 AM):** Exit every position. At 9:30 the opening price is captured. At 9:35 each position is classified by its open-to-9:35 return — winners (>+0.5%) exit immediately, all others hold to 11:30 AM. A failsafe sweep runs at 11:35 AM.
 
 The bot never holds past 11:35 AM intentionally.
 
@@ -25,7 +25,7 @@ This traces `OvernightMomentumBot.run()` from startup through end of day.
 
 1. Logging is initialised (file + stdout).
 2. `_load_state()` is called:
-   - If `bot_state.json` exists and is dated **today**, all stage flags are restored (`hard_stops_checked`, `v2_classified`, `exits_1130_done`, `data_collected`, `scoring_done`, `entries_done`, `open_prices`, `exit_schedule`, `classification_audit`).
+   - If `bot_state.json` exists and is dated **today**, all stage flags are restored (`v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`, `open_prices`, `exit_schedule`, `classification_audit`).
    - If it is from a **prior day**, it is ignored. `positions.json` is loaded for overnight holds.
 3. `get_broker_positions()` fetches live Alpaca positions:
    - If positions exist → `reconcile_local_positions_from_broker()` syncs local state to broker truth. `morning_exits_done = False`.
@@ -42,23 +42,23 @@ This traces `OvernightMomentumBot.run()` from startup through end of day.
 
 Each second the loop checks `morning_exits_done`. It is `False` so morning logic runs. All time guards are still `False` (before 9:30) so nothing executes yet. The loop sleeps 1 second and repeats.
 
-If local positions are empty but broker still shows positions (e.g. crash recovery), `reconcile_local_positions_from_broker()` fires to rebuild local state before the 9:30 hard stop.
+If local positions are empty but broker still shows positions (e.g. crash recovery), `reconcile_local_positions_from_broker()` fires to rebuild local state before the 9:30 open price capture.
 
 ---
 
-### 9:30 AM — Hard Stop Check (`_check_hard_stops()`)
+### 9:30 AM — Open Price Capture (`_capture_open_prices()`)
 
 **Guard:** `not self.hard_stops_checked and current_time >= 09:30`
 
+**No positions are exited here.** All overnight holds are kept regardless of the opening print.
+
 1. Fetches live Alpaca **snapshots** for all held symbols.
 2. For each position, reads `snapshot["open"]` — the RTH opening print.
-   - If `open` is missing or zero: logs a warning, skips the hard stop for that symbol, defers open price resolution to the 9:35 minute-bar fallback.
-   - If `open` is valid: stores it in `self.open_prices[symbol]` for use at 9:35 classification. Updates `position.current_price`.
-3. Hard stop condition: `open_price <= entry_price × (1 + HARD_STOP_PCT)` → i.e. `open_price <= entry_price × 0.95`.
-4. Every triggered symbol is collected and exited via `_exit_single_position(symbol, "hard stop at open")`.
-5. `hard_stops_checked = True`. State saved.
+   - If `open` is missing or zero: logs a warning, defers open price to the 9:35 minute-bar fallback.
+   - If `open` is valid: stores it in `self.open_prices[symbol]`. Updates `position.current_price`.
+3. State saved.
 
-**After this step:** `self.open_prices` contains a snapshot open for every symbol that had one. Stopped-out positions are gone from `self.position_mgr.positions`.
+**After this step:** `self.open_prices` contains the snapshot open for every symbol that had one. No positions have been touched.
 
 ---
 
@@ -153,18 +153,17 @@ The loop continues ticking every second. `morning_exits_done` is still `False`. 
 
 Calls `build_universe(massive, alpaca)` — a 4-stage pipeline:
 
-**Stage A — Massive snapshot:**
-- Fetches full market snapshot from Massive API.
-- Filters by: price range ($1–$10), tradability flag.
-- Falls back to Alpaca Assets API if Massive is unreachable.
+**Stage A — Alpaca asset list (eligibility):**
+- Calls Alpaca `GET /v2/assets` — this is the authoritative eligibility source.
+- Filters to: US equity, active, tradable, non-OTC, non-ETF/fund, no warrants/rights/units/preferred.
 
-**Stage B — Daily bars + ADV/ATR:**
-- Fetches last 20 days of daily OHLCV bars from Alpaca for all Stage A symbols.
-- Computes **ADV** (20-day average dollar volume). Filters: ADV ≥ $2M.
-- Computes **ATR** (14-day average true range). Stores in `_adv_cache`, `_atr_cache`.
+**Stage B — Price filter (Massive) + ADV/ATR (Alpaca):**
+- Calls Massive API `get_full_market_snapshot()` for current prices. Filters: $1–$10.
+- **If Massive fails**, falls back to Alpaca snapshots automatically.
+- Fetches 20 days of daily OHLCV from Alpaca. Computes **ADV** (≥$2M gate) and **ATR**.
 
-**Stage D — Execution pre-filter:**
-- Runs a tradability pre-check (spread, quote validity) to eliminate obviously unorderable names early.
+**Stage D — Fresh Alpaca tradability re-check:**
+- Second `GET /v2/assets` call to catch any symbols that became restricted after Stage A.
 
 Results saved to `self.universe` (list of symbols). `universe_audit` written to `state/audit/`. `data_collected = True`. State saved.
 
@@ -198,13 +197,13 @@ Six metrics per candidate:
 | `proximity_to_high` | +15% | `signal_price / day_high` |
 | `volume_vs_avg` | +20% | `last_60min_volume / avg_60min_volume` |
 | `volume_trend` | +10% | Recent volume acceleration |
-| `vs_market` | +25% | `intraday_return - spy_return` |
+| `vs_market` | +25% | `intraday_return − spy_return` (difference, stable when SPY near zero) |
 | `atr_percent` | -10% | ATR as % of price (volatility penalty) |
 
 #### 7. Normalize, score, bucket (`normalize_and_score_350()`, `assign_buckets()`)
-- Each metric is normalized to 0–1 across the candidate pool.
-- `composite_score = Σ(metric × weight)`.
-- Candidates assigned to **buckets 1–5** (5 = highest). Only bucket 4+ selected for allocation.
+- Each metric is **z-scored** across the daily candidate pool (mean 0, std 1).
+- `composite_score = Σ(z_metric × weight)`.
+- Candidates assigned to **decile buckets 1–10** (10 = highest score in today's pool, relative ranking). Only bucket ≥ 4 selected for allocation.
 - Sorted descending by `composite_score`.
 
 `scoring_done = True`. Top 20 saved to `state/audit/candidates_YYYY-MM-DD.json`. State saved.
@@ -216,7 +215,9 @@ Six metrics per candidate:
 **Guard:** `self.scoring_done and not self.entries_done and current_time >= 15:50`
 
 #### 1. Get equity and tier config
-`get_account_equity()` → `get_selection_config(equity)` → returns tier thresholds, `max_leverage`, `max_positions`.
+`get_account_equity()` → `get_selection_config(equity)` → returns `min_bucket` (≥4), `max_positions` (30), `max_leverage`.
+
+Note: `selection_mode` has been removed — behavior is determined entirely by `min_bucket`, `max_head_positions`, and `max_positions`.
 
 ```
 deployable = equity × max_leverage  (1.0 for cash accounts)
@@ -293,7 +294,7 @@ Positions are now held overnight. The bot process terminates.
 - Persists across days — loaded at next-day 9:00 AM startup
 
 **`state/bot_state.json`** — date-stamped; ignored if from a prior day
-- `hard_stops_checked`, `v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`
+- `hard_stops_checked` (open-price capture flag), `v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`
 - `data_collected`, `scoring_done`, `entries_done`
 - `open_prices` — `{symbol: open_price}` captured at 9:30
 - `exit_schedule` — `{symbol: "09:35" | "11:30"}`
@@ -381,8 +382,7 @@ MAX_TOTAL_POSITIONS  = 30      # Soft cap; exceeded to reach 80% deployment
 
 ### Exit rules (`config_strategy.py`)
 ```python
-HARD_STOP_PCT         = -0.05   # -5% from entry price at 9:30 open
-EXIT_UP_MOVE_PCT      =  0.5    # ret_open_to_935 > 0.5% -> exit at 9:35
+EXIT_UP_MOVE_PCT =  0.5       # ret_open_to_935 > 0.5% -> exit at 9:35
 V2_CLASSIFY_TIME      = "09:35"
 EXIT_BUCKET_1130_TIME = "11:30"
 V2_FAILSAFE_TIME      = "11:35"
@@ -452,9 +452,8 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 4. **No sector diversification** — Selection is purely momentum-based; can concentrate in a single sector.
 5. **Broker API dependency** — Failsafe and reconciliation rely on broker API availability.
 6. **No real-time alerts** — Bot logs to file only; no push notifications for critical events.
-7. **Fixed stop level** — Hard stop at -5% is not adaptive to per-symbol volatility.
-8. **Minute bar data quality** — Symbols with fewer than 30 bars are excluded from scoring.
-9. **No drawdown protection** — Bot enters positions regardless of recent P&L history.
+7. **Minute bar data quality** — Symbols with fewer than 30 bars are excluded from scoring.
+8. **No drawdown protection** — Bot enters positions regardless of recent P&L history.
 
 ---
 
@@ -462,8 +461,7 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 
 ⚠️ **This is an overnight momentum strategy with significant risks:**
 
-- **Overnight gap risk** — Positions are exposed to after-hours news and gap opens
-- **Stop execution risk** — Gaps can blow through the -5% stop, resulting in larger losses
+- **Overnight gap risk (no hard stop)** — There is no stop-loss. A large gap-down at the open is held through the open and not exited until 9:35 (if it gapped up enough to trigger the rule) or 11:30
 - **Momentum reversal risk** — Late-day strength can reverse overnight
 - **Liquidity risk** — 0.3% ADV cap may not prevent slippage in thin small-cap names
 - **Technology risk** — API failures or bugs could cause missed exits

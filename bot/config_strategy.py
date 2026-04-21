@@ -16,9 +16,9 @@ SCORE_WEIGHT_ATR_PCT = -0.10    # negative = penalty for high volatility
 # Account-tier selection presets
 # ═══════════════════════════════════════════════════
 STRATEGY_TIERS = [
-    {"max_equity": 25_000,  "selection_mode": "top30",  "min_bucket": 4, "max_positions": 30},
-    {"max_equity": 100_000, "selection_mode": "top30",  "min_bucket": 4, "max_positions": 30},
-    {"max_equity": None,    "selection_mode": "top30",  "min_bucket": 4, "max_positions": 30},
+    {"max_equity": 25_000,  "min_bucket": 4, "max_positions": 30},
+    {"max_equity": 100_000, "min_bucket": 4, "max_positions": 30},
+    {"max_equity": None,    "min_bucket": 4, "max_positions": 30},
 ]
 
 # ═══════════════════════════════════════════════════
@@ -37,8 +37,6 @@ MAX_TOTAL_POSITIONS = 30    # Hard cap including head + tail
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
 # ═══════════════════════════════════════════════════
-HARD_STOP_PCT = -0.05       # -5% from entry price -> exit at 9:30 open
-
 # Exit rule: ret_open_to_935 > EXIT_UP_MOVE_PCT -> exit at 9:35, else -> exit at 11:30
 EXIT_UP_MOVE_PCT = 0.5       # % threshold for immediate 9:35 exit (authoritative)
 V2_FAILSAFE_TIME = "11:35"   # Post-exit failsafe verification

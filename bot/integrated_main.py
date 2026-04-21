@@ -4,7 +4,7 @@ Daily Schedule (ET) — bot starts at 9:00 AM:
 
 MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
   09:00  Start, detect overnight positions from broker
-  09:30  Market open — hard-stop check (entry_price × 0.95)
+  09:30  Market open — capture RTH open prices (no exits; all positions held)
   09:35  Classify each position by open-to-9:35 return:
            ret > +0.5%   -> exit immediately at 09:35
            otherwise     -> hold to 11:30
@@ -115,8 +115,8 @@ class OvernightMomentumBot:
         self.scoring_done = False         # 3:48 PM scoring complete
         self.entries_done = False         # 3:50 PM entries executed
 
-        # Morning stop tracking
-        self.hard_stops_checked = False
+        # Morning open price capture
+        self.hard_stops_checked = False   # flag name kept for state-file compat
 
         # Exit state
         self.v2_classified = False                    # 9:35 classification done
@@ -147,6 +147,18 @@ class OvernightMomentumBot:
 
     def run(self):
         """Main bot loop - runs from 9:00 AM until after market close"""
+        try:
+            self._run()
+        except Exception:  # noqa: BLE001
+            logger.critical("UNHANDLED EXCEPTION in run() — bot terminated", exc_info=True)
+            try:
+                self._save_state()
+            except Exception:
+                logger.critical("State save also failed after crash", exc_info=True)
+            raise
+
+    def _run(self):
+        """Inner run — called by run() which wraps it with top-level error handling."""
         logger.info("=" * 60)
         logger.info("Overnight Momentum Bot Starting")
         logger.info("=" * 60)
@@ -216,9 +228,9 @@ class OvernightMomentumBot:
                         self._save_state()
 
                 if has_positions and not self.morning_exits_done:
-                    # 9:30 AM — Hard stop check at market open
+                    # 9:30 AM — Capture RTH open prices (no exits)
                     if not self.hard_stops_checked and current_time >= t_market_open:
-                        self._check_hard_stops()
+                        self._capture_open_prices()
                         self.hard_stops_checked = True
                         self._save_state()
 
@@ -300,53 +312,39 @@ class OvernightMomentumBot:
     # MORNING EXIT METHODS
     # ════════════════════════════════════════════════════════════
 
-    def _check_hard_stops(self):
-        """9:30 AM: Check if any position opened below hard stop level (entry × 0.95)."""
-        logger.info("HARD STOP CHECK: checking opening prices against entry stops")
+    def _capture_open_prices(self):
+        """9:30 AM: Fetch RTH open prices for all positions and store for 9:35 classification.
+
+        No exits are triggered here. All positions are held regardless of the
+        opening print. The 9:35 classifier uses these open prices to compute
+        ret_open_to_935 and assign each position to the 9:35 or 11:30 bucket.
+        """
+        logger.info("OPEN PRICE CAPTURE: fetching 9:30 opening prints")
 
         positions = list(self.position_mgr.positions.items())
         if not positions:
             return
 
-        # Get current prices (opening prints)
         symbols = [s for s, _ in positions]
         snapshots = self.alpaca.get_snapshots(symbols)
 
-        exits_triggered = []
+        captured = 0
         for symbol, position in positions:
             snap = snapshots.get(symbol, {})
             open_price = snap.get("open")
 
             if not open_price or open_price <= 0:
-                # Do NOT fall back to last_price — it may already be a moving
-                # market price that would distort V2 move_5m_pct classification.
                 logger.warning(
-                    f"No RTH open for {symbol} (snapshot open={snap.get('open')}) "
-                    f"— will attempt first minute bar at 9:35; skipping hard stop"
+                    f"OPEN CAPTURE: {symbol} no snapshot open "
+                    f"— will fall back to first minute bar at 9:35"
                 )
                 continue
 
-            # Record real RTH open for V2 classification at 9:35
             self.open_prices[symbol] = open_price
             position.current_price = open_price
+            captured += 1
 
-            # Hard stop: entry_price × (1 + HARD_STOP_PCT)
-            stop_level = position.entry_price * (1.0 + config.HARD_STOP_PCT)
-            if open_price <= stop_level:
-                logger.warning(
-                    f"HARD STOP TRIGGERED: {symbol} open={open_price:.4f} "
-                    f"<= stop={stop_level:.4f} (entry={position.entry_price:.4f})"
-                )
-                exits_triggered.append(symbol)
-
-        # Execute exits for triggered stops
-        for symbol in exits_triggered:
-            self._exit_single_position(symbol, "hard stop at open")
-
-        if exits_triggered:
-            logger.info(f"Hard stops: exited {len(exits_triggered)} positions")
-        else:
-            logger.info(f"Hard stops: no triggers ({len(positions)} positions checked)")
+        logger.info(f"OPEN CAPTURE: {captured}/{len(positions)} open prices captured from snapshot")
 
     def _classify_and_exit_v2(self):
         """9:35 AM: Classify positions and execute immediate 9:35 exits.
@@ -1003,7 +1001,11 @@ class OvernightMomentumBot:
 
 
 def main():
-    bot = OvernightMomentumBot()
+    try:
+        bot = OvernightMomentumBot()
+    except Exception:
+        logging.critical("UNHANDLED EXCEPTION during bot initialisation", exc_info=True)
+        raise
     bot.run()
 
 

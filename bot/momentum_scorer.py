@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SelectionConfig:
     """Runtime selection parameters — chosen based on account equity."""
-    selection_mode: str = "top10"   # "top10", "top20", "bucket"
     min_bucket: int = 4
     max_positions: int = 10
     max_head_positions: int = 10
@@ -43,7 +42,6 @@ def get_selection_config(equity: float) -> SelectionConfig:
         cap = tier["max_equity"]
         if cap is None or equity <= cap:
             cfg = SelectionConfig(
-                selection_mode=tier["selection_mode"],
                 min_bucket=tier["min_bucket"],
                 max_positions=tier["max_positions"],
                 max_head_positions=min(tier["max_positions"], config.MAX_HEAD_POSITIONS),
@@ -53,8 +51,8 @@ def get_selection_config(equity: float) -> SelectionConfig:
                 min_shares=config.MIN_SHARES,
             )
             logger.info(
-                f"Account ${equity:,.0f} -> tier {tier['selection_mode']} "
-                f"(max_positions={cfg.max_positions})"
+                f"Account ${equity:,.0f} -> tier "
+                f"(min_bucket={cfg.min_bucket}, max_positions={cfg.max_positions})"
             )
             return cfg
     # Fallback
@@ -191,9 +189,8 @@ def compute_raw_metrics_350(
         if sym_avg > 0:
             c.volume_trend = sym_vol / sym_avg
 
-        # Relative strength vs market
-        if spy_return and spy_return != 0:
-            c.vs_market = c.intraday_return / spy_return if c.intraday_return else 0.0
+        # Relative strength vs market (difference, not ratio — stable when SPY near 0)
+        c.vs_market = c.intraday_return - spy_return
 
         # Volatility
         if c.signal_price > 0 and c.atr_14d > 0:
