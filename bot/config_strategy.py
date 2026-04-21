@@ -42,6 +42,13 @@ EXIT_UP_MOVE_PCT = 0.5       # % threshold for immediate 9:35 exit (authoritativ
 V2_FAILSAFE_TIME = "11:35"   # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
+# Execution safety — buying power buffer + mop-up
+# ═══════════════════════════════════════════════════
+ENTRY_BP_BUFFER_PCT = 0.98       # Size each order to 98% of reported buying power
+ENTRY_MIN_DEPLOY_PCT = 0.95      # If first pass deploys <95%, run mop-up pass
+ENTRY_MOPUP_MAX_POSITIONS = 5    # Max extra candidates to try in mop-up
+
+# ═══════════════════════════════════════════════════
 # Afternoon timeline (T-1 entry day)
 # ═══════════════════════════════════════════════════
 DATA_COLLECTION_TIME = "15:30"   # Begin universe pipeline

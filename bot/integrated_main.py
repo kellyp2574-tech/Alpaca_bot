@@ -18,6 +18,7 @@ AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   16:00  Confirm positions held overnight, save state, done
 """
 import logging
+import math
 import os
 import sys
 import time
@@ -710,17 +711,63 @@ class OvernightMomentumBot:
                 for sym, reason in exec_rejected.items():
                     logger.warning(f"Execution reject {sym}: {reason}")
 
-            # Submit market buy orders
+            # Submit market buy orders (BP-aware + resize-on-reject + logging)
             total_deployed = 0.0
+
+            def _adaptive_qty(alloc: Allocation, bp_buffer: float = config.ENTRY_BP_BUFFER_PCT) -> int:
+                """Return alloc.shares clamped to current buying power."""
+                bp = self.position_mgr.get_total_capital()
+                if not bp or bp <= 0:
+                    return alloc.shares
+                max_notional = bp * bp_buffer
+                price_ref = alloc.candidate.signal_price
+                notional = alloc.shares * price_ref
+                if notional <= max_notional:
+                    return alloc.shares
+                new_qty = math.floor(max_notional / price_ref) if price_ref > 0 else 0
+                return max(0, new_qty)
 
             for alloc in allocations:
                 symbol = alloc.symbol
                 if symbol not in orderable_set:
                     continue
-                qty = alloc.shares
+
                 candidate = alloc.candidate
+                price_ref = candidate.signal_price
+                qty = _adaptive_qty(alloc)
+
+                # Pre-submit logging
+                planned_notional = qty * price_ref
+                bp_before = self.position_mgr.get_total_capital() or 0.0
+                logger.info(
+                    f"ENTRY PLANNED {symbol}: qty={qty}, price_ref={price_ref:.4f}, "
+                    f"notional={planned_notional:,.2f}, bp_before={bp_before:,.2f}, "
+                    f"bucket={alloc.alloc_bucket}, rank={alloc.rank}"
+                )
+
+                if qty < config.MIN_SHARES:
+                    logger.warning(
+                        f"ENTRY SKIP {symbol}: adaptive qty {qty} < {config.MIN_SHARES} min shares "
+                        f"(bp=${bp_before:,.2f}, price={price_ref:.4f})"
+                    )
+                    exec_diag.failed_submissions[symbol] = "bp_resize_below_min"
+                    continue
 
                 buy_resp = self.position_mgr.submit_buy_order(symbol, qty)
+                if not buy_resp:
+                    # Retry once with fresh BP + recalculated qty
+                    fresh_bp = self.position_mgr.get_total_capital()
+                    if fresh_bp and fresh_bp > 0 and price_ref > 0:
+                        retry_qty = math.floor((fresh_bp * config.ENTRY_BP_BUFFER_PCT) / price_ref)
+                        if retry_qty >= config.MIN_SHARES and retry_qty < qty:
+                            logger.warning(
+                                f"ENTRY RETRY {symbol}: resizing {qty} -> {retry_qty} "
+                                f"after submit failure (fresh_bp=${fresh_bp:,.2f})"
+                            )
+                            buy_resp = self.position_mgr.submit_buy_order(symbol, retry_qty)
+                            if buy_resp:
+                                qty = retry_qty
+
                 if not buy_resp:
                     logger.error(f"Failed to submit buy for {symbol} x{qty}")
                     exec_diag.failed_submissions[symbol] = "submit_failed"
@@ -767,6 +814,97 @@ class OvernightMomentumBot:
                 else:
                     logger.warning(f"No fill for {symbol} buy order")
                     exec_diag.failed_submissions[symbol] = "no_fill"
+
+            # ── Post-loop mop-up pass ────────────────────────────
+            deploy_target = equity * sel.max_leverage * config.ENTRY_MIN_DEPLOY_PCT
+            if total_deployed < deploy_target:
+                shortfall = deploy_target - total_deployed
+                logger.warning(
+                    f"MOP-UP: deployment ${total_deployed:,.2f} < target ${deploy_target:,.2f} "
+                    f"(shortfall ${shortfall:,.2f}). Walking remaining candidates..."
+                )
+
+                already_tried = set(exec_diag.filled_symbols) | set(exec_diag.submitted_symbols)
+                extra_attempts = 0
+
+                for candidate in eligible_candidates:
+                    if extra_attempts >= config.ENTRY_MOPUP_MAX_POSITIONS:
+                        break
+                    sym = candidate.symbol
+                    if sym in already_tried:
+                        continue
+                    if sym not in orderable_set:
+                        continue
+
+                    price_ref = candidate.signal_price
+                    if price_ref <= 0:
+                        continue
+
+                    fresh_bp = self.position_mgr.get_total_capital()
+                    if not fresh_bp or fresh_bp <= 0:
+                        break
+                    max_notional = fresh_bp * config.ENTRY_BP_BUFFER_PCT
+                    if max_notional < price_ref * config.MIN_SHARES:
+                        logger.info(f"MOP-UP STOP: remaining BP ${fresh_bp:,.2f} can't afford min position")
+                        break
+
+                    mopup_qty = math.floor(max_notional / price_ref)
+                    if mopup_qty < config.MIN_SHARES:
+                        continue
+
+                    logger.info(
+                        f"MOP-UP PLANNED {sym}: qty={mopup_qty}, price_ref={price_ref:.4f}, "
+                        f"notional={mopup_qty * price_ref:,.2f}, bp_before={fresh_bp:,.2f}"
+                    )
+
+                    buy_resp = self.position_mgr.submit_buy_order(sym, mopup_qty)
+                    if not buy_resp:
+                        continue
+
+                    order_id = buy_resp.get("id")
+                    if not order_id:
+                        continue
+
+                    fill = self.position_mgr.get_order_fill(order_id, max_wait=30)
+                    if fill and int(fill["filled_qty"]) > 0:
+                        filled_qty = int(fill["filled_qty"])
+                        fill_price = fill["filled_avg_price"]
+
+                        position = Position(
+                            symbol=sym,
+                            entry_price=fill_price,
+                            quantity=filled_qty,
+                            entry_time=datetime.now(_ET),
+                            entry_gap_pct=0.0,
+                            adv_estimate=candidate.adv_dollars,
+                            peak_price=fill_price,
+                            current_price=fill_price,
+                        )
+                        self.position_mgr.positions[sym] = position
+                        total_deployed += fill_price * filled_qty
+                        exec_diag.filled_symbols.append(sym)
+                        exec_diag.fill_details[sym] = {
+                            "qty": filled_qty, "price": round(fill_price, 4),
+                            "score": round(candidate.composite_score, 4),
+                            "bucket": candidate.bucket,
+                            "alloc_bucket": "MOPUP",
+                            "rank": 0,
+                        }
+                        already_tried.add(sym)
+                        extra_attempts += 1
+
+                        logger.info(
+                            f"ENTRY MOP-UP {sym}: {filled_qty} @ {fill_price:.4f} "
+                            f"(score={candidate.composite_score:.3f})"
+                        )
+                    else:
+                        already_tried.add(sym)
+                        logger.warning(f"No fill for mop-up {sym}")
+
+                logger.info(
+                    f"MOP-UP complete: {extra_attempts} extra positions, "
+                    f"total deployed now ${total_deployed:,.2f}"
+                )
 
             self.entries_done = True
             self._save_state()
