@@ -812,10 +812,15 @@ class OvernightMomentumBot:
                         f"(score={candidate.composite_score:.3f}, bucket={candidate.bucket})"
                     )
                 else:
-                    logger.warning(f"No fill for {symbol} buy order")
+                    # Cancel potentially-live order so mop-up can safely retry
+                    self.position_mgr._cancel_order(order_id)
+                    logger.warning(f"No fill for {symbol} buy order (order canceled)")
                     exec_diag.failed_submissions[symbol] = "no_fill"
 
             # ── Post-loop mop-up pass ────────────────────────────
+            # Only filled symbols are truly "done". Failed submissions
+            # can be retried with smaller qty, and candidates outside
+            # the original allocation can be vet-on-demand.
             deploy_target = equity * sel.max_leverage * config.ENTRY_MIN_DEPLOY_PCT
             if total_deployed < deploy_target:
                 shortfall = deploy_target - total_deployed
@@ -824,37 +829,68 @@ class OvernightMomentumBot:
                     f"(shortfall ${shortfall:,.2f}). Walking remaining candidates..."
                 )
 
-                already_tried = set(exec_diag.filled_symbols) | set(exec_diag.submitted_symbols)
-                extra_attempts = 0
+                already_filled = set(exec_diag.filled_symbols)
+                mopup_attempts = 0
+                mopup_fills = 0
 
                 for candidate in eligible_candidates:
-                    if extra_attempts >= config.ENTRY_MOPUP_MAX_POSITIONS:
+                    if mopup_attempts >= config.ENTRY_MOPUP_MAX_POSITIONS:
                         break
                     sym = candidate.symbol
-                    if sym in already_tried:
-                        continue
-                    if sym not in orderable_set:
+                    if sym in already_filled:
                         continue
 
                     price_ref = candidate.signal_price
                     if price_ref <= 0:
                         continue
 
+                    # Vet new candidates not in the original orderable_set
+                    if sym not in orderable_set:
+                        try:
+                            snap = self.alpaca.get_snapshots([sym])
+                            ok, rej = filter_execution_ready(
+                                [sym], snap,
+                                max_spread_pct=0.05, require_quote=True,
+                            )
+                            if ok:
+                                orderable_set.add(sym)
+                                logger.info(f"MOP-UP VET {sym}: passed execution gate")
+                            else:
+                                reason = rej.get(sym, "unknown")
+                                logger.info(f"MOP-UP VET {sym}: rejected ({reason})")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"MOP-UP VET {sym}: snapshot error ({e})")
+                            continue
+
                     fresh_bp = self.position_mgr.get_total_capital()
                     if not fresh_bp or fresh_bp <= 0:
                         break
-                    max_notional = fresh_bp * config.ENTRY_BP_BUFFER_PCT
-                    if max_notional < price_ref * config.MIN_SHARES:
-                        logger.info(f"MOP-UP STOP: remaining BP ${fresh_bp:,.2f} can't afford min position")
-                        break
 
-                    mopup_qty = math.floor(max_notional / price_ref)
+                    # Per-position cap: ADV, MAX_POSITION_DOLLARS, and BP share
+                    adv_cap = candidate.adv_dollars * config.ADV_CAP_PCT if candidate.adv_dollars > 0 else fresh_bp
+                    target_dollars = min(
+                        fresh_bp * config.ENTRY_BP_BUFFER_PCT,
+                        adv_cap,
+                        config.MAX_POSITION_DOLLARS,
+                    )
+                    if target_dollars < price_ref * config.MIN_SHARES:
+                        logger.info(
+                            f"MOP-UP SKIP {sym}: capped target ${target_dollars:,.2f} "
+                            f"can't support min shares at price {price_ref:.4f}"
+                        )
+                        continue
+
+                    mopup_qty = math.floor(target_dollars / price_ref)
                     if mopup_qty < config.MIN_SHARES:
                         continue
 
+                    mopup_attempts += 1
+
                     logger.info(
                         f"MOP-UP PLANNED {sym}: qty={mopup_qty}, price_ref={price_ref:.4f}, "
-                        f"notional={mopup_qty * price_ref:,.2f}, bp_before={fresh_bp:,.2f}"
+                        f"notional={mopup_qty * price_ref:,.2f}, bp_before={fresh_bp:,.2f}, "
+                        f"attempt={mopup_attempts}/{config.ENTRY_MOPUP_MAX_POSITIONS}"
                     )
 
                     buy_resp = self.position_mgr.submit_buy_order(sym, mopup_qty)
@@ -890,19 +926,20 @@ class OvernightMomentumBot:
                             "alloc_bucket": "MOPUP",
                             "rank": 0,
                         }
-                        already_tried.add(sym)
-                        extra_attempts += 1
+                        already_filled.add(sym)
+                        mopup_fills += 1
 
                         logger.info(
                             f"ENTRY MOP-UP {sym}: {filled_qty} @ {fill_price:.4f} "
                             f"(score={candidate.composite_score:.3f})"
                         )
                     else:
-                        already_tried.add(sym)
-                        logger.warning(f"No fill for mop-up {sym}")
+                        self.position_mgr._cancel_order(order_id)
+                        already_filled.add(sym)
+                        logger.warning(f"No fill for mop-up {sym} (order canceled)")
 
                 logger.info(
-                    f"MOP-UP complete: {extra_attempts} extra positions, "
+                    f"MOP-UP complete: {mopup_fills} fills from {mopup_attempts} attempts, "
                     f"total deployed now ${total_deployed:,.2f}"
                 )
 
