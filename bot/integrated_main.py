@@ -659,16 +659,26 @@ class OvernightMomentumBot:
                 self.entries_done = True
                 return
 
-            # Get account equity -> tier config -> deployable capital
+            # Get account equity for tier selection + PDT check
             equity = self.position_mgr.get_account_equity()
             if not equity or equity <= 0:
                 logger.error("Cannot determine account equity — skipping entries")
                 self.entries_done = True
                 return
 
+            # Use buying power as deployable capital so margin is used naturally
+            buying_power = self.position_mgr.get_total_capital()
+            if not buying_power or buying_power <= 0:
+                logger.warning("Cannot determine buying power — falling back to equity")
+                buying_power = equity
+
             sel = get_selection_config(equity)
-            deployable = equity * sel.max_leverage
-            logger.info(f"Account equity: ${equity:,.2f}, deployable: ${deployable:,.2f}")
+            max_deployable = equity * sel.max_leverage
+            deployable = min(buying_power, max_deployable)
+            logger.info(
+                f"Account equity: ${equity:,.2f}, buying_power: ${buying_power:,.2f}, "
+                f"max_leverage={sel.max_leverage}x, deployable: ${deployable:,.2f}"
+            )
 
             # Fix 5: PDT-aware allocation - filter candidates BEFORE allocation
             if equity < 50_000 and self.sold_today:
@@ -821,7 +831,7 @@ class OvernightMomentumBot:
             # Only filled symbols are truly "done". Failed submissions
             # can be retried with smaller qty, and candidates outside
             # the original allocation can be vet-on-demand.
-            deploy_target = equity * sel.max_leverage * config.ENTRY_MIN_DEPLOY_PCT
+            deploy_target = deployable * config.ENTRY_MIN_DEPLOY_PCT
             if total_deployed < deploy_target:
                 shortfall = deploy_target - total_deployed
                 logger.warning(
@@ -835,6 +845,9 @@ class OvernightMomentumBot:
 
                 for candidate in eligible_candidates:
                     if mopup_attempts >= config.ENTRY_MOPUP_MAX_POSITIONS:
+                        break
+                    if len(exec_diag.filled_symbols) >= sel.max_positions:
+                        logger.info(f"MOP-UP STOP: reached max_positions ({sel.max_positions})")
                         break
                     sym = candidate.symbol
                     if sym in already_filled:
@@ -949,7 +962,10 @@ class OvernightMomentumBot:
             # Store execution stats for health report
             head_filled = sum(1 for s in exec_diag.filled_symbols
                               if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "HEAD")
-            tail_filled = len(exec_diag.filled_symbols) - head_filled
+            tail_filled = sum(1 for s in exec_diag.filled_symbols
+                              if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "TAIL")
+            mopup_filled = sum(1 for s in exec_diag.filled_symbols
+                               if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "MOPUP")
 
             self._exec_stats = {
                 "selected": len(exec_diag.selected_symbols),
@@ -960,18 +976,19 @@ class OvernightMomentumBot:
                 "entries_filled": len(exec_diag.filled_symbols),
                 "head_filled": head_filled,
                 "tail_filled": tail_filled,
+                "mopup_filled": mopup_filled,
                 "total_deployed": total_deployed,
                 "equity": equity,
+                "deployable": deployable,
             }
 
-            # Fix 2: Deployment shortfall diagnostics
-            deployment_pct = total_deployed / equity * 100
+            deployment_pct = total_deployed / deployable * 100 if deployable > 0 else 0.0
             logger.info(
                 f"Entry execution complete: {len(exec_diag.filled_symbols)} filled "
-                f"({head_filled} HEAD + {tail_filled} TAIL), "
+                f"({head_filled} HEAD + {tail_filled} TAIL + {mopup_filled} MOPUP), "
                 f"{len(exec_diag.rejected_symbols)} rejected at execution gate, "
                 f"${total_deployed:,.2f} deployed "
-                f"({deployment_pct:.1f}% of equity)"
+                f"({deployment_pct:.1f}% of deployable)"
             )
 
             # Explicit shortfall diagnostics

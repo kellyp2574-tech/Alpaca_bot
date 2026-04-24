@@ -33,6 +33,8 @@ HEAD_PCT = 0.70             # 70% of capital to top-ranked positions
 TAIL_PCT = 0.30             # 30% of capital to remaining candidates
 MAX_HEAD_POSITIONS = 10     # Equal-weight top N
 MAX_TOTAL_POSITIONS = 30    # Hard cap including head + tail
+TAIL_TARGET_SLOTS = 5       # Target number of tail positions for slice sizing
+TAIL_MAX_POSITION_FACTOR = 0.75  # Max tail position = head slot × this factor
 
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
