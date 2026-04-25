@@ -1,6 +1,6 @@
 # Overnight Momentum Trading Bot
 
-Automated equity trading strategy on Alpaca that captures overnight momentum by entering positions at 3:50 PM and exiting the next morning. Uses a composite scoring model to identify high-momentum small-cap stocks ($1–$10, $2M+ ADV) with strong late-day volume and relative strength.
+Automated equity trading strategy on Alpaca that captures overnight momentum by entering positions at 3:50 PM and exiting the next morning. Uses a dual-scoring model — a new **HEAD score** for late-day continuation candidates and an original **TAIL score** for broader momentum — with a waterfall capital allocator. Exits are driven by an entry-price comparison at 9:35 AM, placing trailing stops on continuation names and immediately selling gap-faded positions.
 
 ---
 
@@ -10,8 +10,8 @@ Automated equity trading strategy on Alpaca that captures overnight momentum by 
 
 The bot runs a strict two-day cycle:
 
-- **T-1 afternoon (3:30–4:00 PM):** Build a tradeable universe, score candidates on 6 intraday metrics, allocate capital, and submit market buy orders at 3:50 PM. Positions are held overnight.
-- **T+1 morning (9:00–11:35 AM):** Exit every position. At 9:30 the opening price is captured. At 9:35 each position is classified by its open-to-9:35 return — winners (>+0.5%) exit immediately, all others hold to 11:30 AM. A failsafe sweep runs at 11:35 AM.
+- **T-1 afternoon (3:30–4:00 PM):** Build a tradeable universe, compute both HEAD and TAIL scores, allocate capital using a waterfall system (HEAD then TAIL), and submit market buy orders at 3:50 PM. Positions held overnight.
+- **T+1 morning (9:00–11:35 AM):** At 9:30 open prices are captured. At 9:35 each position is classified vs. its entry price — continuation names get a **1.25% trailing stop**, faded names are **sold immediately**. At 11:30 any live trailing stops are cancelled and remaining positions market-sold. Failsafe sweep at 11:35 AM.
 
 The bot never holds past 11:35 AM intentionally.
 
@@ -23,26 +23,23 @@ This traces `OvernightMomentumBot.run()` from startup through end of day.
 
 ### 9:00 AM — Bot Startup (`run()`)
 
-1. Logging is initialised (file + stdout).
-2. `_load_state()` is called:
-   - If `bot_state.json` exists and is dated **today**, all stage flags are restored (`v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`, `open_prices`, `exit_schedule`, `classification_audit`).
-   - If it is from a **prior day**, it is ignored. `positions.json` is loaded for overnight holds.
+1. Logging initialised (file + stdout).
+2. `_load_state()` called:
+   - If `bot_state.json` is dated **today**: all stage flags restored (`v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`, `open_prices`, `exit_schedule`, `classification_audit`, `trailing_order_ids`).
+   - If from a **prior day**: ignored. `positions.json` loaded for overnight holds.
 3. `get_broker_positions()` fetches live Alpaca positions:
-   - If positions exist → `reconcile_local_positions_from_broker()` syncs local state to broker truth. `morning_exits_done = False`.
-   - If no positions → `morning_exits_done = True` (skip all morning exit logic).
-4. All schedule times are pre-computed from config strings into `datetime.time` objects:
-   - `t_market_open = 09:30`, `t_v2_classify = 09:35`, `t_bucket_1130 = 11:30`, `t_failsafe = 11:35`, `t_data_collect = 15:30`, `t_scoring = 15:48`, `t_entry = 15:50`, `t_market_close = 16:00`.
-5. **Late-start guard:** if current time ≥ 11:35 and positions exist → `_run_failsafe_flatten()` is called immediately. Positions are cleared. `morning_exits_done = True`.
-6. If current time ≥ 16:00 → log error and return (nothing to do).
+   - Positions exist → `reconcile_local_positions_from_broker()` syncs local to broker truth. `morning_exits_done = False`.
+   - No positions → `morning_exits_done = True` (skip all morning exit logic).
+4. Schedule times pre-computed: `09:30`, `09:35`, `11:30`, `11:35`, `15:30`, `15:48`, `15:50`, `16:00`.
+5. **Late-start guard:** if time ≥ 11:35 and positions exist → `_run_failsafe_flatten()` immediately. `morning_exits_done = True`.
+6. If time ≥ 16:00 → log error and return.
 7. **Main `while True` loop begins** — ticks every 1 second.
 
 ---
 
 ### 9:00–9:30 AM — Waiting Loop
 
-Each second the loop checks `morning_exits_done`. It is `False` so morning logic runs. All time guards are still `False` (before 9:30) so nothing executes yet. The loop sleeps 1 second and repeats.
-
-If local positions are empty but broker still shows positions (e.g. crash recovery), `reconcile_local_positions_from_broker()` fires to rebuild local state before the 9:30 open price capture.
+Morning logic runs each tick. All time guards still `False`. If local positions empty but broker holds positions (crash recovery), `reconcile_local_positions_from_broker()` fires to rebuild local state before 9:30.
 
 ---
 
@@ -50,81 +47,80 @@ If local positions are empty but broker still shows positions (e.g. crash recove
 
 **Guard:** `not self.hard_stops_checked and current_time >= 09:30`
 
-**No positions are exited here.** All overnight holds are kept regardless of the opening print.
+**No positions exited here.** All overnight holds kept.
 
-1. Fetches live Alpaca **snapshots** for all held symbols.
-2. For each position, reads `snapshot["open"]` — the RTH opening print.
-   - If `open` is missing or zero: logs a warning, defers open price to the 9:35 minute-bar fallback.
-   - If `open` is valid: stores it in `self.open_prices[symbol]`. Updates `position.current_price`.
+1. Fetches Alpaca **snapshots** for all held symbols.
+2. Reads `snapshot["open"]` — the RTH opening print.
+   - Valid → stored in `self.open_prices[symbol]`, `position.current_price` updated.
+   - Missing/zero → deferred to 9:35 minute-bar fallback.
 3. State saved.
 
-**After this step:** `self.open_prices` contains the snapshot open for every symbol that had one. No positions have been touched.
+> Open prices are used **only for gap logging** at 9:35 — they do not drive the exit decision.
 
 ---
 
-### 9:35 AM — Classification + Immediate Exits (`_classify_and_exit_v2()`)
+### 9:35 AM — Classification + Exits (`_classify_and_exit_v2()`)
 
 **Guard:** `not self.v2_classified and current_time >= 09:35`
 
-#### Step 1: Fetch 9:35 snapshots
-`get_snapshots(symbols)` — used as `price_935` fallback only.
+#### Step 1: Fetch data
+- `get_snapshots(symbols)` — fallback source for `price_935`.
+- `get_minute_bars(symbols, "09:30", "09:35")` — primary source for `price_935`.
 
-#### Step 2: Fetch 9:30–9:35 minute bars
-`get_minute_bars(symbols, "09:30", "09:35")` — primary source for both open fallback and `price_935`.
+#### Step 2: Resolve open prices (logging only)
+For each symbol, if no snapshot open from 9:30: tries `minute_bars[symbol][0]["o"]` as fallback.
 
-#### Step 3: Resolve open prices
-For each symbol:
-- If already in `self.open_prices` (from 9:30 snapshot) → source tagged `"snapshot"`.
-- Else → tries `minute_bars[symbol][0]["o"]` (first bar open):
-  - Valid → stored in `self.open_prices`, source tagged `"minute_bar"`.
-  - Missing or zero → source tagged `"missing"`, symbol will default to 11:30.
-
-#### Step 4: Classify (`classify_positions()` in `exit_classifier.py`)
-For each symbol:
+#### Step 3: Classify (`classify_positions()` in `exit_classifier.py`)
 
 ```
 price_935:
-  1. last minute-bar close:  bars[-1]["c"]   -> source = "minute_bar"
-  2. snapshot fallback:      snap["last_price"] or snap["close"]  -> source = "snapshot"
-  3. neither available       -> source = "missing", default to 11:30
+  1. minute_bars[-1]["c"]          -> source = "minute_bar"   (preferred)
+  2. snapshot["last_price"]        -> source = "snapshot"     (fallback)
+  3. neither available             -> source = "missing"      -> EXIT immediately (conservative)
 
-ret_open_to_935 = (price_935 - open_price) / open_price × 100
-
-if ret_open_to_935 > EXIT_UP_MOVE_PCT (0.5%)  ->  EXIT_BUCKET_935  ("09:35")
-else                                            ->  EXIT_BUCKET_1130 ("11:30")
+Classification rule (entry-price based):
+  price_935 > entry_price   ->  EXIT_BUCKET_TRAIL  ("trail")
+  price_935 <= entry_price  ->  EXIT_BUCKET_935    ("09:35")
+  missing entry_price       ->  EXIT_BUCKET_935    (conservative default)
 ```
 
-Missing price data always defaults to `"11:30"`.
+#### Step 4: Store schedule and audit
+- `self.exit_schedule = {symbol: exit_bucket}` for every symbol.
+- `self.classification_audit` includes: `entry_price`, `open_price`, `price_935`, `ret_vs_entry_pct`, `exit_bucket`, source fields, `gap_pct`. Persisted in `bot_state.json`.
 
-Source quality is summarised in logs: how many symbols used minute-bar opens, how many used snapshot fallback for `price_935`, how many were missing. A warning fires if >50% of symbols used minute-bar open fallbacks.
+#### Step 5: Execute immediate exits (faded positions)
+Every symbol in `EXIT_BUCKET_935` → `_exit_single_position(symbol, "price_935 <= entry_price -> 9:35 exit")`.
 
-#### Step 5: Store schedule and audit
-- `self.exit_schedule = {symbol: exit_time}` for every symbol.
-- `self.classification_audit = {symbol: {open_price, price_935, move_5m_pct, exit_time, open_price_source, price_935_source, gap_pct}}` — persisted to `bot_state.json`.
+**Partial fill re-routing:** incomplete 9:35 exits are re-routed to `EXIT_BUCKET_1130`.
 
-#### Step 6: Execute immediate 9:35 exits
-Every symbol assigned `"09:35"` is passed to `_exit_single_position(symbol, "move > 0.5% from open -> 9:35 exit")`.
-
-**Partial fill re-routing:** if a 9:35 exit doesn't fully fill, `exit_schedule[symbol]` is updated to `"11:30"` so the 11:30 bucket catches the remainder automatically.
+#### Step 6: Place trailing stops (continuation positions)
+Every symbol in `EXIT_BUCKET_TRAIL`:
+- `submit_trailing_stop_sell(symbol, qty, trail_percent=1.25)` → Alpaca `type=trailing_stop`.
+- Order ID stored in `self.trailing_order_ids[symbol]` (persisted to state).
+- If trailing stop placement fails: logged as warning; position falls back to 11:30 market sell.
 
 `v2_classified = True`. State saved.
 
 ---
 
-### 9:35 AM–11:30 AM — Waiting Loop
+### 9:35 AM–11:30 AM — Waiting
 
-The loop continues ticking every second. `morning_exits_done` is still `False`. No time guards fire yet. If all 9:35 exits completed and no positions remain, `morning_exits_done` is set `True` immediately (early completion path).
+Trailing stops are live on Alpaca's servers. If a trailing stop triggers and fills, Alpaca removes the position automatically — local state is cleaned up at 11:30 reconciliation. No polling required.
+
+If all 9:35 exits completed and no positions remain, `morning_exits_done = True` immediately (early completion).
 
 ---
 
-### 11:30 AM — Hold Bucket Exit (`_exit_bucket(EXIT_BUCKET_1130, ...)`)
+### 11:30 AM — Hard Exit (`_exit_bucket(EXIT_BUCKET_1130, ...)`)
 
 **Guard:** `self.v2_classified and not self.exits_1130_done and current_time >= 11:30`
 
-1. Collects all symbols in `exit_schedule` whose bucket is `"11:30"` AND that still exist in `self.position_mgr.positions`.
-2. Calls `_exit_single_position(symbol, "scheduled 11:30 AM exit")` for each.
-3. After all exits: `reconcile_local_positions_from_broker()` — syncs local state in case any fills were partial.
-4. `exits_1130_done = True`. State saved.
+1. **Cancel all live trailing stop orders** — iterates `self.trailing_order_ids`, calls `_cancel_order(order_id)` for each symbol still held locally. Clears the dict.
+2. **Reconcile with broker** — `reconcile_local_positions_from_broker()` removes any symbols whose trailing stop already filled (broker no longer holds them).
+3. **Market-sell all remaining positions** — every symbol left in `self.position_mgr.positions` gets `_exit_single_position(symbol, "11:30 forced exit")`.
+4. Post-exit reconciliation. `exits_1130_done = True`. State saved.
+
+> The 11:30 exit is a **catch-all** — it handles trailing-stop survivors, faded-position partial fills, and any unscheduled leftovers.
 
 ---
 
@@ -132,18 +128,17 @@ The loop continues ticking every second. `morning_exits_done` is still `False`. 
 
 **Guard:** `not self.post_exit_failsafe_done and current_time >= 11:35`
 
-1. Calls `broker_position_count()`.
-   - **0 positions:** logs "broker confirmed flat". Done.
-   - **>0 positions:** calls `_run_failsafe_flatten()`:
-     - Fetches all broker positions directly.
-     - For each: submits market sell → polls 30s for fill → if unfilled, limit sell at -3% → if still unfilled, limit sell at -5% → logs `CRITICAL` if still open after all layers.
+1. `broker_position_count()`:
+   - **0 positions:** logs confirmed flat. Done.
+   - **>0 positions:** `_run_failsafe_flatten()`:
+     - Market sell → 30s poll → limit at -3% → limit at -5% → `CRITICAL` if still open.
 2. `post_exit_failsafe_done = True`, `morning_exits_done = True`. State saved.
 
 ---
 
 ### 11:35 AM–3:30 PM — Idle
 
-`morning_exits_done = True`. The morning block no longer runs. The afternoon block guards are all `False` until 3:30 PM. Loop sleeps 1 second each tick.
+`morning_exits_done = True`. Morning block no longer runs. Loop sleeps 1 second per tick.
 
 ---
 
@@ -151,21 +146,18 @@ The loop continues ticking every second. `morning_exits_done` is still `False`. 
 
 **Guard:** `not self.data_collected and current_time >= 15:30`
 
-Calls `build_universe(massive, alpaca)` — a 4-stage pipeline:
+Calls `build_universe(massive, alpaca)` — 4-stage pipeline:
 
-**Stage A — Alpaca asset list (eligibility):**
-- Calls Alpaca `GET /v2/assets` — this is the authoritative eligibility source.
-- Filters to: US equity, active, tradable, non-OTC, non-ETF/fund, no warrants/rights/units/preferred.
+**Stage A — Eligibility (Alpaca `GET /v2/assets`):**
+US equity, active, tradable, non-OTC, non-ETF/fund, no warrants/rights/units/preferred.
 
-**Stage B — Price filter (Massive) + ADV/ATR (Alpaca):**
-- Calls Massive API `get_full_market_snapshot()` for current prices. Filters: $1–$10.
-- **If Massive fails**, falls back to Alpaca snapshots automatically.
-- Fetches 20 days of daily OHLCV from Alpaca. Computes **ADV** (≥$2M gate) and **ATR**.
+**Stage B — Price + Liquidity:**
+Massive API prices → $1–$10 filter. Alpaca 20-day OHLCV → ADV (≥$2M) and ATR. Falls back to Alpaca snapshots if Massive unavailable.
 
-**Stage D — Fresh Alpaca tradability re-check:**
-- Second `GET /v2/assets` call to catch any symbols that became restricted after Stage A.
+**Stage D — Broker executability re-check:**
+Second `GET /v2/assets` for any symbols that became restricted since Stage A.
 
-Results saved to `self.universe` (list of symbols). `universe_audit` written to `state/audit/`. `data_collected = True`. State saved.
+`universe_audit` written to `state/logs/`. `data_collected = True`. State saved.
 
 ---
 
@@ -174,39 +166,53 @@ Results saved to `self.universe` (list of symbols). `universe_audit` written to 
 **Guard:** `self.data_collected and not self.scoring_done and current_time >= 15:48`
 
 #### 1. Fetch signal bars
-`get_intraday_bars_for_signal(universe, today, start="09:30", end="15:50")` — full-day minute bars for every universe symbol.
+`get_intraday_bars_for_signal(universe, today, "09:30", "15:50")` — full-day 1-minute bars.
 
-#### 2. Stage C — Minute bar data quality filter
-Removes symbols with fewer than 30 minute bars. Logs the before/after count.
+#### 2. Stage C — Data quality filter
+Remove symbols with < 30 minute bars.
 
-#### 3. Fetch SPY return
-Snapshot of `SPY` → `(last - open) / open`. Used as market benchmark in scoring.
+#### 3. SPY return
+`(SPY_last - SPY_open) / SPY_open` — market benchmark for `vs_market` metric.
 
-#### 4. Build 60-min volume profiles
-For each symbol: last 60 minutes of volume vs. average 60-minute volume across the day.
+#### 4. 60-min volume profiles
+Last-60-minute volume and average-60-minute volume per symbol.
 
 #### 5. Build candidates (`build_signal_candidates_350()`)
-Extracts per-symbol: `signal_price` (3:50 close), `adv_dollars`, `atr_percent`, first/last bar prices, volume data. Returns a list of `MomentumCandidate` objects.
+Creates `MomentumCandidate` objects: `signal_price`, `adv_dollars`, `atr_14d`, bar highs/lows/volumes.
 
-#### 6. Compute raw metrics (`compute_raw_metrics_350()`)
-Six metrics per candidate:
+#### 6. Compute TAIL score metrics (`compute_raw_metrics_350()`)
 
-| Metric | Weight | Calculation |
-|--------|--------|-------------|
-| `intraday_return` | +20% | `(signal_price - open) / open` |
-| `proximity_to_high` | +15% | `signal_price / day_high` |
-| `volume_vs_avg` | +20% | `last_60min_volume / avg_60min_volume` |
-| `volume_trend` | +10% | Recent volume acceleration |
-| `vs_market` | +25% | `intraday_return − spy_return` (difference, stable when SPY near zero) |
-| `atr_percent` | -10% | ATR as % of price (volatility penalty) |
+| Metric | Weight | Formula |
+|--------|--------|---------|
+| `intraday_return` | +20% | `(signal_price − open) / open` |
+| `proximity_to_high` | +15% | `signal_price / day_high` (1.0 = at the high) |
+| `volume_vs_avg` | +20% | `last_60min_vol / avg_60min_vol` |
+| `volume_trend` | +10% | Volume acceleration in last 60 min |
+| `vs_market` | +25% | `intraday_return − spy_return` |
+| `atr_percent` | −10% | `ATR_14d / signal_price` (volatility penalty) |
 
-#### 7. Normalize, score, bucket (`normalize_and_score_350()`, `assign_buckets()`)
-- Each metric is **z-scored** across the daily candidate pool (mean 0, std 1).
-- `composite_score = Σ(z_metric × weight)`.
-- Candidates assigned to **decile buckets 1–10** (10 = highest score in today's pool, relative ranking). Only bucket ≥ 4 selected for allocation.
-- Sorted descending by `composite_score`.
+Z-scored across the candidate pool → `composite_score = Σ(z × weight)`.
 
-`scoring_done = True`. Top 20 saved to `state/audit/candidates_YYYY-MM-DD.json`. State saved.
+#### 7. Compute HEAD score (`compute_head_score()`)
+
+```
+late_day_share = dollar_volume_last_60min / dollar_volume_930_to_350
+
+head_score = 0.40 × late_day_share
+           − 0.30 × proximity_to_high
+           − 0.10 × atr_percent
+```
+
+Higher `head_score` = volume concentrating late in the day, not extended at the high, low volatility.
+
+#### 8. Bucket assignment (`assign_buckets()`)
+Decile buckets 1–10 by `composite_score` (10 = top 10% of today's pool). Only bucket ≥ 4 considered for allocation.
+
+Candidates saved to `state/logs/candidates_YYYY-MM-DD.json` with **two ranked views**:
+- `top_20_by_head_score` — actual HEAD selection pool
+- `top_20_by_composite_score` — TAIL ranking pool
+
+`scoring_done = True`. State saved.
 
 ---
 
@@ -214,61 +220,49 @@ Six metrics per candidate:
 
 **Guard:** `self.scoring_done and not self.entries_done and current_time >= 15:50`
 
-#### 1. Get equity and tier config
-`get_account_equity()` → `get_selection_config(equity)` → returns `min_bucket` (≥4), `max_positions` (30), `max_leverage`.
-
-Note: `selection_mode` has been removed — behavior is determined entirely by `min_bucket`, `max_head_positions`, and `max_positions`.
-
-```
-deployable = equity × max_leverage  (1.0 for cash accounts)
+#### 1. Capital calculation
+```python
+equity      = get_account_equity()
+buying_power = get_total_capital()          # Alpaca buying_power field
+deployable  = min(buying_power, equity × MAX_LEVERAGE)
 ```
 
-#### 2. PDT guard (pre-allocation)
-If `equity < $50,000` and `sold_today` is non-empty: removes any same-day sold symbols from the candidate list **before** allocation. Logs how many were blocked. If nothing remains, skips entries entirely.
+#### 2. PDT guard
+If `equity < $50,000` and `sold_today` non-empty: same-day sold symbols removed from candidates before allocation.
 
-#### 3. HEAD/TAIL allocation (`allocate_head_tail()`)
-Capital is split into two pools and allocated in ranked order:
+#### 3. Waterfall allocation (`allocate_head_tail()`)
 
-**HEAD pool (70% of deployable, top 10 equal-weight):**
+**HEAD — top 10 by `head_score`, equal-weight:**
 ```
-slot_size = deployable × 0.70 / 10
-per_position_max = min(slot_size, ADV × 0.003)
-shares = floor(per_position_max / signal_price)
-if shares < 25: skip, unspent slot rolls to TAIL
+slot_size   = deployable / HEAD_COUNT             # deployable / 10
+adv_cap     = adv_dollars × ADV_CAP_PCT           # adv × 0.003
+max_dollars = min(slot_size, adv_cap)
+shares      = floor(max_dollars / signal_price)
+if shares < MIN_SHARES (25): skip, full slot → leftover
+leftover capital cascades into TAIL
 ```
 
-**TAIL pool (30% of deployable + HEAD leftovers, waterfall):**
+**TAIL — remaining candidates by `composite_score`, waterfall:**
 ```
-for each remaining candidate (ranked 11+):
-    max_dollars = min(remaining_cash, ADV × 0.003)
-    shares = floor(max_dollars / signal_price)
+pool: all candidates NOT in HEAD, sorted by composite_score desc, up to TAIL_MAX_POSITIONS (30)
+for each candidate:
+    dynamic_slice = remaining_cash / candidates_remaining
+    adv_cap       = adv_dollars × ADV_CAP_PCT
+    max_dollars   = min(dynamic_slice, adv_cap, remaining_cash)
+    shares        = floor(max_dollars / signal_price)
     if shares < 25: skip (cash not consumed)
-    deploy, subtract cost
-    stop when 80% deployment target reached OR no more candidates
+    deploy, subtract cost, stop at MAX_TOTAL_POSITIONS (40)
 ```
-
-The 30-position cap is a soft limit — the allocator will exceed it to reach the 80% deployment target if enough candidates exist.
 
 #### 4. Execution gate (`filter_execution_ready()`)
-Fresh snapshots fetched for all allocated symbols immediately before order submission. Rejects:
-- Bid/ask spread > 5%
-- Missing or invalid quote
-
-Rejected symbols are logged with their reason.
+Fresh snapshots for all allocated symbols. Rejects: spread > 5%, missing/stale quote.
 
 #### 5. Submit market buy orders
-For each orderable allocation:
-- `submit_buy_order(symbol, qty)` → market buy, `time_in_force="day"`.
-- `get_order_fill(order_id, max_wait=30)` polls up to 30 seconds.
-- On fill: creates a `Position(symbol, entry_price=fill_price, quantity=filled_qty, entry_time=now, adv_estimate, ...)` and stores it in `position_mgr.positions`.
-- Logs: `ENTRY AAPL: 150 @ 8.4200 [HEAD #1] (score=0.812, bucket=5)`
-
-#### 6. Deployment shortfall diagnostics
-If `total_deployed / equity < 80%`, a detailed breakdown is logged:
-- PDT-blocked candidates count
-- Execution gate rejection reasons
-- Failed submissions / no-fill count
-- Gap between target and actual deployed dollars
+- `submit_buy_order(symbol, qty)` → market buy `time_in_force="day"`.
+- `get_order_fill(order_id, max_wait=30)` polls up to 30s.
+- On fill: `Position` stored in `position_mgr.positions` with `entry_price = fill_price`.
+- On Alpaca buying-power rejection: retry once with `qty × 0.98` (2% haircut).
+- On any other failure: logged, continue to next candidate.
 
 `entries_done = True`. State saved.
 
@@ -278,10 +272,7 @@ If `total_deployed / equity < 80%`, a detailed breakdown is logged:
 
 **Guard:** `current_time >= 16:00`
 
-- If `entries_done` or positions exist: saves end-of-day audit reports (`execution_YYYY-MM-DD.json`, `health_YYYY-MM-DD.json`). State saved. **Loop exits.**
-- If no entries were made: `_finalize_day()` runs cleanup, loop exits.
-
-Positions are now held overnight. The bot process terminates.
+End-of-day audit reports saved (`execution_YYYY-MM-DD.json`, `run_health_YYYY-MM-DD.json`). Loop exits. Positions held overnight.
 
 ---
 
@@ -294,22 +285,22 @@ Positions are now held overnight. The bot process terminates.
 - Persists across days — loaded at next-day 9:00 AM startup
 
 **`state/bot_state.json`** — date-stamped; ignored if from a prior day
-- `hard_stops_checked` (open-price capture flag), `v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`
-- `data_collected`, `scoring_done`, `entries_done`
-- `open_prices` — `{symbol: open_price}` captured at 9:30
-- `exit_schedule` — `{symbol: "09:35" | "11:30"}`
-- `classification_audit` — `{symbol: {open_price, price_935, move_5m_pct, exit_time, open_price_source, price_935_source, gap_pct}}`
+- Stage flags: `v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`
+- `open_prices` — `{symbol: open_price}` captured at 9:30 (for gap logging)
+- `exit_schedule` — `{symbol: "09:35" | "trail" | "11:30"}`
+- `classification_audit` — `{symbol: {entry_price, open_price, price_935, ret_vs_entry_pct, exit_bucket, ...}}`
+- `trailing_order_ids` — `{symbol: alpaca_order_id}` for live trailing stops
 - `sold_today` — symbols sold this session (PDT guard)
 
 ### Same-Day Crash Recovery
 
-If the bot restarts mid-day, `_load_state()` restores all flags. The event loop resumes from the last completed stage — no duplicate exits, no duplicate entries.
+`_load_state()` restores all flags including `trailing_order_ids`. The event loop resumes from the last completed stage — no duplicate exits or entries. Trailing stops already placed on Alpaca remain active through a crash/restart.
 
 ### Broker Reconciliation
 
-On startup, live broker positions are fetched and compared to `positions.json`:
+On startup and after exit waves:
 - Positions in broker but not local → rebuilt from broker data
-- Positions local but not in broker → removed
+- Positions local but not in broker → removed (trailing stop may have filled)
 - Quantities mismatched → synced to broker value
 
 ---
@@ -320,9 +311,9 @@ On startup, live broker positions are fetched and compared to `positions.json`:
 run.py                              # Entry point
 bot/
   integrated_main.py                # OvernightMomentumBot — main orchestrator
-  position_manager_overnight.py     # Position tracking, order submission, failsafe flatten
-  exit_classifier.py                # 9:35 AM classification (open-to-935 return rule)
-  momentum_scorer.py                # 350-model scoring, HEAD/TAIL allocation
+  position_manager_overnight.py     # Position tracking, order submission, trailing stops, failsafe
+  exit_classifier.py                # 9:35 AM entry-price classification (trail vs immediate exit)
+  momentum_scorer.py                # HEAD score, TAIL score, waterfall allocator
   universe_builder.py               # 4-stage universe pipeline, audit writers
   massive_client.py                 # Massive API (universe snapshot)
   market_data.py                    # Alpaca data client (bars, snapshots)
@@ -336,12 +327,11 @@ bot/
 state/
   positions.json                    # Overnight positions
   bot_state.json                    # Same-day recovery state
-  audit/
-    universe_YYYY-MM-DD.json        # Universe pipeline diagnostics
-    candidates_YYYY-MM-DD.json      # Top 20 scored candidates
-    execution_YYYY-MM-DD.json       # Entry fill details
-    health_YYYY-MM-DD.json          # Daily run health metrics
   logs/
+    universe_YYYY-MM-DD.json        # Universe pipeline diagnostics
+    candidates_YYYY-MM-DD.json      # Top 20 HEAD + top 20 TAIL scored candidates
+    execution_YYYY-MM-DD.json       # Entry fill funnel details
+    run_health_YYYY-MM-DD.json      # Daily run health summary
     bot_YYYY-MM-DD.log              # Full daily log
 ```
 
@@ -351,15 +341,15 @@ state/
 
 ### Universe (`config_universe.py`)
 ```python
-UNIVERSE_PRESET  = "expanded_smallcap"
-MIN_PRICE        = 1.00
-MAX_PRICE        = 10.00
-MIN_ADV_DOLLARS  = 2_000_000   # $2M minimum 20-day ADV
+UNIVERSE_PRESET   = "expanded_smallcap"
+MIN_PRICE         = 1.00
+MAX_PRICE         = 10.00
+MIN_ADV_DOLLARS   = 2_000_000    # $2M minimum 20-day ADV
 ADV_LOOKBACK_DAYS = 20
 ATR_LOOKBACK_DAYS = 14
 ```
 
-### Scoring weights (`config_strategy.py`)
+### TAIL score weights (`config_strategy.py`)
 ```python
 SCORE_WEIGHT_INTRADAY_RETURN = 0.20
 SCORE_WEIGHT_PROXIMITY_HIGH  = 0.15
@@ -369,23 +359,28 @@ SCORE_WEIGHT_VS_MARKET       = 0.25
 SCORE_WEIGHT_ATR_PCT         = -0.10
 ```
 
+### HEAD score formula
+```python
+# late_day_share = dollar_volume_last_60min / dollar_volume_930_to_350
+head_score = 0.40 * late_day_share - 0.30 * proximity_to_high - 0.10 * atr_percent
+```
+
 ### Position sizing (`config_strategy.py`)
 ```python
 MAX_LEVERAGE         = 1.0     # Cash account, no margin
-ADV_CAP_PCT          = 0.003   # Max = 0.3% of 20-day ADV per position
-MIN_SHARES           = 25      # Skip if rounding yields fewer
-HEAD_PCT             = 0.70
-TAIL_PCT             = 0.30
-MAX_HEAD_POSITIONS   = 10
-MAX_TOTAL_POSITIONS  = 30      # Soft cap; exceeded to reach 80% deployment
+ADV_CAP_PCT          = 0.003   # Max 0.3% of 20-day ADV per position
+MIN_SHARES           = 25      # Skip if rounding yields fewer shares
+HEAD_COUNT           = 10      # Fixed equal-weight HEAD slots
+TAIL_MAX_POSITIONS   = 30      # Max TAIL candidates (non-HEAD pool)
+MAX_TOTAL_POSITIONS  = 40      # Hard cap: HEAD + TAIL combined
 ```
 
 ### Exit rules (`config_strategy.py`)
 ```python
-EXIT_UP_MOVE_PCT =  0.5       # ret_open_to_935 > 0.5% -> exit at 9:35
-V2_CLASSIFY_TIME      = "09:35"
-EXIT_BUCKET_1130_TIME = "11:30"
-V2_FAILSAFE_TIME      = "11:35"
+TRAILING_STOP_PCT     = 1.25       # % trail from high-water mark for continuation names
+V2_CLASSIFY_TIME      = "09:35"    # Entry-price classification + trailing stop placement
+EXIT_BUCKET_1130_TIME = "11:30"    # Hard fallback: cancel trailing stops + market sell all
+V2_FAILSAFE_TIME      = "11:35"    # Post-exit broker verification
 ```
 
 ### Timing (`config_strategy.py`)
@@ -438,6 +433,8 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 
 | Start time | Has positions | Action |
 |------------|--------------|--------|
+| Before 9:30 AM | Any | Normal startup |
+| 9:30–11:35 AM | Yes | Resumes from last saved state (crash recovery) |
 | After 11:35 AM | Yes | Immediate failsafe flatten, then continues to afternoon |
 | After 4:00 PM | Any | Logs error, exits |
 | 11:35 AM–3:30 PM | No | Waits for 3:30 PM data collection |
@@ -446,13 +443,13 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 
 ## Known Limitations
 
-1. **Massive API dependency** — Universe building requires Massive API. Alpaca fallback is slower and may miss symbols.
-2. **Polling-based execution** — 1-second event loop. Very fast market moves between polls could be missed.
-3. **Single-day holding period** — Strategy assumes next-morning exit. Extended holds are not supported.
-4. **No sector diversification** — Selection is purely momentum-based; can concentrate in a single sector.
-5. **Broker API dependency** — Failsafe and reconciliation rely on broker API availability.
-6. **No real-time alerts** — Bot logs to file only; no push notifications for critical events.
-7. **Minute bar data quality** — Symbols with fewer than 30 bars are excluded from scoring.
+1. **Massive API dependency** — Universe building requires Massive API; Alpaca fallback is slower and may miss symbols.
+2. **Polling-based execution** — 1-second event loop; very fast intraday moves between polls could be missed.
+3. **Single-day holding period** — Strategy assumes next-morning exit; extended holds not supported.
+4. **No sector diversification** — Selection is purely momentum-based; can concentrate in one sector.
+5. **Trailing stop market conversion** — Alpaca trailing stops convert to market orders on trigger; fill price may differ from stop price in fast markets.
+6. **Trailing stops inactive outside RTH** — Alpaca trailing stops do not trigger in extended hours; they activate at 9:30 AM the following day if still open (not expected in normal operation).
+7. **No real-time alerts** — Bot logs to file only; no push notifications for critical events.
 8. **No drawdown protection** — Bot enters positions regardless of recent P&L history.
 
 ---
@@ -461,10 +458,11 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 
 ⚠️ **This is an overnight momentum strategy with significant risks:**
 
-- **Overnight gap risk (no hard stop)** — There is no stop-loss. A large gap-down at the open is held through the open and not exited until 9:35 (if it gapped up enough to trigger the rule) or 11:30
-- **Momentum reversal risk** — Late-day strength can reverse overnight
-- **Liquidity risk** — 0.3% ADV cap may not prevent slippage in thin small-cap names
-- **Technology risk** — API failures or bugs could cause missed exits
-- **PDT risk** — Same-day re-entries blocked when equity < $50,000; accounts < $25,000 subject to PDT rules
+- **Overnight gap risk** — No hard stop-loss. A large gap-down at open is held through 9:35 classification; if `price_935 ≤ entry_price` the position is sold immediately at 9:35, but the loss is already realised at the open price.
+- **Trailing stop slippage** — In fast or gapping markets the execution price of a triggered trailing stop can be significantly below the stop trigger price.
+- **Momentum reversal risk** — Late-day strength used as a selection signal can fully reverse overnight.
+- **Liquidity risk** — 0.3% ADV cap limits position size but does not eliminate slippage in thin small-cap names.
+- **Technology risk** — API failures or bugs could cause missed exits. Failsafe layer mitigates but does not eliminate this.
+- **PDT risk** — Same-day re-entries blocked when equity < $50,000; accounts < $25,000 subject to PDT rules.
 
 **Always test in paper trading first. Never risk capital you cannot afford to lose.**

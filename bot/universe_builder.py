@@ -588,8 +588,17 @@ def save_run_health(
         logger.error(f"Failed to save run health report: {e}")
 
 
-def save_candidates_audit(candidates: List[dict]):
-    """Save daily scored candidates to state/logs/candidates_YYYY-MM-DD.json."""
+def save_candidates_audit(candidates):
+    """Save daily scored candidates to state/logs/candidates_YYYY-MM-DD.json.
+
+    Args:
+        candidates: Either a List[dict] (legacy, single ranked list) or a
+                    dict with named ranked views, e.g.:
+                    {
+                      "top_20_by_head_score": [...],
+                      "top_20_by_composite_score": [...],
+                    }
+    """
     today = date.today().isoformat()
     path = os.path.join(config.LOG_DIR, f"candidates_{today}.json")
     try:

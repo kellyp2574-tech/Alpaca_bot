@@ -88,7 +88,12 @@ class MomentumCandidate:
 
     # Scored
     composite_score: float = 0.0
+    head_score: float = 0.0      # Late-day continuation score (HEAD selection)
     bucket: int = 0
+
+    # Dollar volume fields for head score
+    dollar_volume_last_60min: float = 0.0   # $ volume in last 60 min
+    dollar_volume_930_to_350: float = 0.0   # $ volume 9:30-3:50 total
 
 
 # ──────────────────────────────────────────────────────────────
@@ -200,6 +205,58 @@ def compute_raw_metrics_350(
 
 
 # ──────────────────────────────────────────────────────────────
+# Step 2b: Compute HEAD score (late-day continuation)
+# ──────────────────────────────────────────────────────────────
+
+def compute_head_score(
+    candidates: List[MomentumCandidate],
+    minute_bars: Dict[str, List[dict]],
+) -> List[MomentumCandidate]:
+    """Compute the HEAD score for each candidate.
+
+    HEAD score (raw, NOT z-scored) — designed to rank late-day continuation:
+
+        late_day_share = dollar_volume_last_60min / dollar_volume_930_to_350
+        head_score = 0.40 * late_day_share
+                   - 0.30 * proximity_to_high
+                   - 0.10 * atr_percent
+
+    Higher is better:
+      - High late_day_share  → volume is concentrating at end of day (continuation signal)
+      - Low proximity_to_high → not extended / not at a local peak
+      - Low atr_percent      → lower volatility is preferred for reliable continuation
+
+    Dollar volumes are computed from minute bars here to avoid re-fetching.
+    """
+    for c in candidates:
+        bars = minute_bars.get(c.symbol, [])
+        if not bars:
+            continue
+
+        # Total dollar volume 9:30-3:50
+        total_dv = sum(b.get("v", 0) * b.get("c", 0) for b in bars)
+        c.dollar_volume_930_to_350 = total_dv
+
+        # Dollar volume in last 60 bars (last ~60 minutes)
+        last_60 = bars[-60:] if len(bars) >= 60 else bars
+        dv_60 = sum(b.get("v", 0) * b.get("c", 0) for b in last_60)
+        c.dollar_volume_last_60min = dv_60
+
+        if total_dv > 0:
+            late_day_share = dv_60 / total_dv
+        else:
+            late_day_share = 0.0
+
+        c.head_score = (
+            0.40 * late_day_share
+            - 0.30 * c.proximity_to_high
+            - 0.10 * c.atr_percent
+        )
+
+    return candidates
+
+
+# ──────────────────────────────────────────────────────────────
 # Step 3: Normalize + score
 # ──────────────────────────────────────────────────────────────
 
@@ -278,66 +335,60 @@ def allocate_head_tail(
     total_capital: float,
     sel: Optional[SelectionConfig] = None,
 ) -> List[Allocation]:
-    """HEAD/TAIL position allocator — runs once per day before entry.
+    """HEAD/TAIL waterfall allocator — runs once per day before entry.
 
     Decision tree:
-      1. Rank candidates by composite_score descending.
-      2. Split: head = top max_head_positions, tail = rest.
-      3. HEAD (HEAD_PCT of capital): equal-weight, ADV-capped, MIN_SHARES gate.
-         Unspent capital rolls into tail.
-      4. TAIL (TAIL_PCT + leftover): waterfall until capital or position cap exhausted.
-      5. Combine and return.
+      1. All candidates sorted by head_score descending → top HEAD_COUNT = HEAD pool.
+      2. HEAD: equal-weight slots (total_capital / HEAD_COUNT), each capped at ADV.
+         Unallocated capital (ADV-limited slots or skipped) rolls into TAIL.
+      3. Remaining candidates (non-HEAD), sorted by composite_score descending = TAIL pool.
+         Waterfall: each gets min(dynamic_slice, ADV cap, remaining_capital).
+         dynamic_slice = remaining_capital / max(1, tail_positions_remaining).
+      4. Combine HEAD + TAIL and return.
 
     Args:
-        candidates: Scored + bucketed candidates.
-        total_capital: Deployable cash (equity × leverage).
-        sel: Runtime selection config (from get_selection_config). Uses
-             global defaults when None.
+        candidates: Scored + bucketed candidates (both head_score and composite_score set).
+        total_capital: Deployable capital (buying_power capped by equity * leverage).
+        sel: Runtime selection config (from get_selection_config).
 
     Returns:
         List[Allocation] ordered head-first then tail by rank.
     """
-    min_bucket = sel.min_bucket if sel else 4
     adv_cap_pct = sel.adv_cap_pct if sel else config.ADV_CAP_PCT
     min_shares = sel.min_shares if sel else config.MIN_SHARES
-    max_head = sel.max_head_positions if sel else config.MAX_HEAD_POSITIONS
-    max_total = sel.max_positions if sel else config.MAX_TOTAL_POSITIONS
-    head_pct = config.HEAD_PCT
-    tail_pct = config.TAIL_PCT
+    head_count = config.HEAD_COUNT
+    tail_max = config.TAIL_MAX_POSITIONS
+    max_total = config.MAX_TOTAL_POSITIONS
 
-    # ── Step 1: filter + rank ────────────────────────────
-    eligible = [c for c in candidates if c.bucket >= min_bucket]
-    if not eligible:
-        logger.warning(f"No candidates with bucket >= {min_bucket}")
+    if not candidates:
+        logger.warning("allocate_head_tail: no candidates provided")
         return []
 
-    eligible.sort(key=lambda c: c.composite_score, reverse=True)
+    # ── Step 1: HEAD — top HEAD_COUNT by head_score ───────
+    all_sorted_head = sorted(candidates, key=lambda c: c.head_score, reverse=True)
+    head_candidates = all_sorted_head[:head_count]
+    head_symbols = {c.symbol for c in head_candidates}
 
-    # ── Step 2: split HEAD / TAIL ────────────────────────
-    head_candidates = eligible[:max_head]
-    tail_candidates = eligible[max_head:]
-
-    # ── Step 3: allocate HEAD (equal-weight) ─────────────
-    head_capital = total_capital * head_pct
-    slot_size = head_capital / len(head_candidates) if head_candidates else 0
-
+    slot_size = total_capital / head_count if head_count > 0 else 0.0
     head_allocations: List[Allocation] = []
     head_leftover = 0.0
 
     for rank, c in enumerate(head_candidates, start=1):
         if c.signal_price <= 0:
             head_leftover += slot_size
+            logger.info(f"HEAD skip {c.symbol}: price=0")
             continue
 
-        max_dollars = min(slot_size, c.adv_dollars * adv_cap_pct) if c.adv_dollars > 0 else slot_size
+        adv_cap = c.adv_dollars * adv_cap_pct if c.adv_dollars > 0 else slot_size
+        max_dollars = min(slot_size, adv_cap)
         shares = math.floor(max_dollars / c.signal_price)
 
         if shares < min_shares:
-            head_leftover += slot_size      # roll full slot forward
+            head_leftover += slot_size
             logger.info(
                 f"HEAD skip {c.symbol}: {shares} shares < {min_shares} min "
                 f"(price={c.signal_price:.2f}, slot=${slot_size:,.0f}, "
-                f"adv_cap=${c.adv_dollars * adv_cap_pct:,.0f})"
+                f"adv_cap=${adv_cap:,.0f})"
             )
             continue
 
@@ -350,43 +401,44 @@ def allocate_head_tail(
             candidate=c,
         ))
         head_leftover += (slot_size - cost)
+        logger.debug(
+            f"HEAD {rank} {c.symbol}: {shares} shares @ ${c.signal_price:.2f} "
+            f"= ${cost:,.0f} (head_score={c.head_score:.4f})"
+        )
 
-    # ── Step 4: allocate TAIL (spread waterfall) ─────────
-    tail_capital = total_capital * tail_pct + head_leftover
-    remaining_cash = tail_capital
+    # ── Step 2: TAIL — remaining candidates by composite_score ──
+    tail_candidates = [c for c in candidates if c.symbol not in head_symbols]
+    tail_candidates.sort(key=lambda c: c.composite_score, reverse=True)
+    tail_candidates = tail_candidates[:tail_max]  # limit pool size
+
+    remaining_cash = head_leftover
     positions_count = len(head_allocations)
-
     tail_allocations: List[Allocation] = []
 
-    # Compute per-position slice: spread tail across target_slots,
-    # also cap at head_slot * TAIL_MAX_POSITION_FACTOR to prevent
-    # any single tail name from absorbing the whole tail budget.
-    target_slots = config.TAIL_TARGET_SLOTS
-    base_tail_slice = tail_capital / target_slots if target_slots > 0 else tail_capital
-    head_slot_size = slot_size if head_candidates else tail_capital
-    tail_position_cap = min(
-        base_tail_slice,
-        head_slot_size * config.TAIL_MAX_POSITION_FACTOR,
-    )
-
-    deployed_so_far = sum(a.shares * a.candidate.signal_price for a in head_allocations)
-
-    skip_reasons = {
+    skip_reasons: Dict[str, int] = {
         "max_positions": 0,
         "insufficient_cash": 0,
         "min_shares": 0,
         "price_zero": 0,
     }
 
-    for rank_offset, c in enumerate(tail_candidates, start=max_head + 1):
+    tail_remaining = len(tail_candidates)
+
+    for tail_rank, c in enumerate(tail_candidates, start=1):
         if c.signal_price <= 0:
             skip_reasons["price_zero"] += 1
+            tail_remaining -= 1
             continue
 
         if positions_count >= max_total:
             skip_reasons["max_positions"] += 1
-            logger.info(f"TAIL: reached max positions ({max_total}), stopping")
+            logger.info(f"TAIL: reached max_total ({max_total}), stopping")
             break
+
+        # Dynamic slice: spread remaining cash equally across remaining candidates
+        dynamic_slice = remaining_cash / max(1, tail_remaining)
+        adv_cap = c.adv_dollars * adv_cap_pct if c.adv_dollars > 0 else dynamic_slice
+        max_dollars = min(dynamic_slice, adv_cap, remaining_cash)
 
         min_cost_needed = c.signal_price * min_shares
         if remaining_cash < min_cost_needed:
@@ -395,46 +447,41 @@ def allocate_head_tail(
                 f"TAIL skip {c.symbol}: remaining ${remaining_cash:,.0f} "
                 f"< min cost ${min_cost_needed:,.0f}"
             )
+            tail_remaining -= 1
             continue
 
-        # Cap: slice target, ADV cap, position cap, remaining cash
-        adv_cap = c.adv_dollars * adv_cap_pct if c.adv_dollars > 0 else tail_position_cap
-        max_dollars = min(tail_position_cap, adv_cap, remaining_cash)
         shares = math.floor(max_dollars / c.signal_price)
-
         if shares < min_shares:
             skip_reasons["min_shares"] += 1
             logger.debug(
                 f"TAIL skip {c.symbol}: {shares} shares < {min_shares} min "
                 f"(price=${c.signal_price:.2f}, max_dollars=${max_dollars:,.0f})"
             )
-            continue        # skip, do NOT consume cash
+            tail_remaining -= 1
+            continue
 
         cost = shares * c.signal_price
         tail_allocations.append(Allocation(
             symbol=c.symbol,
             shares=shares,
-            rank=rank_offset,
+            rank=head_count + tail_rank,
             alloc_bucket="TAIL",
             candidate=c,
         ))
         remaining_cash -= cost
-        deployed_so_far += cost
         positions_count += 1
+        tail_remaining -= 1
 
-        deploy_pct = deployed_so_far / total_capital * 100
         logger.debug(
-            f"TAIL allocated {c.symbol}: ${cost:,.0f} "
-            f"(slice=${max_dollars:,.0f}, cap=${tail_position_cap:,.0f}), "
-            f"{deploy_pct:.1f}% total deployed"
+            f"TAIL {tail_rank} {c.symbol}: {shares} shares @ ${c.signal_price:.2f} "
+            f"= ${cost:,.0f} (score={c.composite_score:.3f})"
         )
 
-    # ── Step 5: combine ──────────────────────────────────
+    # ── Step 3: combine + safety check ───────────────────
     final = head_allocations + tail_allocations
 
-    # ── Step 6: safety ───────────────────────────────────
     total_cost = sum(a.shares * a.candidate.signal_price for a in final)
-    if total_cost > total_capital * 1.001:  # tiny float tolerance
+    if total_cost > total_capital * 1.001:
         logger.error(
             f"Allocation exceeds capital: ${total_cost:,.2f} > ${total_capital:,.2f}"
         )
@@ -442,39 +489,40 @@ def allocate_head_tail(
     # ── Logging ──────────────────────────────────────────
     head_cost = sum(a.shares * a.candidate.signal_price for a in head_allocations)
     tail_cost = sum(a.shares * a.candidate.signal_price for a in tail_allocations)
-    deploy_pct = total_cost / total_capital * 100
-    
+    deploy_pct = total_cost / total_capital * 100 if total_capital > 0 else 0.0
+
     logger.info(
-        f"HEAD/TAIL allocation: {len(final)} positions from {len(eligible)} eligible "
-        f"(capital=${total_capital:,.0f})"
+        f"HEAD/TAIL allocation: {len(final)} positions "
+        f"({len(head_allocations)} HEAD + {len(tail_allocations)} TAIL) "
+        f"from {len(candidates)} candidates (capital=${total_capital:,.0f})"
     )
     logger.info(
-        f"  HEAD: {len(head_allocations)} positions, ${head_cost:,.0f} deployed "
-        f"({head_cost / total_capital * 100:.1f}%)"
+        f"  HEAD: {len(head_allocations)}/{head_count} filled, "
+        f"${head_cost:,.0f} ({head_cost / total_capital * 100:.1f}%), "
+        f"slot=${slot_size:,.0f}, leftover=${head_leftover:,.0f}"
     )
     logger.info(
-        f"  TAIL: {len(tail_allocations)} positions, ${tail_cost:,.0f} deployed "
-        f"({tail_cost / total_capital * 100:.1f}%) "
-        f"[slice_cap=${tail_position_cap:,.0f}, target_slots={target_slots}]"
+        f"  TAIL: {len(tail_allocations)} positions, "
+        f"${tail_cost:,.0f} ({tail_cost / total_capital * 100:.1f}%), "
+        f"pool={len(tail_candidates)} candidates"
     )
     logger.info(
-        f"  Total: ${total_cost:,.0f} deployed "
-        f"({deploy_pct:.1f}%), "
+        f"  Total: ${total_cost:,.0f} deployed ({deploy_pct:.1f}%), "
         f"${total_capital - total_cost:,.0f} undeployed"
     )
 
-    skipped_head = len(head_candidates) - len(head_allocations)
+    skipped_head = head_count - len(head_allocations)
     if skipped_head > 0:
-        logger.info(f"HEAD: {skipped_head} candidates skipped (price=0, ADV caps, or min_shares={min_shares})")
+        logger.info(f"  HEAD: {skipped_head} slots skipped (ADV cap or min_shares)")
 
     total_tail_skips = sum(skip_reasons.values())
     if total_tail_skips > 0:
-        reasons_str = ", ".join(f"{k}: {v}" for k, v in skip_reasons.items() if v > 0)
-        logger.info(f"TAIL skip reasons: {reasons_str}")
+        reasons_str = ", ".join(f"{k}={v}" for k, v in skip_reasons.items() if v > 0)
+        logger.info(f"  TAIL skips: {reasons_str}")
 
     if deploy_pct < 80.0:
         logger.warning(
-            f"Deployment below 80% target: {deploy_pct:.1f}% deployed "
+            f"Deployment below 80%: {deploy_pct:.1f}% "
             f"(${total_cost:,.0f} of ${total_capital:,.0f})"
         )
 

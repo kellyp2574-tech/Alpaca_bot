@@ -16,9 +16,9 @@ SCORE_WEIGHT_ATR_PCT = -0.10    # negative = penalty for high volatility
 # Account-tier selection presets
 # ═══════════════════════════════════════════════════
 STRATEGY_TIERS = [
-    {"max_equity": 25_000,  "min_bucket": 4, "max_positions": 30},
-    {"max_equity": 100_000, "min_bucket": 4, "max_positions": 30},
-    {"max_equity": None,    "min_bucket": 4, "max_positions": 30},
+    {"max_equity": 25_000,  "min_bucket": 4, "max_positions": 40},
+    {"max_equity": 100_000, "min_bucket": 4, "max_positions": 40},
+    {"max_equity": None,    "min_bucket": 4, "max_positions": 40},
 ]
 
 # ═══════════════════════════════════════════════════
@@ -29,18 +29,21 @@ ADV_CAP_PCT = 0.003         # 0.3% of ADV max position size
 MAX_POSITION_DOLLARS = 50_000  # Legacy: absolute dollar cap (used by position_manager)
 MIN_SHARES = 25             # Minimum share count per position
 
-HEAD_PCT = 0.70             # 70% of capital to top-ranked positions
-TAIL_PCT = 0.30             # 30% of capital to remaining candidates
-MAX_HEAD_POSITIONS = 10     # Equal-weight top N
-MAX_TOTAL_POSITIONS = 30    # Hard cap including head + tail
-TAIL_TARGET_SLOTS = 5       # Target number of tail positions for slice sizing
-TAIL_MAX_POSITION_FACTOR = 0.75  # Max tail position = head slot × this factor
+HEAD_COUNT = 10             # Fixed number of equal-weight HEAD positions
+TAIL_MAX_POSITIONS = 30     # Max tail candidates after head symbols removed
+MAX_TOTAL_POSITIONS = 40    # Hard cap: HEAD_COUNT + TAIL_MAX_POSITIONS
+MAX_HEAD_POSITIONS = HEAD_COUNT   # Compat alias used by SelectionConfig
+
+# Trailing stop for continuation positions (placed at 9:35 AM)
+TRAILING_STOP_PCT = 1.25    # 1.25% trail from high-water mark
 
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
 # ═══════════════════════════════════════════════════
-# Exit rule: ret_open_to_935 > EXIT_UP_MOVE_PCT -> exit at 9:35, else -> exit at 11:30
-EXIT_UP_MOVE_PCT = 0.5       # % threshold for immediate 9:35 exit (authoritative)
+# Entry-based 9:35 classification:
+#   price_935 > entry_price  -> place 1.25% trailing stop (continuation)
+#   price_935 <= entry_price -> exit immediately at 9:35 (gap faded)
+# 11:30 is the hard fallback: cancel any live trailing stop + market sell.
 V2_FAILSAFE_TIME = "11:35"   # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
@@ -82,5 +85,7 @@ SECTOR_ETFS = {
 }
 MARKET_BENCHMARK = "SPY"
 
-# Compat: legacy position_manager methods reference MAX_POSITIONS directly.
+# Compat aliases
 MAX_POSITIONS = MAX_TOTAL_POSITIONS
+HEAD_PCT = 0.0   # Unused — waterfall allocator does not use fixed pct split
+TAIL_PCT = 0.0   # Unused — kept for any old import references

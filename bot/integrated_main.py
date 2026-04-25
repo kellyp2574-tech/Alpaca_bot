@@ -5,10 +5,10 @@ Daily Schedule (ET) — bot starts at 9:00 AM:
 MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
   09:00  Start, detect overnight positions from broker
   09:30  Market open — capture RTH open prices (no exits; all positions held)
-  09:35  Classify each position by open-to-9:35 return:
-           ret > +0.5%   -> exit immediately at 09:35
-           otherwise     -> hold to 11:30
-  11:30  Exit remaining (hold) positions
+  09:35  Classify each position by entry-price comparison:
+           price_935 > entry_price  -> place 1.25% trailing stop (continuation)
+           price_935 <= entry_price -> exit immediately at 09:35 (gap faded)
+  11:30  Cancel any live trailing stops + market sell remaining positions
   11:35  Post-exit failsafe verification
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
@@ -36,6 +36,7 @@ from bot.momentum_scorer import (
     Allocation,
     build_signal_candidates_350,
     compute_raw_metrics_350,
+    compute_head_score,
     normalize_and_score_350,
     assign_buckets,
     allocate_head_tail,
@@ -44,6 +45,7 @@ from bot.exit_classifier import (
     classify_positions,
     ExitClassification,
     EXIT_BUCKET_935,
+    EXIT_BUCKET_TRAIL,
     EXIT_BUCKET_1130,
 )
 from bot.position_manager_overnight import PositionManager, Position
@@ -133,6 +135,9 @@ class OvernightMomentumBot:
 
         # PDT guard: symbols sold today (no same-day re-entry when equity < $50k)
         self.sold_today: set = set()
+
+        # Trailing stop order IDs placed at 9:35 (for cancel-before-market-sell at 11:30)
+        self.trailing_order_ids: Dict[str, str] = {}  # {symbol: order_id}
 
         # Retry counters
         self.universe_retry_count = 0
@@ -348,14 +353,12 @@ class OvernightMomentumBot:
         logger.info(f"OPEN CAPTURE: {captured}/{len(positions)} open prices captured from snapshot")
 
     def _classify_and_exit_v2(self):
-        """9:35 AM: Classify positions and execute immediate 9:35 exits.
+        """9:35 AM: Classify positions and act:
 
-        Rule: if ret_open_to_935 > EXIT_UP_MOVE_PCT -> exit now at 9:35
-              otherwise -> hold to 11:30 bucket.
+          price_935 > entry_price  -> place 1.25% trailing stop (continuation)
+          price_935 <= entry_price -> exit immediately (gap faded)
 
-        Price sourcing:
-          open_price  : 9:30 snapshot (preferred) or first minute-bar open (fallback)
-          price_935   : last 9:30-9:35 minute-bar close (preferred) or snapshot fallback
+        11:30 fallback: cancel any live trailing stops + market sell survivors.
         """
         positions = list(self.position_mgr.positions.items())
         if not positions:
@@ -368,7 +371,7 @@ class OvernightMomentumBot:
         # 1) Fetch 9:35 snapshots (used as price_935 fallback)
         snapshots = self.alpaca.get_snapshots(symbols)
 
-        # 2) Fetch 9:30-9:35 minute bars (primary source for open fallback + price_935)
+        # 2) Fetch 9:30-9:35 minute bars (primary source for price_935)
         today = date.today().isoformat()
         et_offset = _et_utc_offset_str()
         minute_bars = self.alpaca.get_minute_bars(
@@ -377,7 +380,7 @@ class OvernightMomentumBot:
             f"{today}T09:35:00{et_offset}",
         )
 
-        # 3) Resolve open prices, tracking the source for each symbol
+        # 3) Resolve open prices (for gap_pct logging only — not used for classification)
         open_price_sources: Dict[str, str] = {}
         for symbol in symbols:
             if symbol in self.open_prices:
@@ -389,24 +392,12 @@ class OvernightMomentumBot:
                     if bar_open and bar_open > 0:
                         self.open_prices[symbol] = bar_open
                         open_price_sources[symbol] = "minute_bar"
-                        logger.info(
-                            f"EXIT CLASSIFY: {symbol} open from minute-bar fallback: "
-                            f"{bar_open:.4f} (snapshot not available at 9:30)"
-                        )
                     else:
                         open_price_sources[symbol] = "missing"
-                        logger.warning(
-                            f"EXIT CLASSIFY: {symbol} no usable open price from "
-                            f"snapshot or minute bars — will default to 11:30"
-                        )
                 else:
                     open_price_sources[symbol] = "missing"
-                    logger.warning(
-                        f"EXIT CLASSIFY: {symbol} no minute bars and no snapshot open "
-                        f"— will default to 11:30"
-                    )
 
-        # 4) Build entry_prices for gap logging
+        # 4) Build entry_prices for classification
         entry_prices = {s: p.entry_price for s, p in positions}
 
         # 5) Classify all positions
@@ -420,13 +411,14 @@ class OvernightMomentumBot:
         )
 
         # 6) Store schedule and classification audit
-        self.exit_schedule = {sym: cls.exit_time for sym, cls in classifications.items()}
+        self.exit_schedule = {sym: cls.exit_bucket for sym, cls in classifications.items()}
         self.classification_audit = {
             sym: {
+                "entry_price":       cls.entry_price,
                 "open_price":        cls.open_price,
                 "price_935":         cls.price_935,
-                "move_5m_pct":       cls.move_5m_pct,
-                "exit_time":         cls.exit_time,
+                "ret_vs_entry_pct":  cls.ret_vs_entry_pct,
+                "exit_bucket":       cls.exit_bucket,
                 "open_price_source": cls.open_price_source,
                 "price_935_source":  cls.price_935_source,
                 "gap_pct":           cls.gap_pct,
@@ -434,29 +426,95 @@ class OvernightMomentumBot:
             for sym, cls in classifications.items()
         }
 
-        # 7) Execute immediate 9:35 exits
+        # 7) Execute immediate exits for faded positions
         exits_935 = [sym for sym, cls in classifications.items()
-                     if cls.exit_time == EXIT_BUCKET_935]
+                     if cls.exit_bucket == EXIT_BUCKET_935]
         if exits_935:
-            logger.info(f"EXIT CLASSIFY: executing {len(exits_935)} immediate 9:35 exits")
+            logger.info(f"EXIT CLASSIFY: {len(exits_935)} positions faded — exiting immediately")
             for symbol in exits_935:
-                self._exit_single_position(symbol, f"move > {config.EXIT_UP_MOVE_PCT}% from open -> 9:35 exit")
+                self._exit_single_position(symbol, "price_935 <= entry_price -> 9:35 exit")
         else:
-            logger.info("EXIT CLASSIFY: no positions in 9:35 bucket")
+            logger.info("EXIT CLASSIFY: no positions in immediate-exit bucket")
+
+        # 8) Place trailing stops for continuation positions
+        trail_symbols = [sym for sym, cls in classifications.items()
+                         if cls.exit_bucket == EXIT_BUCKET_TRAIL
+                         and sym in self.position_mgr.positions]
+        if trail_symbols:
+            logger.info(
+                f"EXIT CLASSIFY: {len(trail_symbols)} continuation positions — "
+                f"placing {config.TRAILING_STOP_PCT}% trailing stops"
+            )
+            for symbol in trail_symbols:
+                position = self.position_mgr.positions.get(symbol)
+                if not position:
+                    continue
+                trail_resp = self.position_mgr.submit_trailing_stop_sell(
+                    symbol=symbol,
+                    qty=position.quantity,
+                    trail_percent=config.TRAILING_STOP_PCT,
+                )
+                if trail_resp:
+                    order_id = trail_resp.get("id")
+                    if order_id:
+                        self.trailing_order_ids[symbol] = order_id
+                        logger.info(
+                            f"TRAIL {symbol}: trailing stop placed "
+                            f"(qty={position.quantity}, trail={config.TRAILING_STOP_PCT}%, "
+                            f"order_id={order_id})"
+                        )
+                else:
+                    logger.warning(
+                        f"TRAIL {symbol}: failed to place trailing stop — "
+                        f"will fallback to market sell at 11:30"
+                    )
+        else:
+            logger.info("EXIT CLASSIFY: no positions in trailing-stop bucket")
 
     def _exit_bucket(self, bucket: str, reason: str):
-        """Exit all positions scheduled for the given time bucket."""
-        symbols = [sym for sym, t in self.exit_schedule.items()
-                   if t == bucket and sym in self.position_mgr.positions]
+        """Exit all positions in the given bucket.
+
+        For the 11:30 bucket this also cancels any live trailing stop orders
+        before submitting market sells, to avoid double-selling.
+        For any remaining positions not in the schedule (e.g. trailing stop
+        already filled them), broker reconciliation will clean up local state.
+        """
+        # Determine symbols: include scheduled-for-this-bucket AND any
+        # unscheduled survivors still held locally (catch-all).
+        if bucket == EXIT_BUCKET_1130:
+            # Cancel all live trailing stops first
+            trail_symbols_to_cancel = [
+                sym for sym in list(self.trailing_order_ids.keys())
+                if sym in self.position_mgr.positions
+            ]
+            if trail_symbols_to_cancel:
+                logger.info(
+                    f"{reason}: canceling {len(trail_symbols_to_cancel)} live trailing stops "
+                    f"before market sell: {trail_symbols_to_cancel}"
+                )
+                for symbol in trail_symbols_to_cancel:
+                    order_id = self.trailing_order_ids.get(symbol)
+                    if order_id:
+                        self.position_mgr._cancel_order(order_id)
+                    self.trailing_order_ids.pop(symbol, None)
+
+            # Exit ALL remaining local positions (trailing stop may have filled some)
+            # First reconcile so we don't try to sell already-closed positions
+            self.position_mgr.reconcile_local_positions_from_broker()
+            symbols = list(self.position_mgr.positions.keys())
+        else:
+            symbols = [sym for sym, t in self.exit_schedule.items()
+                       if t == bucket and sym in self.position_mgr.positions]
+
         if not symbols:
-            logger.info(f"{reason}: no positions in this bucket")
+            logger.info(f"{reason}: no positions remaining")
             return
 
         logger.info(f"{reason}: exiting {len(symbols)} positions: {symbols}")
         for symbol in symbols:
             self._exit_single_position(symbol, reason)
 
-        # Fix 4: reconcile local state with broker after each exit wave
+        # Reconcile local state with broker after exit wave
         actions = self.position_mgr.reconcile_local_positions_from_broker()
         if actions:
             logger.info(f"{reason}: post-exit reconciliation adjustments: {actions}")
@@ -484,17 +542,13 @@ class OvernightMomentumBot:
         still_held = symbol in self.position_mgr.positions
         if still_held:
             remaining = self.position_mgr.positions[symbol].quantity
-            # Re-route to next bucket so leftovers are retried automatically
             current_bucket = self.exit_schedule.get(symbol)
-            next_bucket = None
-            if current_bucket == EXIT_BUCKET_935:
-                next_bucket = EXIT_BUCKET_1130
-
-            if next_bucket:
-                self.exit_schedule[symbol] = next_bucket
+            # Both 9:35 exits and incomplete trailing-stop exits fall back to 11:30
+            if current_bucket in (EXIT_BUCKET_935, EXIT_BUCKET_TRAIL):
+                self.exit_schedule[symbol] = EXIT_BUCKET_1130
                 logger.warning(
                     f"EXIT INCOMPLETE {symbol}: {remaining} shares still held — "
-                    f"re-routed {current_bucket} -> {next_bucket}"
+                    f"re-routed {current_bucket} -> {EXIT_BUCKET_1130}"
                 )
             else:
                 logger.warning(
@@ -601,6 +655,9 @@ class OvernightMomentumBot:
                 volume_last_60min, volume_avg_60min,
             )
 
+            # 5b. Compute HEAD score (late-day continuation signal)
+            candidates = compute_head_score(candidates, self._minute_bars)
+
             # 6. Normalize, score, bucket
             candidates = normalize_and_score_350(candidates)
             candidates = assign_buckets(candidates)
@@ -612,18 +669,23 @@ class OvernightMomentumBot:
 
             # Log top 10
             logger.info(f"Scoring complete: {len(candidates)} scored")
-            for c in candidates[:10]:
+            head_sorted = sorted(candidates, key=lambda c: c.head_score, reverse=True)
+            logger.info("Top 10 by HEAD score:")
+            for c in head_sorted[:10]:
                 logger.info(
-                    f"  {c.symbol}: score={c.composite_score:.3f} bucket={c.bucket} "
-                    f"ret={c.intraday_return:.2%} prox={c.proximity_to_high:.3f} "
-                    f"vol_vs_avg={c.volume_vs_avg:.2f} atr%={c.atr_percent:.3f}"
+                    f"  {c.symbol}: head={c.head_score:.4f} score={c.composite_score:.3f} "
+                    f"bucket={c.bucket} ret={c.intraday_return:.2%} "
+                    f"prox={c.proximity_to_high:.3f} atr%={c.atr_percent:.3f}"
                 )
 
-            # Save candidates audit artifact
-            top_20_dicts = [
-                {
-                    "symbol": c.symbol, "score": round(c.composite_score, 4),
-                    "bucket": c.bucket, "intraday_return": round(c.intraday_return, 4),
+            # Save candidates audit artifact — two ranked views
+            def _candidate_dict(c):
+                return {
+                    "symbol": c.symbol,
+                    "score": round(c.composite_score, 4),
+                    "head_score": round(c.head_score, 4),
+                    "bucket": c.bucket,
+                    "intraday_return": round(c.intraday_return, 4),
                     "proximity_to_high": round(c.proximity_to_high, 4),
                     "volume_vs_avg": round(c.volume_vs_avg, 2),
                     "volume_trend": round(c.volume_trend, 2),
@@ -632,13 +694,18 @@ class OvernightMomentumBot:
                     "signal_price": round(c.signal_price, 4),
                     "adv_dollars": round(c.adv_dollars, 0),
                 }
-                for c in candidates[:20]
-            ]
-            save_candidates_audit(top_20_dicts)
+
+            top_20_head = sorted(candidates, key=lambda c: c.head_score, reverse=True)[:20]
+            top_20_tail = sorted(candidates, key=lambda c: c.composite_score, reverse=True)[:20]
+            audit_dicts = {
+                "top_20_by_head_score": [_candidate_dict(c) for c in top_20_head],
+                "top_20_by_composite_score": [_candidate_dict(c) for c in top_20_tail],
+            }
+            save_candidates_audit(audit_dicts)
 
             # Also update universe audit with top 20
             if self._universe_diag:
-                save_universe_audit(self._universe_diag, self.universe, scored_top20=top_20_dicts)
+                save_universe_audit(self._universe_diag, self.universe, scored_top20=[_candidate_dict(c) for c in top_20_head])
 
         except Exception as e:
             logger.exception(f"Error in scoring: {e}")
@@ -1151,6 +1218,7 @@ class OvernightMomentumBot:
                 "entries_done": self.entries_done,
                 "open_prices": self.open_prices,
                 "sold_today": list(self.sold_today),
+                "trailing_order_ids": self.trailing_order_ids,
             }
             self.state_mgr.save_bot_state(bot_state)
         except Exception as e:
@@ -1184,6 +1252,7 @@ class OvernightMomentumBot:
         self.entries_done = bot_state.get("entries_done", False)
         self.open_prices = bot_state.get("open_prices", {})
         self.sold_today = set(bot_state.get("sold_today", []))
+        self.trailing_order_ids = bot_state.get("trailing_order_ids", {})
 
         # Load positions
         saved = self.state_mgr.load_positions()

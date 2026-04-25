@@ -159,6 +159,57 @@ class PositionManager:
             logger.error(f"Buy order FAILED (network) | symbol={symbol} | qty={qty} | error={e}")
             return None
 
+    def submit_trailing_stop_sell(
+        self, symbol: str, qty: int, trail_percent: float
+    ) -> Optional[dict]:
+        """Submit a trailing stop sell order via POST /v2/orders.
+
+        Alpaca trailing stop:
+          type = "trailing_stop"
+          trail_percent = e.g. 1.25  (meaning 1.25% trail from high-water mark)
+          time_in_force = "day"   (trailing stops only valid with "day" or "gtc")
+
+        Returns the order response dict or None on failure.
+        """
+        url = f"{self.base_url}/v2/orders"
+        order_data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "trailing_stop",
+            "time_in_force": "day",
+            "trail_percent": str(trail_percent),
+        }
+
+        try:
+            response = self.session.post(url, json=order_data, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            logger.info(
+                f"Trailing stop submitted: {symbol} x{qty} "
+                f"trail={trail_percent}% (ID: {order_id})"
+            )
+            return data
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "N/A"
+            body = ""
+            try:
+                body = e.response.text[:500] if e.response is not None else ""
+            except Exception:
+                body = "<unreadable>"
+            logger.error(
+                f"Trailing stop FAILED | symbol={symbol} | qty={qty} | "
+                f"trail={trail_percent}% | status={status_code} | body={body}"
+            )
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"Trailing stop FAILED (network) | symbol={symbol} | "
+                f"qty={qty} | trail={trail_percent}% | error={e}"
+            )
+            return None
+
     def _submit_sell_order(self, symbol: str, qty: int, order_type: str = "market",
                            limit_price: Optional[float] = None) -> Optional[dict]:
         """Submit a sell order via POST /v2/orders.
