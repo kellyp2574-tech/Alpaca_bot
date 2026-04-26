@@ -2,28 +2,10 @@
 import json
 import logging
 import os
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
-from datetime import datetime
+from typing import Dict, Optional
 from bot import config
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PositionState:
-    """Serializable position state"""
-    symbol: str
-    entry_price: float
-    quantity: int
-    entry_time: str
-    entry_gap_pct: float
-    adv_estimate: float
-    peak_price: float = 0.0
-    order_id: Optional[str] = None
-    trailing_stop_price: float = 0.0
-    is_trailing_active: bool = False
-    current_price: float = 0.0
 
 
 class StateManager:
@@ -32,7 +14,6 @@ class StateManager:
     def __init__(self):
         self.state_dir = config.STATE_DIR
         self.positions_file = config.POSITIONS_FILE
-        self.daily_log_file = config.DAILY_LOG_FILE
 
         # Ensure directories exist
         os.makedirs(self.state_dir, exist_ok=True)
@@ -50,13 +31,8 @@ class StateManager:
                     "entry_price": pos.entry_price,
                     "quantity": pos.quantity,
                     "entry_time": pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
-                    "entry_gap_pct": pos.entry_gap_pct,
                     "adv_estimate": pos.adv_estimate,
-                    "peak_price": pos.peak_price,
-                    "trailing_stop_price": getattr(pos, 'trailing_stop_price', 0),
-                    "is_trailing_active": getattr(pos, 'is_trailing_active', False),
                     "current_price": getattr(pos, 'current_price', pos.entry_price),
-                    "order_id": getattr(pos, 'order_id', None),
                 }
 
         try:
@@ -76,13 +52,6 @@ class StateManager:
 
             positions = {}
             for symbol, pos_data in data.items():
-                # Handle missing fields for backward compatibility
-                if 'order_id' not in pos_data:
-                    pos_data['order_id'] = None
-                if 'trailing_stop_price' not in pos_data:
-                    pos_data['trailing_stop_price'] = 0
-                if 'is_trailing_active' not in pos_data:
-                    pos_data['is_trailing_active'] = False
                 if 'current_price' not in pos_data:
                     pos_data['current_price'] = pos_data.get('entry_price', 0)
                 positions[symbol] = pos_data
@@ -124,31 +93,3 @@ class StateManager:
             logger.error(f"Error loading bot state: {e}")
             return None
 
-    def log_daily_summary(self, date: str, summary: dict):
-        """Log daily trading summary"""
-        log_entry = {
-            "date": date,
-            "timestamp": datetime.now().isoformat(),
-            **summary
-        }
-
-        # Append to daily log
-        logs = []
-        if os.path.exists(self.daily_log_file):
-            try:
-                with open(self.daily_log_file, 'r') as f:
-                    logs = json.load(f)
-            except (json.JSONDecodeError, IOError, OSError):
-                logs = []
-
-        logs.append(log_entry)
-
-        try:
-            with open(self.daily_log_file, 'w') as f:
-                json.dump(logs, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving daily log: {e}")
-
-    # Pre-trade state methods removed - now handled by integrated_main._save_pre_trade_state()
-    # with date validation. The schema differs (includes "date" field), so keeping these
-    # stale methods would create confusion and potential bugs.

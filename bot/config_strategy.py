@@ -16,9 +16,9 @@ SCORE_WEIGHT_ATR_PCT = -0.10    # negative = penalty for high volatility
 # Account-tier selection presets
 # ═══════════════════════════════════════════════════
 STRATEGY_TIERS = [
-    {"max_equity": 25_000,  "min_bucket": 4, "max_positions": 40},
-    {"max_equity": 100_000, "min_bucket": 4, "max_positions": 40},
-    {"max_equity": None,    "min_bucket": 4, "max_positions": 40},
+    {"max_equity": 25_000,  "min_bucket": 4, "max_positions": 25},
+    {"max_equity": 100_000, "min_bucket": 4, "max_positions": 25},
+    {"max_equity": None,    "min_bucket": 4, "max_positions": 25},
 ]
 
 # ═══════════════════════════════════════════════════
@@ -30,21 +30,15 @@ MAX_POSITION_DOLLARS = 50_000  # Legacy: absolute dollar cap (used by position_m
 MIN_SHARES = 25             # Minimum share count per position
 
 HEAD_COUNT = 10             # Fixed number of equal-weight HEAD positions
-TAIL_MAX_POSITIONS = 30     # Max tail candidates after head symbols removed
-MAX_TOTAL_POSITIONS = 40    # Hard cap: HEAD_COUNT + TAIL_MAX_POSITIONS
+TAIL_MAX_POSITIONS = 15     # Max tail candidates after head symbols removed
+MAX_TOTAL_POSITIONS = 25    # Hard cap: HEAD_COUNT + TAIL_MAX_POSITIONS
 MAX_HEAD_POSITIONS = HEAD_COUNT   # Compat alias used by SelectionConfig
-
-# Trailing stop for continuation positions (placed at 9:35 AM)
-TRAILING_STOP_PCT = 1.25    # 1.25% trail from high-water mark
 
 # ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
 # ═══════════════════════════════════════════════════
-# Entry-based 9:35 classification:
-#   price_935 > entry_price  -> place 1.25% trailing stop (continuation)
-#   price_935 <= entry_price -> exit immediately at 9:35 (gap faded)
-# 11:30 is the hard fallback: cancel any live trailing stop + market sell.
-V2_FAILSAFE_TIME = "11:35"   # Post-exit failsafe verification
+# Simple rule: market sell ALL positions at 9:40 AM, no conditions.
+V2_FAILSAFE_TIME = "09:45"   # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
 # Execution safety — buying power buffer + mop-up
@@ -64,8 +58,7 @@ ENTRY_TIME = "15:50"             # Execute entries (market orders)
 # Morning timeline (T+1 exit day)
 # ═══════════════════════════════════════════════════
 MARKET_OPEN_TIME = "09:30"
-V2_CLASSIFY_TIME = "09:35"       # Exit classification + immediate 9:35 exits
-EXIT_BUCKET_1130_TIME = "11:30"  # Hold bucket exit
+EXIT_940_TIME = "09:40"          # Market sell ALL positions
 
 # ═══════════════════════════════════════════════════
 # Sector ETFs — kept for future use when sector mapping is added
@@ -85,7 +78,3 @@ SECTOR_ETFS = {
 }
 MARKET_BENCHMARK = "SPY"
 
-# Compat aliases
-MAX_POSITIONS = MAX_TOTAL_POSITIONS
-HEAD_PCT = 0.0   # Unused — waterfall allocator does not use fixed pct split
-TAIL_PCT = 0.0   # Unused — kept for any old import references

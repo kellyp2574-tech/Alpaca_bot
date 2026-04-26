@@ -1,6 +1,6 @@
 # Overnight Momentum Trading Bot
 
-Automated equity trading strategy on Alpaca that captures overnight momentum by entering positions at 3:50 PM and exiting the next morning. Uses a dual-scoring model — a new **HEAD score** for late-day continuation candidates and an original **TAIL score** for broader momentum — with a waterfall capital allocator. Exits are driven by an entry-price comparison at 9:35 AM, placing trailing stops on continuation names and immediately selling gap-faded positions.
+Automated equity trading strategy on Alpaca that captures overnight momentum by entering positions at 3:50 PM and exiting the next morning. Uses a dual-scoring model — a **HEAD score** for late-day continuation candidates and a **TAIL score** for broader momentum — with a waterfall capital allocator. All positions are exited unconditionally via market sell at 9:40 AM.
 
 ---
 
@@ -11,9 +11,9 @@ Automated equity trading strategy on Alpaca that captures overnight momentum by 
 The bot runs a strict two-day cycle:
 
 - **T-1 afternoon (3:30–4:00 PM):** Build a tradeable universe, compute both HEAD and TAIL scores, allocate capital using a waterfall system (HEAD then TAIL), and submit market buy orders at 3:50 PM. Positions held overnight.
-- **T+1 morning (9:00–11:35 AM):** At 9:30 open prices are captured. At 9:35 each position is classified vs. its entry price — continuation names get a **1.25% trailing stop**, faded names are **sold immediately**. At 11:30 any live trailing stops are cancelled and remaining positions market-sold. Failsafe sweep at 11:35 AM.
+- **T+1 morning (9:00–9:45 AM):** At 9:30 positions fill at the open. At 9:40 AM **all positions are market-sold unconditionally** — no classification, no conditions. A failsafe sweep runs at 9:45 AM.
 
-The bot never holds past 11:35 AM intentionally.
+The bot never holds past 9:45 AM intentionally.
 
 ---
 
@@ -25,108 +25,42 @@ This traces `OvernightMomentumBot.run()` from startup through end of day.
 
 1. Logging initialised (file + stdout).
 2. `_load_state()` called:
-   - If `bot_state.json` is dated **today**: all stage flags restored (`v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`, `open_prices`, `exit_schedule`, `classification_audit`, `trailing_order_ids`).
+   - If `bot_state.json` is dated **today**: all stage flags restored (`v2_classified`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`, `sold_today`).
    - If from a **prior day**: ignored. `positions.json` loaded for overnight holds.
 3. `get_broker_positions()` fetches live Alpaca positions:
    - Positions exist → `reconcile_local_positions_from_broker()` syncs local to broker truth. `morning_exits_done = False`.
    - No positions → `morning_exits_done = True` (skip all morning exit logic).
-4. Schedule times pre-computed: `09:30`, `09:35`, `11:30`, `11:35`, `15:30`, `15:48`, `15:50`, `16:00`.
-5. **Late-start guard:** if time ≥ 11:35 and positions exist → `_run_failsafe_flatten()` immediately. `morning_exits_done = True`.
+4. Schedule times pre-computed: `09:30`, `09:40`, `09:45`, `15:30`, `15:48`, `15:50`, `16:00`.
+5. **Late-start guard:** if time ≥ 09:45 and positions exist → `_run_failsafe_flatten()` immediately. `morning_exits_done = True`.
 6. If time ≥ 16:00 → log error and return.
 7. **Main `while True` loop begins** — ticks every 1 second.
 
 ---
 
-### 9:00–9:30 AM — Waiting Loop
+### 9:00–9:40 AM — Waiting Loop
 
-Morning logic runs each tick. All time guards still `False`. If local positions empty but broker holds positions (crash recovery), `reconcile_local_positions_from_broker()` fires to rebuild local state before 9:30.
-
----
-
-### 9:30 AM — Open Price Capture (`_capture_open_prices()`)
-
-**Guard:** `not self.hard_stops_checked and current_time >= 09:30`
-
-**No positions exited here.** All overnight holds kept.
-
-1. Fetches Alpaca **snapshots** for all held symbols.
-2. Reads `snapshot["open"]` — the RTH opening print.
-   - Valid → stored in `self.open_prices[symbol]`, `position.current_price` updated.
-   - Missing/zero → deferred to 9:35 minute-bar fallback.
-3. State saved.
-
-> Open prices are used **only for gap logging** at 9:35 — they do not drive the exit decision.
+Morning logic runs each tick. All time guards still `False`. If local positions empty but broker holds positions (crash recovery), `reconcile_local_positions_from_broker()` fires to rebuild local state.
 
 ---
 
-### 9:35 AM — Classification + Exits (`_classify_and_exit_v2()`)
+### 9:40 AM — Market Sell All (`_exit_all_940()`)
 
-**Guard:** `not self.v2_classified and current_time >= 09:35`
+**Guard:** `not self.v2_classified and current_time >= 09:40`
 
-#### Step 1: Fetch data
-- `get_snapshots(symbols)` — fallback source for `price_935`.
-- `get_minute_bars(symbols, "09:30", "09:35")` — primary source for `price_935`.
+**No classification. No conditions.** Every held position is market-sold unconditionally.
 
-#### Step 2: Resolve open prices (logging only)
-For each symbol, if no snapshot open from 9:30: tries `minute_bars[symbol][0]["o"]` as fallback.
-
-#### Step 3: Classify (`classify_positions()` in `exit_classifier.py`)
-
-```
-price_935:
-  1. minute_bars[-1]["c"]          -> source = "minute_bar"   (preferred)
-  2. snapshot["last_price"]        -> source = "snapshot"     (fallback)
-  3. neither available             -> source = "missing"      -> EXIT immediately (conservative)
-
-Classification rule (entry-price based):
-  price_935 > entry_price   ->  EXIT_BUCKET_TRAIL  ("trail")
-  price_935 <= entry_price  ->  EXIT_BUCKET_935    ("09:35")
-  missing entry_price       ->  EXIT_BUCKET_935    (conservative default)
-```
-
-#### Step 4: Store schedule and audit
-- `self.exit_schedule = {symbol: exit_bucket}` for every symbol.
-- `self.classification_audit` includes: `entry_price`, `open_price`, `price_935`, `ret_vs_entry_pct`, `exit_bucket`, source fields, `gap_pct`. Persisted in `bot_state.json`.
-
-#### Step 5: Execute immediate exits (faded positions)
-Every symbol in `EXIT_BUCKET_935` → `_exit_single_position(symbol, "price_935 <= entry_price -> 9:35 exit")`.
-
-**Partial fill re-routing:** incomplete 9:35 exits are re-routed to `EXIT_BUCKET_1130`.
-
-#### Step 6: Place trailing stops (continuation positions)
-Every symbol in `EXIT_BUCKET_TRAIL`:
-- `submit_trailing_stop_sell(symbol, qty, trail_percent=1.25)` → Alpaca `type=trailing_stop`.
-- Order ID stored in `self.trailing_order_ids[symbol]` (persisted to state).
-- If trailing stop placement fails: logged as warning; position falls back to 11:30 market sell.
+1. Iterates `self.position_mgr.positions` — submits `_exit_single_position(symbol, "9:40 AM market sell")` for each.
+2. `_exit_position()` handles: broker check → market sell → 30s poll → limit fallback → partial fill retry.
+3. After all exits: `reconcile_local_positions_from_broker()` syncs local state.
+4. Any partial fills not resolved are caught by the 9:45 failsafe.
 
 `v2_classified = True`. State saved.
 
 ---
 
-### 9:35 AM–11:30 AM — Waiting
+### 9:45 AM — Post-Exit Failsafe
 
-Trailing stops are live on Alpaca's servers. If a trailing stop triggers and fills, Alpaca removes the position automatically — local state is cleaned up at 11:30 reconciliation. No polling required.
-
-If all 9:35 exits completed and no positions remain, `morning_exits_done = True` immediately (early completion).
-
----
-
-### 11:30 AM — Hard Exit (`_exit_bucket(EXIT_BUCKET_1130, ...)`)
-
-**Guard:** `self.v2_classified and not self.exits_1130_done and current_time >= 11:30`
-
-1. **Cancel all live trailing stop orders** — iterates `self.trailing_order_ids`, calls `_cancel_order(order_id)` for each symbol still held locally. Clears the dict.
-2. **Reconcile with broker** — `reconcile_local_positions_from_broker()` removes any symbols whose trailing stop already filled (broker no longer holds them).
-3. **Market-sell all remaining positions** — every symbol left in `self.position_mgr.positions` gets `_exit_single_position(symbol, "11:30 forced exit")`.
-4. Post-exit reconciliation. `exits_1130_done = True`. State saved.
-
-> The 11:30 exit is a **catch-all** — it handles trailing-stop survivors, faded-position partial fills, and any unscheduled leftovers.
-
----
-
-### 11:35 AM — Post-Exit Failsafe
-
-**Guard:** `not self.post_exit_failsafe_done and current_time >= 11:35`
+**Guard:** `self.v2_classified and not self.post_exit_failsafe_done and current_time >= 09:45`
 
 1. `broker_position_count()`:
    - **0 positions:** logs confirmed flat. Done.
@@ -136,7 +70,7 @@ If all 9:35 exits completed and no positions remain, `morning_exits_done = True`
 
 ---
 
-### 11:35 AM–3:30 PM — Idle
+### 9:45 AM–3:30 PM — Idle
 
 `morning_exits_done = True`. Morning block no longer runs. Loop sleeps 1 second per tick.
 
@@ -285,22 +219,18 @@ End-of-day audit reports saved (`execution_YYYY-MM-DD.json`, `run_health_YYYY-MM
 - Persists across days — loaded at next-day 9:00 AM startup
 
 **`state/bot_state.json`** — date-stamped; ignored if from a prior day
-- Stage flags: `v2_classified`, `exits_1130_done`, `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`
-- `open_prices` — `{symbol: open_price}` captured at 9:30 (for gap logging)
-- `exit_schedule` — `{symbol: "09:35" | "trail" | "11:30"}`
-- `classification_audit` — `{symbol: {entry_price, open_price, price_935, ret_vs_entry_pct, exit_bucket, ...}}`
-- `trailing_order_ids` — `{symbol: alpaca_order_id}` for live trailing stops
+- Stage flags: `v2_classified` (9:40 sell fired), `post_exit_failsafe_done`, `data_collected`, `scoring_done`, `entries_done`
 - `sold_today` — symbols sold this session (PDT guard)
 
 ### Same-Day Crash Recovery
 
-`_load_state()` restores all flags including `trailing_order_ids`. The event loop resumes from the last completed stage — no duplicate exits or entries. Trailing stops already placed on Alpaca remain active through a crash/restart.
+`_load_state()` restores all stage flags. The event loop resumes from the last completed stage — no duplicate exits or entries. If the bot crashes after 9:40 but before 9:45, the failsafe will catch any remaining positions on restart.
 
 ### Broker Reconciliation
 
 On startup and after exit waves:
 - Positions in broker but not local → rebuilt from broker data
-- Positions local but not in broker → removed (trailing stop may have filled)
+- Positions local but not in broker → removed (already filled or closed)
 - Quantities mismatched → synced to broker value
 
 ---
@@ -311,8 +241,8 @@ On startup and after exit waves:
 run.py                              # Entry point
 bot/
   integrated_main.py                # OvernightMomentumBot — main orchestrator
-  position_manager_overnight.py     # Position tracking, order submission, trailing stops, failsafe
-  exit_classifier.py                # 9:35 AM entry-price classification (trail vs immediate exit)
+  position_manager_overnight.py     # Position tracking, order submission, failsafe flatten
+  exit_classifier.py                # Unused — kept for reference only
   momentum_scorer.py                # HEAD score, TAIL score, waterfall allocator
   universe_builder.py               # 4-stage universe pipeline, audit writers
   massive_client.py                 # Massive API (universe snapshot)
@@ -349,7 +279,7 @@ ADV_LOOKBACK_DAYS = 20
 ATR_LOOKBACK_DAYS = 14
 ```
 
-### TAIL score weights (`config_strategy.py`)
+### TAIL composite score weights (`config_strategy.py`)
 ```python
 SCORE_WEIGHT_INTRADAY_RETURN = 0.20
 SCORE_WEIGHT_PROXIMITY_HIGH  = 0.15
@@ -371,16 +301,14 @@ MAX_LEVERAGE         = 1.0     # Cash account, no margin
 ADV_CAP_PCT          = 0.003   # Max 0.3% of 20-day ADV per position
 MIN_SHARES           = 25      # Skip if rounding yields fewer shares
 HEAD_COUNT           = 10      # Fixed equal-weight HEAD slots
-TAIL_MAX_POSITIONS   = 30      # Max TAIL candidates (non-HEAD pool)
-MAX_TOTAL_POSITIONS  = 40      # Hard cap: HEAD + TAIL combined
+TAIL_MAX_POSITIONS   = 15      # Max TAIL candidates (non-HEAD pool)
+MAX_TOTAL_POSITIONS  = 25      # Hard cap: HEAD + TAIL combined
 ```
 
 ### Exit rules (`config_strategy.py`)
 ```python
-TRAILING_STOP_PCT     = 1.25       # % trail from high-water mark for continuation names
-V2_CLASSIFY_TIME      = "09:35"    # Entry-price classification + trailing stop placement
-EXIT_BUCKET_1130_TIME = "11:30"    # Hard fallback: cancel trailing stops + market sell all
-V2_FAILSAFE_TIME      = "11:35"    # Post-exit broker verification
+EXIT_940_TIME    = "09:40"    # Market sell ALL positions — no conditions
+V2_FAILSAFE_TIME = "09:45"    # Post-exit broker verification
 ```
 
 ### Timing (`config_strategy.py`)
@@ -433,11 +361,11 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 
 | Start time | Has positions | Action |
 |------------|--------------|--------|
-| Before 9:30 AM | Any | Normal startup |
-| 9:30–11:35 AM | Yes | Resumes from last saved state (crash recovery) |
-| After 11:35 AM | Yes | Immediate failsafe flatten, then continues to afternoon |
+| Before 9:40 AM | Any | Normal startup |
+| 9:40–9:45 AM | Yes | Resumes from last saved state; re-runs any incomplete exits |
+| After 9:45 AM | Yes | Immediate failsafe flatten, then continues to afternoon |
 | After 4:00 PM | Any | Logs error, exits |
-| 11:35 AM–3:30 PM | No | Waits for 3:30 PM data collection |
+| 9:45 AM–3:30 PM | No | Waits for 3:30 PM data collection |
 
 ---
 
@@ -447,10 +375,8 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 2. **Polling-based execution** — 1-second event loop; very fast intraday moves between polls could be missed.
 3. **Single-day holding period** — Strategy assumes next-morning exit; extended holds not supported.
 4. **No sector diversification** — Selection is purely momentum-based; can concentrate in one sector.
-5. **Trailing stop market conversion** — Alpaca trailing stops convert to market orders on trigger; fill price may differ from stop price in fast markets.
-6. **Trailing stops inactive outside RTH** — Alpaca trailing stops do not trigger in extended hours; they activate at 9:30 AM the following day if still open (not expected in normal operation).
-7. **No real-time alerts** — Bot logs to file only; no push notifications for critical events.
-8. **No drawdown protection** — Bot enters positions regardless of recent P&L history.
+5. **No real-time alerts** — Bot logs to file only; no push notifications for critical events.
+6. **No drawdown protection** — Bot enters positions regardless of recent P&L history.
 
 ---
 
@@ -458,8 +384,7 @@ Start at **9:00 AM ET**. The bot manages its own schedule. Runs until 4:00 PM th
 
 ⚠️ **This is an overnight momentum strategy with significant risks:**
 
-- **Overnight gap risk** — No hard stop-loss. A large gap-down at open is held through 9:35 classification; if `price_935 ≤ entry_price` the position is sold immediately at 9:35, but the loss is already realised at the open price.
-- **Trailing stop slippage** — In fast or gapping markets the execution price of a triggered trailing stop can be significantly below the stop trigger price.
+- **Overnight gap risk** — No stop-loss. A gap-down at the open is held until 9:40 AM and sold unconditionally at market. The loss is fully realised at the 9:40 market fill price.
 - **Momentum reversal risk** — Late-day strength used as a selection signal can fully reverse overnight.
 - **Liquidity risk** — 0.3% ADV cap limits position size but does not eliminate slippage in thin small-cap names.
 - **Technology risk** — API failures or bugs could cause missed exits. Failsafe layer mitigates but does not eliminate this.

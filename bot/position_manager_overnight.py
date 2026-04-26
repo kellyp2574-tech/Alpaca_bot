@@ -23,12 +23,7 @@ class Position:
     entry_price: float
     quantity: int
     entry_time: datetime
-    entry_gap_pct: float
     adv_estimate: float
-    peak_price: float = field(default=0.0)
-    trailing_stop_price: float = field(default=0.0)
-    is_trailing_active: bool = field(default=False)
-    order_id: Optional[str] = None
     current_price: float = field(default=0.0)
 
 
@@ -67,12 +62,7 @@ class PositionManager:
                     entry_price=data.get("entry_price", 0),
                     quantity=data.get("quantity", 0),
                     entry_time=datetime.fromisoformat(data.get("entry_time", datetime.now().isoformat())),
-                    entry_gap_pct=data.get("entry_gap_pct", 0),
                     adv_estimate=data.get("adv_estimate", 0),
-                    peak_price=data.get("peak_price", data.get("entry_price", 0)),
-                    trailing_stop_price=data.get("trailing_stop_price", 0),
-                    is_trailing_active=data.get("is_trailing_active", False),
-                    order_id=data.get("order_id"),
                     current_price=data.get("current_price", data.get("entry_price", 0)),
                 )
                 self.positions[symbol] = position
@@ -105,17 +95,6 @@ class PositionManager:
 
     def get_position_count(self) -> int:
         return len(self.positions)
-
-    # ────────────────────────────────────────────────────────
-    # Position sizing
-    # ────────────────────────────────────────────────────────
-
-    def calculate_position_size(self, target_dollars: float, adv: float, current_price: float) -> int:
-        """Calculate position size with ADV cap and absolute dollar cap."""
-        adv_dollar_cap = adv * config.ADV_CAP_PCT
-        position_dollars = min(target_dollars, adv_dollar_cap, config.MAX_POSITION_DOLLARS)
-        quantity = int(position_dollars / current_price) if current_price > 0 else 0
-        return max(0, quantity)
 
     # ────────────────────────────────────────────────────────
     # Order submission
@@ -157,57 +136,6 @@ class PositionManager:
             return None
         except requests.exceptions.RequestException as e:
             logger.error(f"Buy order FAILED (network) | symbol={symbol} | qty={qty} | error={e}")
-            return None
-
-    def submit_trailing_stop_sell(
-        self, symbol: str, qty: int, trail_percent: float
-    ) -> Optional[dict]:
-        """Submit a trailing stop sell order via POST /v2/orders.
-
-        Alpaca trailing stop:
-          type = "trailing_stop"
-          trail_percent = e.g. 1.25  (meaning 1.25% trail from high-water mark)
-          time_in_force = "day"   (trailing stops only valid with "day" or "gtc")
-
-        Returns the order response dict or None on failure.
-        """
-        url = f"{self.base_url}/v2/orders"
-        order_data = {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "sell",
-            "type": "trailing_stop",
-            "time_in_force": "day",
-            "trail_percent": str(trail_percent),
-        }
-
-        try:
-            response = self.session.post(url, json=order_data, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            order_id = data.get("id")
-            logger.info(
-                f"Trailing stop submitted: {symbol} x{qty} "
-                f"trail={trail_percent}% (ID: {order_id})"
-            )
-            return data
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code if e.response is not None else "N/A"
-            body = ""
-            try:
-                body = e.response.text[:500] if e.response is not None else ""
-            except Exception:
-                body = "<unreadable>"
-            logger.error(
-                f"Trailing stop FAILED | symbol={symbol} | qty={qty} | "
-                f"trail={trail_percent}% | status={status_code} | body={body}"
-            )
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(
-                f"Trailing stop FAILED (network) | symbol={symbol} | "
-                f"qty={qty} | trail={trail_percent}% | error={e}"
-            )
             return None
 
     def _submit_sell_order(self, symbol: str, qty: int, order_type: str = "market",
@@ -632,11 +560,6 @@ class PositionManager:
 
         return result
 
-    def force_exit_all(self, reason: str = "force"):
-        logger.warning(f"Force exiting all positions: {reason}")
-        for symbol in list(self.positions.keys()):
-            self._exit_position(symbol, reason)
-
     # ────────────────────────────────────────────────────────
     # Order cancellation
     # ────────────────────────────────────────────────────────
@@ -654,46 +577,6 @@ class PositionManager:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error canceling all open orders: {e}")
             return False
-
-    def get_open_orders(self) -> List[dict]:
-        """Get all open orders from Alpaca."""
-        url = f"{self.base_url}/v2/orders"
-        params = {"status": "open"}
-        try:
-            response = self.session.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            return data if isinstance(data, list) else []
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting open orders: {e}")
-            return []
-
-    def cancel_open_buy_orders(self) -> int:
-        """Cancel all open market buy orders (used for startup cleanup). Returns count canceled."""
-        open_orders = self.get_open_orders()
-        market_buy_orders = [
-            order for order in open_orders
-            if order.get("type") == "market" and order.get("side") == "buy" and order.get("time_in_force") == "day"
-        ]
-
-        if not market_buy_orders:
-            return 0
-
-        logger.warning(f"Found {len(market_buy_orders)} open market buy orders on startup - canceling to prevent duplicates")
-
-        canceled_count = 0
-        for order in market_buy_orders:
-            order_id = order.get("id")
-            symbol = order.get("symbol")
-            qty = order.get("qty")
-
-            if self._cancel_order(order_id):
-                logger.warning(f"Canceled orphaned market order: {symbol} {qty} shares (ID: {order_id})")
-                canceled_count += 1
-            else:
-                logger.error(f"Failed to cancel market order: {symbol} {qty} shares (ID: {order_id})")
-
-        return canceled_count
 
     # ────────────────────────────────────────────────────────
     # Broker interaction
@@ -751,9 +634,7 @@ class PositionManager:
                     entry_price=avg_entry,
                     quantity=qty,
                     entry_time=datetime.now(),
-                    entry_gap_pct=0.0,
                     adv_estimate=0.0,
-                    peak_price=avg_entry,
                     current_price=avg_entry,
                 )
                 logger.warning(f"Broker reconcile: ADDED {symbol} qty={qty} avg={avg_entry:.4f}")
@@ -917,85 +798,3 @@ class PositionManager:
 
         return summary
 
-    def nuclear_flatten(self, max_rounds: int = 5) -> Dict[str, object]:
-        """NUCLEAR OPTION: spam market sells until broker is completely flat.
-
-        Ignores circuit breakers entirely. Retries up to max_rounds.
-        Use only after 3:58 PM as absolute last resort.
-        """
-        logger.critical(f"NUCLEAR FLATTEN: starting — will retry up to {max_rounds} rounds")
-
-        self._exit_failures.clear()
-        self._exit_failure_times.clear()
-
-        summary = {
-            "rounds": 0,
-            "total_sells": 0,
-            "total_filled": 0,
-            "still_open": [],
-        }
-
-        for rnd in range(1, max_rounds + 1):
-            summary["rounds"] = rnd
-
-            self.cancel_all_open_orders()
-            time.sleep(1)
-
-            broker_positions = self.get_broker_positions()
-            if broker_positions is None:
-                logger.critical(f"NUCLEAR FLATTEN round {rnd}: broker API failed — retrying")
-                time.sleep(2)
-                continue
-            if not broker_positions:
-                logger.critical(f"NUCLEAR FLATTEN: broker is FLAT after round {rnd}")
-                self.positions.clear()
-                return summary
-
-            logger.critical(f"NUCLEAR FLATTEN round {rnd}: {len(broker_positions)} positions remaining")
-
-            for pos in broker_positions:
-                try:
-                    symbol = pos.get("symbol")
-                    qty = abs(int(float(pos.get("qty", "0"))))
-                    if not symbol or qty <= 0:
-                        continue
-
-                    url = f"{self.base_url}/v2/orders"
-                    order_data = {
-                        "symbol": symbol,
-                        "qty": str(qty),
-                        "side": "sell",
-                        "type": "market",
-                        "time_in_force": "day",
-                    }
-                    try:
-                        resp = self.session.post(url, json=order_data, timeout=10)
-                        resp.raise_for_status()
-                        order_id = resp.json().get("id")
-                        summary["total_sells"] += 1
-                        logger.critical(f"NUCLEAR SELL {symbol} x{qty} (ID: {order_id})")
-
-                        if order_id:
-                            fill = self.get_order_fill(order_id, max_wait=15)
-                            if fill and int(fill["filled_qty"]) > 0:
-                                summary["total_filled"] += int(fill["filled_qty"])
-                                self.positions.pop(symbol, None)
-                    except Exception as e:
-                        logger.critical(f"NUCLEAR SELL FAILED {symbol}: {e}")
-                except Exception as e:
-                    logger.critical(f"NUCLEAR FLATTEN error: {e}")
-
-            time.sleep(2)
-
-        remaining = self.get_broker_positions()
-        if remaining is None:
-            logger.critical(f"NUCLEAR FLATTEN: broker API failed on final check")
-        elif remaining:
-            symbols = [p.get("symbol") for p in remaining]
-            summary["still_open"] = symbols
-            logger.critical(f"NUCLEAR FLATTEN INCOMPLETE: {symbols} still open after {max_rounds} rounds")
-        else:
-            self.positions.clear()
-            logger.critical(f"NUCLEAR FLATTEN: broker confirmed flat after {max_rounds} rounds")
-
-        return summary
