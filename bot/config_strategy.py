@@ -35,9 +35,22 @@ MAX_TOTAL_POSITIONS = 25    # Hard cap: HEAD_COUNT + TAIL_MAX_POSITIONS
 MAX_HEAD_POSITIONS = HEAD_COUNT   # Compat alias used by SelectionConfig
 
 # ═══════════════════════════════════════════════════
+# Mean reversion candidate filter
+# ═══════════════════════════════════════════════════
+MR_MIN_PRICE = 1.00
+MR_MAX_PRICE = 3.00
+MR_DAY_RET_MAX = -0.03          # day return must be <= -3%
+MR_VOLUME_RATIO_MIN = 1.5       # today volume / expected volume
+MR_CLOSE_POSITION_MAX = 0.20    # close must be in bottom 20% of day range
+MR_LATE_DROP_MAX = None         # optional: set -0.01 for stricter late-drop filter
+
+MR_MAX_POSITIONS = 5            # max simultaneous positions (start conservative)
+MR_USE_RANDOM_SELECTION = False # deterministic first-N selection for live trading
+
+# ═══════════════════════════════════════════════════
 # Exit rules (morning of T+1)
 # ═══════════════════════════════════════════════════
-# Simple rule: market sell ALL positions at 9:40 AM, no conditions.
+# Simple rule: market sell ALL positions at 9:35 AM, no conditions.
 V2_FAILSAFE_TIME = "09:45"   # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
@@ -45,7 +58,7 @@ V2_FAILSAFE_TIME = "09:45"   # Post-exit failsafe verification
 # ═══════════════════════════════════════════════════
 ENTRY_BP_BUFFER_PCT = 0.98       # Size each order to 98% of reported buying power
 ENTRY_MIN_DEPLOY_PCT = 0.95      # If first pass deploys <95%, run mop-up pass
-ENTRY_MOPUP_MAX_POSITIONS = 5    # Max extra candidates to try in mop-up
+ENTRY_MOPUP_MAX_POSITIONS = 0    # 0 = mop-up disabled (paper trading phase)
 
 # ═══════════════════════════════════════════════════
 # Afternoon timeline (T-1 entry day)
@@ -58,7 +71,7 @@ ENTRY_TIME = "15:50"             # Execute entries (market orders)
 # Morning timeline (T+1 exit day)
 # ═══════════════════════════════════════════════════
 MARKET_OPEN_TIME = "09:30"
-EXIT_940_TIME = "09:40"          # Market sell ALL positions
+EXIT_940_TIME = "09:35"          # Market sell ALL positions (mean reversion exit)
 
 # ═══════════════════════════════════════════════════
 # Sector ETFs — kept for future use when sector mapping is added

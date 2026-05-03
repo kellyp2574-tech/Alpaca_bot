@@ -3,7 +3,7 @@
 # ═══════════════════════════════════════════════════
 # Universe presets — pick one via UNIVERSE_PRESET
 # ═══════════════════════════════════════════════════
-UNIVERSE_PRESET = "expanded_smallcap"
+UNIVERSE_PRESET = "mean_reversion_smallcap"
 
 UNIVERSE_PRESETS = {
     "core_smallcap": {
@@ -14,6 +14,11 @@ UNIVERSE_PRESETS = {
     "expanded_smallcap": {
         "min_price": 1.0,
         "max_price": 10.0,
+        "min_adv_dollars": 2_000_000,
+    },
+    "mean_reversion_smallcap": {
+        "min_price": 1.0,
+        "max_price": 3.0,
         "min_adv_dollars": 2_000_000,
     },
     "midcap": {

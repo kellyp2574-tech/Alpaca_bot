@@ -1,17 +1,20 @@
-"""Overnight Momentum Bot — Main Orchestrator
+"""Overnight Mean Reversion Bot — Main Orchestrator
+
+Strategy: buy stocks with large intraday declines ($1-$3, down >= 3%, high volume,
+closed near low) at 3:50 PM, sell at market on the next morning at 9:35 AM.
 
 Daily Schedule (ET) — bot starts at 9:00 AM:
 
 MORNING (T+1 exits — positions from yesterday's 3:50 PM entries):
   09:00  Start, detect overnight positions from broker
   09:30  Market open — positions fill at the open
-  09:40  Market sell ALL positions — no conditions, no trailing stop
+  09:35  Market sell ALL positions — no conditions
   09:45  Post-exit failsafe verification
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca asset filter + daily bars + ADV)
-  15:48  Fetch 9:30-3:50 minute bars -> build & score candidates (350 model)
-  15:50  Select positions (account-tier), size, EXECUTE ENTRIES (market)
+  15:48  Fetch 9:30-3:50 minute bars -> apply mean reversion filters + score
+  15:50  Select top MR_MAX_POSITIONS, size equally, EXECUTE ENTRIES (market)
   16:00  Confirm positions held overnight, save state, done
 """
 import logging
@@ -26,18 +29,12 @@ from zoneinfo import ZoneInfo
 from bot import config
 from bot.massive_client import MassiveClient
 from bot.market_data import AlpacaDataClient
-from bot.momentum_scorer import (
-    MomentumCandidate,
-    SelectionConfig,
-    get_selection_config,
-    Allocation,
-    build_signal_candidates_350,
-    compute_raw_metrics_350,
-    compute_head_score,
-    normalize_and_score_350,
-    assign_buckets,
-    allocate_head_tail,
+from bot.mean_reversion_scorer import (
+    MeanReversionCandidate,
+    build_mean_reversion_candidates,
+    filter_mean_reversion_candidates,
 )
+from bot.momentum_scorer import Allocation, get_selection_config
 from bot.position_manager_overnight import PositionManager, Position
 from bot.rate_limiter import get_api_call_count
 from bot.state_manager import StateManager
@@ -74,8 +71,8 @@ def _parse_config_time(time_str: str) -> dt_time:
     return dt_time(int(parts[0]), int(parts[1]))
 
 
-class OvernightMomentumBot:
-    """Main bot orchestrator for overnight momentum strategy"""
+class OvernightMeanReversionBot:
+    """Main bot orchestrator for overnight mean reversion strategy"""
 
     def __init__(self):
         self.massive = MassiveClient()
@@ -85,7 +82,7 @@ class OvernightMomentumBot:
 
         # Universe & candidates
         self.universe: List[str] = []
-        self.scored_candidates: List[MomentumCandidate] = []
+        self.scored_candidates: List[MeanReversionCandidate] = []
         self._universe_diag: Optional[UniverseDiagnostics] = None
 
         # Stage flags
@@ -128,7 +125,7 @@ class OvernightMomentumBot:
     def _run(self):
         """Inner run — called by run() which wraps it with top-level error handling."""
         logger.info("=" * 60)
-        logger.info("Overnight Momentum Bot Starting")
+        logger.info("Overnight Mean Reversion Bot Starting")
         logger.info("=" * 60)
 
         # Load any saved state and detect mode
@@ -194,9 +191,9 @@ class OvernightMomentumBot:
                         self._save_state()
 
                 if has_positions and not self.morning_exits_done:
-                    # 9:40 AM — Market sell ALL positions, no conditions
+                    # 9:35 AM — Market sell ALL positions, no conditions
                     if not self.v2_classified and current_time >= t_exit_940:
-                        self._exit_all_940()
+                        self._exit_all_935()
                         self.v2_classified = True
                         self._save_state()
 
@@ -266,27 +263,27 @@ class OvernightMomentumBot:
     # MORNING EXIT METHODS
     # ════════════════════════════════════════════════════════════
 
-    def _exit_all_940(self):
-        """9:40 AM: Market sell ALL positions unconditionally.
+    def _exit_all_935(self):
+        """9:35 AM: Market sell ALL positions unconditionally.
 
         No classification. No trailing stops. Every position is sold at market.
         """
         positions = list(self.position_mgr.positions.keys())
         if not positions:
-            logger.info("EXIT 9:40: no positions to sell")
+            logger.info("EXIT 9:35: no positions to sell")
             return
 
-        logger.info(f"EXIT 9:40: market selling {len(positions)} positions: {positions}")
+        logger.info(f"EXIT 9:35: market selling {len(positions)} positions: {positions}")
         for symbol in positions:
-            self._exit_single_position(symbol, "9:40 AM market sell")
+            self._exit_single_position(symbol, "9:35 AM market sell")
 
         # Reconcile local state with broker
         actions = self.position_mgr.reconcile_local_positions_from_broker()
         if actions:
-            logger.info(f"EXIT 9:40: post-exit reconciliation adjustments: {actions}")
+            logger.info(f"EXIT 9:35: post-exit reconciliation adjustments: {actions}")
 
         remaining = self.position_mgr.get_position_count()
-        logger.info(f"EXIT 9:40: done — {remaining} positions remaining")
+        logger.info(f"EXIT 9:35: done — {remaining} positions remaining")
 
     def _exit_single_position(self, symbol: str, reason: str):
         """Exit a single position — delegates to position_mgr._exit_position().
@@ -349,7 +346,7 @@ class OvernightMomentumBot:
     def _step_score_and_rank(self):
         """~3:48 PM: Fetch 9:30-3:50 bars, build 350-model candidates, score."""
         logger.info("=" * 50)
-        logger.info("SCORING (350 model): Fetching signal bars and scoring")
+        logger.info("SCORING (mean reversion): Fetching signal bars and filtering")
         logger.info("=" * 50)
 
         try:
@@ -377,91 +374,59 @@ class OvernightMomentumBot:
                 self.scoring_done = True
                 return
 
-            # 3. Fetch SPY return (open to current)
-            spy_snap = self.alpaca.get_snapshots([config.MARKET_BENCHMARK])
-            spy_data = spy_snap.get(config.MARKET_BENCHMARK, {})
-            spy_open = spy_data.get("open") or 0
-            spy_last = spy_data.get("last_price") or spy_data.get("close") or 0
-            spy_return = (spy_last - spy_open) / spy_open if spy_open > 0 else 0.0
-            logger.info(f"SPY return: {spy_return:.4f} (open={spy_open}, last={spy_last})")
-
-            # 4. Build volume profiles (60-min)
-            volume_last_60min: Dict[str, int] = {}
-            volume_avg_60min: Dict[str, float] = {}
-            for symbol in self.universe:
-                bars = self._minute_bars.get(symbol, [])
-                vol_60, avg_60 = self.alpaca.get_volume_profile_60min(bars)
-                volume_last_60min[symbol] = vol_60
-                volume_avg_60min[symbol] = avg_60
-
-            # 5. Build candidates from minute bars
-            candidates = build_signal_candidates_350(
-                self.universe, self._minute_bars,
-                self._adv_cache, self._atr_cache,
+            # 3. Build raw MR candidates from minute bars
+            raw_candidates = build_mean_reversion_candidates(
+                self.universe,
+                self._minute_bars,
+                self._adv_cache,
             )
 
-            if not candidates:
-                logger.error("No valid candidates after build_signal_candidates_350")
-                self.scoring_done = True
-                return
+            # 4. Apply MR filters + score
+            filtered = filter_mean_reversion_candidates(raw_candidates)
 
-            # 5. Compute raw metrics
-            candidates = compute_raw_metrics_350(
-                candidates, spy_return,
-                volume_last_60min, volume_avg_60min,
-            )
-
-            # 5b. Compute HEAD score (late-day continuation signal)
-            candidates = compute_head_score(candidates, self._minute_bars)
-
-            # 6. Normalize, score, bucket
-            candidates = normalize_and_score_350(candidates)
-            candidates = assign_buckets(candidates)
-            candidates.sort(key=lambda c: c.composite_score, reverse=True)
-
-            self.scored_candidates = candidates
+            # 5. Select top N
+            self.scored_candidates = filtered[:config.MR_MAX_POSITIONS]
             self.scoring_done = True
             self._save_state()
 
-            # Log top 10
-            logger.info(f"Scoring complete: {len(candidates)} scored")
-            head_sorted = sorted(candidates, key=lambda c: c.head_score, reverse=True)
-            logger.info("Top 10 by HEAD score:")
-            for c in head_sorted[:10]:
+            logger.info(
+                f"Mean reversion filter: {len(raw_candidates)} raw -> "
+                f"{len(filtered)} passed -> {len(self.scored_candidates)} selected"
+            )
+
+            for c in self.scored_candidates:
                 logger.info(
-                    f"  {c.symbol}: head={c.head_score:.4f} score={c.composite_score:.3f} "
-                    f"bucket={c.bucket} ret={c.intraday_return:.2%} "
-                    f"prox={c.proximity_to_high:.3f} atr%={c.atr_percent:.3f}"
+                    f"MR SELECT {c.symbol}: price={c.signal_price:.2f}, "
+                    f"day_ret={c.day_return:.2%}, vol_ratio={c.volume_ratio:.2f}x, "
+                    f"close_pos={c.close_position:.2f}, "
+                    f"late_drop={c.late_drop_1530_1550:.2%}, "
+                    f"score={c.selection_score:.3f}"
                 )
 
-            # Save candidates audit artifact — two ranked views
+            # Save candidates audit artifact
             def _candidate_dict(c):
                 return {
                     "symbol": c.symbol,
-                    "score": round(c.composite_score, 4),
-                    "head_score": round(c.head_score, 4),
-                    "bucket": c.bucket,
-                    "intraday_return": round(c.intraday_return, 4),
-                    "proximity_to_high": round(c.proximity_to_high, 4),
-                    "volume_vs_avg": round(c.volume_vs_avg, 2),
-                    "volume_trend": round(c.volume_trend, 2),
-                    "vs_market": round(c.vs_market, 4),
-                    "atr_percent": round(c.atr_percent, 4),
+                    "selection_score": round(c.selection_score, 4),
                     "signal_price": round(c.signal_price, 4),
+                    "day_return": round(c.day_return, 4),
+                    "volume_ratio": round(c.volume_ratio, 2),
+                    "close_position": round(c.close_position, 3),
+                    "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
                     "adv_dollars": round(c.adv_dollars, 0),
                 }
 
-            top_20_head = sorted(candidates, key=lambda c: c.head_score, reverse=True)[:20]
-            top_20_tail = sorted(candidates, key=lambda c: c.composite_score, reverse=True)[:20]
             audit_dicts = {
-                "top_20_by_head_score": [_candidate_dict(c) for c in top_20_head],
-                "top_20_by_composite_score": [_candidate_dict(c) for c in top_20_tail],
+                "selected": [_candidate_dict(c) for c in self.scored_candidates],
+                "all_passed": [_candidate_dict(c) for c in filtered],
             }
             save_candidates_audit(audit_dicts)
 
-            # Also update universe audit with top 20
             if self._universe_diag:
-                save_universe_audit(self._universe_diag, self.universe, scored_top20=[_candidate_dict(c) for c in top_20_head])
+                save_universe_audit(
+                    self._universe_diag, self.universe,
+                    scored_top20=[_candidate_dict(c) for c in filtered[:20]],
+                )
 
         except Exception as e:
             logger.exception(f"Error in scoring: {e}")
@@ -520,11 +485,37 @@ class OvernightMomentumBot:
             else:
                 eligible_candidates = self.scored_candidates
 
-            # HEAD/TAIL allocation (tier-aware) on PDT-filtered candidates
-            allocations = allocate_head_tail(eligible_candidates, deployable, sel=sel)
+            # Equal-weight MR allocation across selected candidates
+            selected = eligible_candidates[:config.MR_MAX_POSITIONS]
+            if not selected:
+                logger.warning("No mean reversion candidates after PDT filter — skipping entries")
+                self.entries_done = True
+                return
+
+            slot_dollars = deployable / len(selected)
+            allocations = []
+            for rank, c in enumerate(selected, start=1):
+                if c.signal_price <= 0:
+                    continue
+                adv_cap = c.adv_dollars * config.ADV_CAP_PCT if c.adv_dollars > 0 else slot_dollars
+                target_dollars = min(slot_dollars, adv_cap, config.MAX_POSITION_DOLLARS)
+                shares = math.floor(target_dollars / c.signal_price)
+                if shares < config.MIN_SHARES:
+                    logger.warning(
+                        f"MR SKIP {c.symbol}: shares {shares} < min {config.MIN_SHARES}, "
+                        f"target=${target_dollars:.2f}, price={c.signal_price:.2f}"
+                    )
+                    continue
+                allocations.append(Allocation(
+                    symbol=c.symbol,
+                    shares=shares,
+                    rank=rank,
+                    alloc_bucket="MR",
+                    candidate=c,
+                ))
 
             if not allocations:
-                logger.warning("No positions allocated — skipping entries")
+                logger.warning("No positions sized — skipping entries")
                 self.entries_done = True
                 return
 
@@ -631,8 +622,8 @@ class OvernightMomentumBot:
                     exec_diag.filled_symbols.append(symbol)
                     exec_diag.fill_details[symbol] = {
                         "qty": filled_qty, "price": round(fill_price, 4),
-                        "score": round(candidate.composite_score, 4),
-                        "bucket": candidate.bucket,
+                        "score": round(candidate.selection_score, 4),
+                        "day_return": round(candidate.day_return, 4),
                         "alloc_bucket": alloc.alloc_bucket,
                         "rank": alloc.rank,
                     }
@@ -640,7 +631,10 @@ class OvernightMomentumBot:
                     logger.info(
                         f"ENTRY {symbol}: {filled_qty} @ {fill_price:.4f} "
                         f"[{alloc.alloc_bucket} #{alloc.rank}] "
-                        f"(score={candidate.composite_score:.3f}, bucket={candidate.bucket})"
+                        f"(score={candidate.selection_score:.3f}, "
+                        f"day_ret={candidate.day_return:.2%}, "
+                        f"vol_ratio={candidate.volume_ratio:.2f}x, "
+                        f"close_pos={candidate.close_position:.2f})"
                     )
                 else:
                     # Cancel potentially-live order so mop-up can safely retry
@@ -653,7 +647,7 @@ class OvernightMomentumBot:
             # can be retried with smaller qty, and candidates outside
             # the original allocation can be vet-on-demand.
             deploy_target = deployable * config.ENTRY_MIN_DEPLOY_PCT
-            if total_deployed < deploy_target:
+            if config.ENTRY_MOPUP_MAX_POSITIONS > 0 and total_deployed < deploy_target:
                 shortfall = deploy_target - total_deployed
                 logger.warning(
                     f"MOP-UP: deployment ${total_deployed:,.2f} < target ${deploy_target:,.2f} "
@@ -667,8 +661,8 @@ class OvernightMomentumBot:
                 for candidate in eligible_candidates:
                     if mopup_attempts >= config.ENTRY_MOPUP_MAX_POSITIONS:
                         break
-                    if len(exec_diag.filled_symbols) >= sel.max_positions:
-                        logger.info(f"MOP-UP STOP: reached max_positions ({sel.max_positions})")
+                    if len(exec_diag.filled_symbols) >= config.MR_MAX_POSITIONS:
+                        logger.info(f"MOP-UP STOP: reached MR_MAX_POSITIONS ({config.MR_MAX_POSITIONS})")
                         break
                     sym = candidate.symbol
                     if sym in already_filled:
@@ -752,8 +746,8 @@ class OvernightMomentumBot:
                         exec_diag.filled_symbols.append(sym)
                         exec_diag.fill_details[sym] = {
                             "qty": filled_qty, "price": round(fill_price, 4),
-                            "score": round(candidate.composite_score, 4),
-                            "bucket": candidate.bucket,
+                            "score": round(candidate.selection_score, 4),
+                            "day_return": round(candidate.day_return, 4),
                             "alloc_bucket": "MOPUP",
                             "rank": 0,
                         }
@@ -762,7 +756,8 @@ class OvernightMomentumBot:
 
                         logger.info(
                             f"ENTRY MOP-UP {sym}: {filled_qty} @ {fill_price:.4f} "
-                            f"(score={candidate.composite_score:.3f})"
+                            f"(score={candidate.selection_score:.3f}, "
+                            f"day_ret={candidate.day_return:.2%})"
                         )
                     else:
                         self.position_mgr._cancel_order(order_id)
@@ -778,10 +773,8 @@ class OvernightMomentumBot:
             self._save_state()
 
             # Store execution stats for health report
-            head_filled = sum(1 for s in exec_diag.filled_symbols
-                              if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "HEAD")
-            tail_filled = sum(1 for s in exec_diag.filled_symbols
-                              if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "TAIL")
+            mr_filled = sum(1 for s in exec_diag.filled_symbols
+                             if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "MR")
             mopup_filled = sum(1 for s in exec_diag.filled_symbols
                                if exec_diag.fill_details.get(s, {}).get("alloc_bucket") == "MOPUP")
 
@@ -792,8 +785,7 @@ class OvernightMomentumBot:
                 "exec_rejected_reasons": exec_diag.rejected_symbols,
                 "orders_submitted": len(exec_diag.submitted_symbols),
                 "entries_filled": len(exec_diag.filled_symbols),
-                "head_filled": head_filled,
-                "tail_filled": tail_filled,
+                "mr_filled": mr_filled,
                 "mopup_filled": mopup_filled,
                 "total_deployed": total_deployed,
                 "equity": equity,
@@ -803,7 +795,7 @@ class OvernightMomentumBot:
             deployment_pct = total_deployed / deployable * 100 if deployable > 0 else 0.0
             logger.info(
                 f"Entry execution complete: {len(exec_diag.filled_symbols)} filled "
-                f"({head_filled} HEAD + {tail_filled} TAIL + {mopup_filled} MOPUP), "
+                f"({mr_filled} MR + {mopup_filled} MOPUP), "
                 f"{len(exec_diag.rejected_symbols)} rejected at execution gate, "
                 f"${total_deployed:,.2f} deployed "
                 f"({deployment_pct:.1f}% of deployable)"
@@ -917,22 +909,16 @@ class OvernightMomentumBot:
                 def _candidate_dict(c):
                     return {
                         "symbol": c.symbol,
-                        "score": round(c.composite_score, 4),
-                        "head_score": round(c.head_score, 4),
-                        "bucket": c.bucket,
-                        "intraday_return": round(c.intraday_return, 4),
-                        "proximity_to_high": round(c.proximity_to_high, 4),
-                        "volume_vs_avg": round(c.volume_vs_avg, 2),
-                        "vs_market": round(c.vs_market, 4),
-                        "atr_percent": round(c.atr_percent, 4),
+                        "selection_score": round(c.selection_score, 4),
                         "signal_price": round(c.signal_price, 4),
+                        "day_return": round(c.day_return, 4),
+                        "volume_ratio": round(c.volume_ratio, 2),
+                        "close_position": round(c.close_position, 3),
+                        "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
                         "adv_dollars": round(c.adv_dollars, 0),
                     }
-                top_20_head = sorted(self.scored_candidates, key=lambda c: c.head_score, reverse=True)[:20]
-                top_20_tail = sorted(self.scored_candidates, key=lambda c: c.composite_score, reverse=True)[:20]
                 save_candidates_audit({
-                    "top_20_by_head_score": [_candidate_dict(c) for c in top_20_head],
-                    "top_20_by_composite_score": [_candidate_dict(c) for c in top_20_tail],
+                    "selected": [_candidate_dict(c) for c in self.scored_candidates],
                 })
         except Exception as e:
             logger.error(f"Failed to save candidates audit: {e}")
@@ -1014,7 +1000,7 @@ class OvernightMomentumBot:
 
 def main():
     try:
-        bot = OvernightMomentumBot()
+        bot = OvernightMeanReversionBot()
     except Exception:
         logging.critical("UNHANDLED EXCEPTION during bot initialisation", exc_info=True)
         raise
