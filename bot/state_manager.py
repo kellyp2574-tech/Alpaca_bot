@@ -32,6 +32,7 @@ class StateManager:
                     "quantity": pos.quantity,
                     "entry_time": pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
                     "adv_estimate": pos.adv_estimate,
+                    "sleeve": getattr(pos, 'sleeve', 'MR'),
                     "current_price": getattr(pos, 'current_price', pos.entry_price),
                 }
 

@@ -1,57 +1,49 @@
-"""Strategy configuration — scoring weights, selection tiers, exit rules, timing."""
+"""Strategy configuration — combined MR_WIDE + GDP_BASE sleeves."""
 
 # ═══════════════════════════════════════════════════
-# Composite scoring weights (3:50 PM signal model)
+# Combined sleeve mode
 # ═══════════════════════════════════════════════════
-# vs_sector is zeroed until a real sector mapping exists.
-# Its weight is redistributed to vs_market.
-SCORE_WEIGHT_INTRADAY_RETURN = 0.20
-SCORE_WEIGHT_PROXIMITY_HIGH = 0.15
-SCORE_WEIGHT_VOLUME_VS_AVG = 0.20
-SCORE_WEIGHT_VOLUME_TREND = 0.10
-SCORE_WEIGHT_VS_MARKET = 0.25   # absorbs the old 0.15 sector weight
-SCORE_WEIGHT_ATR_PCT = -0.10    # negative = penalty for high volatility
+ENABLE_COMBINED_SLEEVES = True
+
+# Starting live-paper allocation (60/40 MR/GDP)
+MR_ALLOCATION_PCT = 0.60
+GDP_ALLOCATION_PCT = 0.40
+
+COMBINED_MAX_POSITIONS = 20  # Hard cap across both sleeves
 
 # ═══════════════════════════════════════════════════
-# Account-tier selection presets
-# ═══════════════════════════════════════════════════
-STRATEGY_TIERS = [
-    {"max_equity": 25_000,  "min_bucket": 4, "max_positions": 25},
-    {"max_equity": 100_000, "min_bucket": 4, "max_positions": 25},
-    {"max_equity": None,    "min_bucket": 4, "max_positions": 25},
-]
-
-# ═══════════════════════════════════════════════════
-# Position sizing — HEAD / TAIL allocation
+# Position sizing
 # ═══════════════════════════════════════════════════
 MAX_LEVERAGE = 1.0          # 1.0 = no margin (cash account)
 ADV_CAP_PCT = 0.003         # 0.3% of ADV max position size
-MAX_POSITION_DOLLARS = 50_000  # Legacy: absolute dollar cap (used by position_manager)
+MAX_POSITION_DOLLARS = 50_000  # Absolute dollar cap per position
 MIN_SHARES = 25             # Minimum share count per position
 
-HEAD_COUNT = 10             # Fixed number of equal-weight HEAD positions
-TAIL_MAX_POSITIONS = 15     # Max tail candidates after head symbols removed
-MAX_TOTAL_POSITIONS = 25    # Hard cap: HEAD_COUNT + TAIL_MAX_POSITIONS
-MAX_HEAD_POSITIONS = HEAD_COUNT   # Compat alias used by SelectionConfig
-
 # ═══════════════════════════════════════════════════
-# Mean reversion candidate filter
+# Sleeve 1: Mean Reversion — MR_WIDE
 # ═══════════════════════════════════════════════════
 MR_MIN_PRICE = 1.00
-MR_MAX_PRICE = 3.00
-MR_DAY_RET_MAX = -0.03          # day return must be <= -3%
-MR_VOLUME_RATIO_MIN = 1.5       # today volume / expected volume
-MR_CLOSE_POSITION_MAX = 0.20    # close must be in bottom 20% of day range
+MR_MAX_PRICE = 5.00
+MR_DAY_RET_MAX = -0.03          # day return <= -3%
+MR_VOLUME_RATIO_MIN = 1.5       # today volume / expected volume >= 1.5x
+MR_CLOSE_POSITION_MAX = 0.20    # close in bottom 20% of day range
 MR_LATE_DROP_MAX = None         # optional: set -0.01 for stricter late-drop filter
 
-MR_MAX_POSITIONS = 5            # max simultaneous positions (start conservative)
+MR_MAX_POSITIONS = 12           # target slots for MR sleeve (60% of 20)
 MR_USE_RANDOM_SELECTION = False # deterministic first-N selection for live trading
 
 # ═══════════════════════════════════════════════════
-# Exit rules (morning of T+1)
+# Sleeve 2: Green-Day Pullback — GDP_BASE
 # ═══════════════════════════════════════════════════
-# Simple rule: market sell ALL positions at 9:35 AM, no conditions.
-V2_FAILSAFE_TIME = "09:45"   # Post-exit failsafe verification
+GDP_MIN_PRICE = 1.00
+GDP_MAX_PRICE = 10.00
+GDP_DAY_RET_MIN = 0.01          # day return >= +1%
+GDP_DAY_RET_MAX = 0.10          # day return <= +10%
+GDP_REQUIRE_BELOW_VWAP = True   # price must be below intraday VWAP
+GDP_LATE_MOM_MAX = 0.0          # late momentum 15:30->signal must be <= 0 (decelerating)
+GDP_MAX_CLOSE_POSITION = None   # optional: limit close_position (None = no limit)
+
+GDP_MAX_POSITIONS = 8           # target slots for GDP sleeve (40% of 20)
 
 # ═══════════════════════════════════════════════════
 # Execution safety — buying power buffer + mop-up
@@ -64,17 +56,19 @@ ENTRY_MOPUP_MAX_POSITIONS = 0    # 0 = mop-up disabled (paper trading phase)
 # Afternoon timeline (T-1 entry day)
 # ═══════════════════════════════════════════════════
 DATA_COLLECTION_TIME = "15:30"   # Begin universe pipeline
-SCORING_TIME = "15:48"           # Fetch signal bars + score
-ENTRY_TIME = "15:50"             # Execute entries (market orders)
+SCORING_TIME = "15:55"           # Score using latest available bars/snapshot
+ENTRY_TIME = "15:55"             # Execute immediately after scoring
 
 # ═══════════════════════════════════════════════════
 # Morning timeline (T+1 exit day)
 # ═══════════════════════════════════════════════════
 MARKET_OPEN_TIME = "09:30"
-EXIT_940_TIME = "09:35"          # Market sell ALL positions (mean reversion exit)
+GDP_EXIT_TIME = "09:35"          # GDP sleeve exits at 9:35 AM
+MR_EXIT_TIME = "09:40"           # MR sleeve exits at 9:40 AM
+V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
-# Sector ETFs — kept for future use when sector mapping is added
+# Sector ETFs — kept for future use
 # ═══════════════════════════════════════════════════
 SECTOR_ETFS = {
     "XLK": "Technology",

@@ -3,7 +3,7 @@
 # ═══════════════════════════════════════════════════
 # Universe presets — pick one via UNIVERSE_PRESET
 # ═══════════════════════════════════════════════════
-UNIVERSE_PRESET = "mean_reversion_smallcap"
+UNIVERSE_PRESET = "expanded_smallcap"
 
 UNIVERSE_PRESETS = {
     "core_smallcap": {

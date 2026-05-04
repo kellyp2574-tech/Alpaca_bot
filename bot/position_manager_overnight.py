@@ -18,12 +18,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Position:
-    """Represents an open position"""
+    """Represents an open position with sleeve label"""
     symbol: str
     entry_price: float
     quantity: int
     entry_time: datetime
     adv_estimate: float
+    sleeve: str = field(default="MR")
     current_price: float = field(default=0.0)
 
 
@@ -63,6 +64,7 @@ class PositionManager:
                     quantity=data.get("quantity", 0),
                     entry_time=datetime.fromisoformat(data.get("entry_time", datetime.now().isoformat())),
                     adv_estimate=data.get("adv_estimate", 0),
+                    sleeve=data.get("sleeve", "MR"),
                     current_price=data.get("current_price", data.get("entry_price", 0)),
                 )
                 self.positions[symbol] = position
@@ -635,9 +637,10 @@ class PositionManager:
                     quantity=qty,
                     entry_time=datetime.now(),
                     adv_estimate=0.0,
+                    sleeve="UNKNOWN",
                     current_price=avg_entry,
                 )
-                logger.warning(f"Broker reconcile: ADDED {symbol} qty={qty} avg={avg_entry:.4f}")
+                logger.warning(f"Broker reconcile: ADDED {symbol} qty={qty} avg={avg_entry:.4f} (sleeve=UNKNOWN)")
                 actions[symbol] = "added"
             else:
                 local_pos = self.positions[symbol]
