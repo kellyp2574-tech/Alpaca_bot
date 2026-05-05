@@ -9,27 +9,27 @@ UNIVERSE_PRESETS = {
     "core_smallcap": {
         "min_price": 1.0,
         "max_price": 5.0,
-        "min_adv_dollars": 2_000_000,
+        "min_adv_dollars": 0,  # REMOVED: hard ADV gate (sizing via ADV_CAP_PCT protects)
     },
     "expanded_smallcap": {
         "min_price": 1.0,
         "max_price": 10.0,
-        "min_adv_dollars": 2_000_000,
+        "min_adv_dollars": 0,  # REMOVED: hard ADV gate (sizing via ADV_CAP_PCT protects)
     },
     "mean_reversion_smallcap": {
         "min_price": 1.0,
         "max_price": 3.0,
-        "min_adv_dollars": 2_000_000,
+        "min_adv_dollars": 0,  # REMOVED: hard ADV gate (sizing via ADV_CAP_PCT protects)
     },
     "midcap": {
         "min_price": 5.0,
         "max_price": 50.0,
-        "min_adv_dollars": 2_000_000,
+        "min_adv_dollars": 0,  # REMOVED: hard ADV gate (sizing via ADV_CAP_PCT protects)
     },
     "higher_capacity": {
         "min_price": 5.0,
         "max_price": 100.0,
-        "min_adv_dollars": 2_000_000,
+        "min_adv_dollars": 0,  # REMOVED: hard ADV gate (sizing via ADV_CAP_PCT protects)
     },
 }
 

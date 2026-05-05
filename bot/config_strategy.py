@@ -64,7 +64,7 @@ ENTRY_TIME = "15:55"             # Execute immediately after scoring
 # ═══════════════════════════════════════════════════
 MARKET_OPEN_TIME = "09:30"
 GDP_EXIT_TIME = "09:35"          # GDP sleeve exits at 9:35 AM
-MR_EXIT_TIME = "09:40"           # MR sleeve exits at 9:40 AM
+MR_EXIT_TIME = "09:35"           # MR sleeve exits at 9:35 AM (same as GDP)
 V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════

@@ -2,7 +2,7 @@
 
 Sleeve 1: MR_WIDE (Mean Reversion)
   - Buy 15:55, $1–5, day_ret <= -3%, vol_ratio >= 1.5x, close_position <= 0.20
-  - Exit 09:40
+  - Exit 09:35
 
 Sleeve 2: GDP_BASE (Green-Day Pullback)
   - Buy 15:55, $1–10, day_ret +1% to +10%, below VWAP, late_mom <= 0
@@ -15,12 +15,11 @@ Daily Schedule (ET) — bot starts at 9:00 AM:
 MORNING (T+1 exits — positions from yesterday's 15:55 entries):
   09:00  Start, detect overnight positions from broker
   09:30  Market open — positions fill at the open
-  09:35  Market sell GDP positions — no conditions
-  09:40  Market sell MR positions — no conditions
+  09:35  Market sell ALL positions (both GDP and MR sleeves)
   09:45  Post-exit failsafe verification
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
-  15:30  Build universe (Massive + Alpaca, $1–10, ADV >= $2M)
+  15:30  Build universe (Massive + Alpaca, $1–10, ADV sizing cap protects)
   15:55  Fetch latest 9:30-15:55 minute bars, build both MR and GDP candidates
   15:55  Execute entries immediately after scoring
   16:00  Confirm positions held overnight, save state, done
@@ -161,8 +160,7 @@ class CombinedOvernightReboundBot:
             self.morning_exits_done = True
 
         # Pre-compute schedule times from config
-        t_gdp_exit     = _parse_config_time(config.GDP_EXIT_TIME)           # 09:35
-        t_mr_exit      = _parse_config_time(config.MR_EXIT_TIME)            # 09:40
+        t_exit_all     = _parse_config_time(config.GDP_EXIT_TIME)           # 09:35 (both sleeves)
         t_failsafe     = _parse_config_time(config.V2_FAILSAFE_TIME)        # 09:45
         t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)    # 15:30
         t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:53
@@ -208,15 +206,11 @@ class CombinedOvernightReboundBot:
                         has_positions = self.position_mgr.get_position_count() > 0
 
                 if has_positions and not self.morning_exits_done:
-                    # 9:35 AM — Exit GDP positions
-                    if not self.gdp_exits_done and current_time >= t_gdp_exit:
-                        self._exit_sleeve_positions("GDP", "09:35 GDP market sell")
+                    # 9:35 AM — Exit ALL positions (both GDP and MR sleeves)
+                    if not self.gdp_exits_done and current_time >= t_exit_all:
+                        self._exit_sleeve_positions("GDP", "09:35 all positions (GDP)")
+                        self._exit_sleeve_positions("MR", "09:35 all positions (MR)")
                         self.gdp_exits_done = True
-                        self._save_state()
-
-                    # 9:40 AM — Exit MR positions
-                    if not self.mr_exits_done and current_time >= t_mr_exit:
-                        self._exit_sleeve_positions("MR", "09:40 MR market sell")
                         self.mr_exits_done = True
                         self._save_state()
 
@@ -445,6 +439,15 @@ class CombinedOvernightReboundBot:
             filtered_mr = filter_mean_reversion_candidates(raw_mr)
             self.mr_candidates = filtered_mr[:config.MR_MAX_POSITIONS]
 
+            # CRITICAL DIAGNOSTIC: MR pipeline counts
+            logger.info(
+                f"MR pipeline: "
+                f"universe={len(self.universe)}, "
+                f"raw={len(raw_mr)}, "
+                f"passed={len(filtered_mr)}, "
+                f"selected={len(self.mr_candidates)}"
+            )
+
             # 4. Build raw GDP candidates from minute bars
             raw_gdp = build_green_day_pullback_candidates(
                 self.universe,
@@ -457,6 +460,15 @@ class CombinedOvernightReboundBot:
             mr_symbols = {c.symbol for c in self.mr_candidates}
             filtered_gdp = [c for c in filtered_gdp if c.symbol not in mr_symbols]
             self.gdp_candidates = filtered_gdp[:config.GDP_MAX_POSITIONS]
+
+            # CRITICAL DIAGNOSTIC: GDP pipeline counts
+            logger.info(
+                f"GDP pipeline: "
+                f"universe={len(self.universe)}, "
+                f"raw={len(raw_gdp)}, "
+                f"passed={len(filtered_gdp)}, "
+                f"selected={len(self.gdp_candidates)}"
+            )
 
             self.scoring_done = True
             self._save_state()
