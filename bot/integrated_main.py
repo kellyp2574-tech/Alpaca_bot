@@ -437,15 +437,14 @@ class CombinedOvernightReboundBot:
                 self._adv_cache,
             )
             filtered_mr = filter_mean_reversion_candidates(raw_mr)
-            self.mr_candidates = filtered_mr[:config.MR_MAX_POSITIONS]
+            self.mr_candidates = filtered_mr  # Keep ALL passed candidates for allocator
 
             # CRITICAL DIAGNOSTIC: MR pipeline counts
             logger.info(
                 f"MR pipeline: "
                 f"universe={len(self.universe)}, "
                 f"raw={len(raw_mr)}, "
-                f"passed={len(filtered_mr)}, "
-                f"selected={len(self.mr_candidates)}"
+                f"passed={len(filtered_mr)}"
             )
 
             # 4. Build raw GDP candidates from minute bars
@@ -457,41 +456,41 @@ class CombinedOvernightReboundBot:
             filtered_gdp = filter_green_day_pullback_candidates(raw_gdp)
 
             # 5. Remove GDP candidates that are already MR candidates (MR takes priority)
-            mr_symbols = {c.symbol for c in self.mr_candidates}
+            mr_symbols = {c.symbol for c in filtered_mr}  # Use full filtered list
             filtered_gdp = [c for c in filtered_gdp if c.symbol not in mr_symbols]
-            self.gdp_candidates = filtered_gdp[:config.GDP_MAX_POSITIONS]
+            self.gdp_candidates = filtered_gdp  # Keep ALL passed candidates for allocator
 
             # CRITICAL DIAGNOSTIC: GDP pipeline counts
             logger.info(
                 f"GDP pipeline: "
                 f"universe={len(self.universe)}, "
                 f"raw={len(raw_gdp)}, "
-                f"passed={len(filtered_gdp)}, "
-                f"selected={len(self.gdp_candidates)}"
+                f"passed={len(filtered_gdp)}"
             )
 
             self.scoring_done = True
             self._save_state()
 
             logger.info(
-                f"Combined scoring: MR raw={len(raw_mr)} passed={len(filtered_mr)} selected={len(self.mr_candidates)} | "
-                f"GDP raw={len(raw_gdp)} passed={len(filtered_gdp)} selected={len(self.gdp_candidates)}"
+                f"Combined scoring: "
+                f"MR raw={len(raw_mr)} passed={len(filtered_mr)} top_slots={min(len(filtered_mr), config.MR_MAX_POSITIONS)} | "
+                f"GDP raw={len(raw_gdp)} passed={len(filtered_gdp)} top_slots={min(len(filtered_gdp), config.GDP_MAX_POSITIONS)}"
             )
 
-            # Log MR candidates
-            for c in self.mr_candidates:
+            # Log top MR candidates (only up to max positions)
+            for c in self.mr_candidates[:config.MR_MAX_POSITIONS]:
                 logger.info(
-                    f"MR SELECT {c.symbol}: price={c.signal_price:.2f}, "
+                    f"MR TOP {c.symbol}: price={c.signal_price:.2f}, "
                     f"day_ret={c.day_return:.2%}, vol_ratio={c.volume_ratio:.2f}x, "
                     f"close_pos={c.close_position:.2f}, "
                     f"late_drop={c.late_drop_1530_1550:.2%}, "
                     f"score={c.selection_score:.3f}"
                 )
 
-            # Log GDP candidates
-            for c in self.gdp_candidates:
+            # Log top GDP candidates (only up to max positions)
+            for c in self.gdp_candidates[:config.GDP_MAX_POSITIONS]:
                 logger.info(
-                    f"GDP SELECT {c.symbol}: price={c.signal_price:.2f}, "
+                    f"GDP TOP {c.symbol}: price={c.signal_price:.2f}, "
                     f"day_ret={c.day_return:.2%}, price_vs_vwap={c.price_vs_vwap:.2%}, "
                     f"late_mom={c.late_mom_1530_signal:.2%}, "
                     f"close_pos={c.close_position:.2f}, vol_ratio={c.volume_ratio:.2f}x, "
@@ -527,16 +526,16 @@ class CombinedOvernightReboundBot:
                 }
 
             audit_dicts = {
-                "mr_selected": [_mr_dict(c) for c in self.mr_candidates],
-                "mr_all_passed": [_mr_dict(c) for c in filtered_mr],
-                "gdp_selected": [_gdp_dict(c) for c in self.gdp_candidates],
-                "gdp_all_passed": [_gdp_dict(c) for c in filtered_gdp],
+                "mr_selected": [_mr_dict(c) for c in self.mr_candidates[:config.MR_MAX_POSITIONS]],
+                "mr_all_passed": [_mr_dict(c) for c in self.mr_candidates],
+                "gdp_selected": [_gdp_dict(c) for c in self.gdp_candidates[:config.GDP_MAX_POSITIONS]],
+                "gdp_all_passed": [_gdp_dict(c) for c in self.gdp_candidates],
             }
             save_candidates_audit(audit_dicts)
 
             if self._universe_diag:
-                top_mr = [_mr_dict(c) for c in filtered_mr[:20]]
-                top_gdp = [_gdp_dict(c) for c in filtered_gdp[:20]]
+                top_mr = [_mr_dict(c) for c in self.mr_candidates[:20]]
+                top_gdp = [_gdp_dict(c) for c in self.gdp_candidates[:20]]
                 save_universe_audit(
                     self._universe_diag, self.universe,
                     scored_top20=top_mr + top_gdp,
@@ -563,17 +562,128 @@ class CombinedOvernightReboundBot:
         class SleeveAllocation:
             symbol: str
             shares: int
+            target_dollars: float
             rank: int
             sleeve: str
             candidate: Any
 
-        def _size_candidate(c, slot_dollars: float) -> int:
-            """Return share count for a candidate given slot dollars."""
-            if c.signal_price <= 0:
-                return 0
-            adv_cap = c.adv_dollars * config.ADV_CAP_PCT if c.adv_dollars > 0 else slot_dollars
-            target_dollars = min(slot_dollars, adv_cap, config.MAX_POSITION_DOLLARS)
-            return math.floor(target_dollars / c.signal_price)
+        def allocate_waterfall(candidates, sleeve_budget: float, equity: float, sleeve_name: str, max_positions: int) -> list:
+            """Two-pass waterfall allocator with effective minimum sizing.
+
+            Pre-filters: cap checks, effective min (MIN_POSITION_DOLLARS vs MIN_SHARES*price)
+            Pass 1: Equal share respecting caps (single name 10%, ADV 0.3%, MAX_POSITION_DOLLARS)
+            Pass 2: Redistribute leftover to candidates with capacity (highest ADV first)
+
+            Returns list of dicts with symbol, target_dollars, cap_dollars, adv_dollars.
+            """
+            if not candidates or sleeve_budget <= 0:
+                return []
+
+            max_single_dollars = equity * config.MAX_SINGLE_POSITION_PCT
+
+            # Pre-filter: skip candidates where cap is below effective minimum
+            viable = []
+            skips = {}
+            for c in candidates:
+                adv_cap = c.adv_dollars * config.ADV_CAP_PCT if c.adv_dollars > 0 else 0.0
+                cap = min(
+                    adv_cap,
+                    max_single_dollars,
+                    config.MAX_POSITION_DOLLARS,
+                )
+
+                # Effective minimum considers both MIN_POSITION_DOLLARS and MIN_SHARES requirement
+                effective_min = max(
+                    config.MIN_POSITION_DOLLARS,
+                    config.MIN_SHARES * c.signal_price,
+                )
+
+                if cap < effective_min:
+                    skips[c.symbol] = (
+                        f"cap_below_effective_min: cap=${cap:.2f}, "
+                        f"effective_min=${effective_min:.2f}, adv=${c.adv_dollars:.0f}, price=${c.signal_price:.2f}"
+                    )
+                    continue
+
+                viable.append(c)
+
+            # Log skips if any
+            if skips:
+                logger.warning(f"{sleeve_name}: skipped {len(skips)} candidates (cap below effective min)")
+                for sym, reason in list(skips.items())[:5]:  # Log first 5
+                    logger.warning(f"  {sym}: {reason}")
+
+            # Apply max_positions cap while preserving score order
+            viable = viable[:max_positions]
+
+            if not viable:
+                logger.warning(f"{sleeve_name}: no viable candidates after cap/min-share filters")
+                return []
+
+            # Calculate per-candidate caps
+            caps = {}
+            for c in viable:
+                adv_cap = c.adv_dollars * config.ADV_CAP_PCT
+                caps[c.symbol] = min(
+                    adv_cap,
+                    max_single_dollars,
+                    config.MAX_POSITION_DOLLARS,
+                )
+
+            allocations = {c.symbol: 0.0 for c in viable}
+            base_target = sleeve_budget / len(viable)
+
+            # Pass 1: Low ADV first - give everyone their capped equal share
+            for c in sorted(viable, key=lambda x: x.adv_dollars):
+                effective_min = max(config.MIN_POSITION_DOLLARS, config.MIN_SHARES * c.signal_price)
+                alloc = min(base_target, caps[c.symbol])
+                if alloc >= effective_min:
+                    allocations[c.symbol] = alloc
+
+            leftover = sleeve_budget - sum(allocations.values())
+
+            # Pass 2: High ADV first - push leftover into names with room
+            for c in sorted(viable, key=lambda x: x.adv_dollars, reverse=True):
+                if leftover < config.MIN_POSITION_DOLLARS:
+                    break
+                room = caps[c.symbol] - allocations[c.symbol]
+                if room <= 0:
+                    continue
+                add = min(leftover, room)
+                allocations[c.symbol] += add
+                leftover -= add
+
+            # Build result list (filter by effective min one more time)
+            result = []
+            for c in viable:
+                effective_min = max(config.MIN_POSITION_DOLLARS, config.MIN_SHARES * c.signal_price)
+                if allocations[c.symbol] >= effective_min:
+                    result.append({
+                        "symbol": c.symbol,
+                        "target_dollars": allocations[c.symbol],
+                        "cap_dollars": caps[c.symbol],
+                        "adv_dollars": c.adv_dollars,
+                        "candidate": c,
+                    })
+
+            # Log allocation summary
+            total_allocated = sum(r["target_dollars"] for r in result)
+
+            # Warn about zero allocations (viable but got nothing)
+            zero_alloc = [
+                c.symbol for c in viable
+                if allocations.get(c.symbol, 0.0) <= 0
+            ]
+            if zero_alloc:
+                logger.warning(f"{sleeve_name}: zero allocations after waterfall: {zero_alloc[:10]}")
+
+            logger.info(
+                f"{sleeve_name} waterfall: "
+                f"candidates={len(candidates)}, viable={len(viable)}, selected={len(result)}, "
+                f"budget=${sleeve_budget:,.2f}, allocated=${total_allocated:,.2f}, leftover=${leftover:,.2f}"
+            )
+
+            return result
 
         try:
             # Get account equity and buying power
@@ -611,43 +721,71 @@ class CombinedOvernightReboundBot:
             # Calculate sleeve budgets and target slots
             mr_budget = deployable * config.MR_ALLOCATION_PCT
             gdp_budget = deployable * config.GDP_ALLOCATION_PCT
-            mr_slot = mr_budget / config.MR_MAX_POSITIONS if config.MR_MAX_POSITIONS > 0 else 0
-            gdp_slot = gdp_budget / config.GDP_MAX_POSITIONS if config.GDP_MAX_POSITIONS > 0 else 0
-
             logger.info(
-                f"Sleeve budgets: MR ${mr_budget:,.2f} ({config.MR_ALLOCATION_PCT:.0%}, "
-                f"slot=${mr_slot:,.2f} x {config.MR_MAX_POSITIONS}) | "
-                f"GDP ${gdp_budget:,.2f} ({config.GDP_ALLOCATION_PCT:.0%}, "
-                f"slot=${gdp_slot:,.2f} x {config.GDP_MAX_POSITIONS})"
+                f"Sleeve budgets: MR ${mr_budget:,.2f} ({config.MR_ALLOCATION_PCT:.0%}) | "
+                f"GDP ${gdp_budget:,.2f} ({config.GDP_ALLOCATION_PCT:.0%})"
             )
 
-            # Build allocations for both sleeves (track min-share skips)
+            # Execution eligibility gate FIRST (before allocation)
+            # This prevents budget from being assigned to names that fail spread check
+            # Cap pool size to avoid large snapshot calls (3x max positions gives replacement depth)
+            EXEC_POOL_MULTIPLIER = 3
+            mr_pool = self.mr_candidates[:config.MR_MAX_POSITIONS * EXEC_POOL_MULTIPLIER]
+            gdp_pool = self.gdp_candidates[:config.GDP_MAX_POSITIONS * EXEC_POOL_MULTIPLIER]
+            candidate_symbols = [c.symbol for c in mr_pool + gdp_pool]
+            fresh_snaps = self.alpaca.get_snapshots(candidate_symbols)
+            orderable, exec_rejected = filter_execution_ready(
+                candidate_symbols, fresh_snaps,
+                max_spread_pct=0.05, require_quote=True,
+            )
+            orderable_set = set(orderable)
+
+            if exec_rejected:
+                for sym, reason in exec_rejected.items():
+                    logger.warning(f"Execution reject {sym}: {reason}")
+
+            # Filter candidates to only orderable symbols (from the capped pools)
+            mr_orderable = [c for c in mr_pool if c.symbol in orderable_set]
+            gdp_orderable = [c for c in gdp_pool if c.symbol in orderable_set]
+
+            logger.info(
+                f"Post-spread-filter: MR {len(self.mr_candidates)} -> {len(mr_orderable)} orderable, "
+                f"GDP {len(self.gdp_candidates)} -> {len(gdp_orderable)} orderable"
+            )
+
+            # Allocate ONLY from orderable candidates (budget flows to clean names)
+            mr_results = allocate_waterfall(
+                mr_orderable, mr_budget, equity, "MR", config.MR_MAX_POSITIONS
+            )
+            gdp_results = allocate_waterfall(
+                gdp_orderable, gdp_budget, equity, "GDP", config.GDP_MAX_POSITIONS
+            )
+
+            # Build SleeveAllocation list with shares calculated from target dollars
             allocations: List[SleeveAllocation] = []
-            mr_min_share_skips = 0
-            gdp_min_share_skips = 0
+            for rank, r in enumerate(mr_results, start=1):
+                c = r["candidate"]
+                shares = math.floor(r["target_dollars"] / c.signal_price) if c.signal_price > 0 else 0
+                allocations.append(SleeveAllocation(
+                    symbol=c.symbol,
+                    shares=shares,
+                    target_dollars=r["target_dollars"],
+                    rank=rank,
+                    sleeve="MR",
+                    candidate=c
+                ))
 
-            for rank, c in enumerate(self.mr_candidates[:config.MR_MAX_POSITIONS], start=1):
-                shares = _size_candidate(c, mr_slot)
-                if shares >= config.MIN_SHARES:
-                    allocations.append(SleeveAllocation(c.symbol, shares, rank, "MR", c))
-                else:
-                    mr_min_share_skips += 1
-                    logger.warning(f"MR SKIP {c.symbol}: shares {shares} < min {config.MIN_SHARES}")
-
-            for rank, c in enumerate(self.gdp_candidates[:config.GDP_MAX_POSITIONS], start=1):
-                shares = _size_candidate(c, gdp_slot)
-                if shares >= config.MIN_SHARES:
-                    allocations.append(SleeveAllocation(c.symbol, shares, rank, "GDP", c))
-                else:
-                    gdp_min_share_skips += 1
-                    logger.warning(f"GDP SKIP {c.symbol}: shares {shares} < min {config.MIN_SHARES}")
-
-            # Log min-share skip summary
-            if mr_min_share_skips or gdp_min_share_skips:
-                logger.warning(
-                    f"Min-share skips: MR={mr_min_share_skips}, GDP={gdp_min_share_skips}, "
-                    f"MIN_SHARES={config.MIN_SHARES}"
-                )
+            for rank, r in enumerate(gdp_results, start=1):
+                c = r["candidate"]
+                shares = math.floor(r["target_dollars"] / c.signal_price) if c.signal_price > 0 else 0
+                allocations.append(SleeveAllocation(
+                    symbol=c.symbol,
+                    shares=shares,
+                    target_dollars=r["target_dollars"],
+                    rank=rank,
+                    sleeve="GDP",
+                    candidate=c
+                ))
 
             # Enforce combined position cap (prioritizes MR as appended first)
             if len(allocations) > config.COMBINED_MAX_POSITIONS:
@@ -662,39 +800,34 @@ class CombinedOvernightReboundBot:
                 return
 
             exec_diag.selected_symbols = [a.symbol for a in allocations]
-            logger.info(f"Selected {len(allocations)} allocations: "
-                        f"{sum(1 for a in allocations if a.sleeve=='MR')} MR + "
-                        f"{sum(1 for a in allocations if a.sleeve=='GDP')} GDP")
-
-            # Execution eligibility gate
-            fresh_snaps = self.alpaca.get_snapshots(exec_diag.selected_symbols)
-            orderable, exec_rejected = filter_execution_ready(
-                exec_diag.selected_symbols, fresh_snaps,
-                max_spread_pct=0.05, require_quote=True,
-            )
-            exec_diag.orderable_symbols = list(orderable)
+            exec_diag.orderable_symbols = [a.symbol for a in allocations]  # Only the ones we actually sized
             exec_diag.rejected_symbols = dict(exec_rejected)
-            orderable_set = set(orderable)
-
-            if exec_rejected:
-                for sym, reason in exec_rejected.items():
-                    logger.warning(f"Execution reject {sym}: {reason}")
-
+            total_target = sum(a.target_dollars for a in allocations)
+            logger.info(
+                f"Selected {len(allocations)} allocations: "
+                f"{sum(1 for a in allocations if a.sleeve=='MR')} MR + "
+                f"{sum(1 for a in allocations if a.sleeve=='GDP')} GDP, "
+                f"total_target=${total_target:,.2f}"
+            )
+            logger.info(
+                f"Execution pool metrics: pool_size={len(candidate_symbols)}, "
+                f"orderable={len(orderable_set)}, rejected_spread={len(exec_rejected)}"
+            )
             # Submit market buy orders
             total_deployed = 0.0
 
             def _adaptive_qty(alloc: SleeveAllocation, bp_buffer: float = config.ENTRY_BP_BUFFER_PCT) -> int:
-                """Return alloc.shares clamped to current buying power."""
+                """Return shares clamped to current buying power using target_dollars."""
                 bp = self.position_mgr.get_total_capital()
                 if not bp or bp <= 0:
                     return alloc.shares
                 max_notional = bp * bp_buffer
+                # Use target_dollars as the primary constraint, but cap at buying power
+                target = min(alloc.target_dollars, max_notional)
                 price_ref = alloc.candidate.signal_price
-                notional = alloc.shares * price_ref
-                if notional <= max_notional:
-                    return alloc.shares
-                new_qty = math.floor(max_notional / price_ref) if price_ref > 0 else 0
-                return max(0, new_qty)
+                if price_ref <= 0:
+                    return 0
+                return math.floor(target / price_ref)
 
             # Hard cutoff for new buy submissions (don't chase too close to close)
             entry_cutoff = dt_time(15, 58, 30)
@@ -941,8 +1074,10 @@ class CombinedOvernightReboundBot:
                     "adv_dollars": round(c.adv_dollars, 0),
                 }
             audit_dicts = {
-                "mr_selected": [_mr_dict(c) for c in self.mr_candidates],
-                "gdp_selected": [_gdp_dict(c) for c in self.gdp_candidates],
+                "mr_selected": [_mr_dict(c) for c in self.mr_candidates[:config.MR_MAX_POSITIONS]],
+                "mr_all_passed": [_mr_dict(c) for c in self.mr_candidates],
+                "gdp_selected": [_gdp_dict(c) for c in self.gdp_candidates[:config.GDP_MAX_POSITIONS]],
+                "gdp_all_passed": [_gdp_dict(c) for c in self.gdp_candidates],
             }
             if audit_dicts["mr_selected"] or audit_dicts["gdp_selected"]:
                 save_candidates_audit(audit_dicts)

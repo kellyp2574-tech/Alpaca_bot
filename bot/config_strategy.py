@@ -12,12 +12,14 @@ GDP_ALLOCATION_PCT = 0.40
 COMBINED_MAX_POSITIONS = 20  # Hard cap across both sleeves
 
 # ═══════════════════════════════════════════════════
-# Position sizing
+# Position sizing (waterfall allocation)
 # ═══════════════════════════════════════════════════
-MAX_LEVERAGE = 1.0          # 1.0 = no margin (cash account)
-ADV_CAP_PCT = 0.003         # 0.3% of ADV max position size
-MAX_POSITION_DOLLARS = 50_000  # Absolute dollar cap per position
-MIN_SHARES = 25             # Minimum share count per position
+MAX_LEVERAGE = 1.0               # 1.0 = no margin (cash account)
+ADV_CAP_PCT = 0.003              # 0.3% of ADV max position size
+MAX_SINGLE_POSITION_PCT = 0.10 # 10% max of portfolio in one stock
+MIN_POSITION_DOLLARS = 50        # Min order notional (skip if ADV cap < this)
+MIN_SHARES = 25                  # Minimum share count per position
+MAX_POSITION_DOLLARS = 50_000    # Absolute dollar cap per position (legacy)
 
 # ═══════════════════════════════════════════════════
 # Sleeve 1: Mean Reversion — MR_WIDE
