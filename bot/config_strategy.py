@@ -9,6 +9,9 @@ ENABLE_COMBINED_SLEEVES = True
 MR_ALLOCATION_PCT = 0.60
 GDP_ALLOCATION_PCT = 0.40
 
+MR_WEIGHT = 0.70                 # MR score weight in combined ranking
+MOM_WEIGHT = 0.30                # Momentum score weight in combined ranking
+
 COMBINED_MAX_POSITIONS = 20  # Hard cap across both sleeves
 
 # ═══════════════════════════════════════════════════
@@ -59,14 +62,14 @@ ENTRY_MOPUP_MAX_POSITIONS = 0    # 0 = mop-up disabled (paper trading phase)
 # ═══════════════════════════════════════════════════
 DATA_COLLECTION_TIME = "15:30"   # Begin universe pipeline
 SCORING_TIME = "15:55"           # Score using latest available bars/snapshot
-ENTRY_TIME = "15:55"             # Execute immediately after scoring
+ENTRY_TIME = "15:50"             # Execute immediately after scoring
 
 # ═══════════════════════════════════════════════════
 # Morning timeline (T+1 exit day)
 # ═══════════════════════════════════════════════════
 MARKET_OPEN_TIME = "09:30"
-GDP_EXIT_TIME = "09:35"          # GDP sleeve exits at 9:35 AM
-MR_EXIT_TIME = "09:35"           # MR sleeve exits at 9:35 AM (same as GDP)
+GDP_EXIT_TIME = "09:30"          # GDP sleeve exits at market open
+MR_EXIT_TIME = "09:30"           # MR sleeve exits at market open
 V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
