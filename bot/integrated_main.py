@@ -1,27 +1,26 @@
 """Combined Overnight Rebound Bot — Main Orchestrator
 
 Sleeve 1: MR_WIDE (Mean Reversion)
-  - Buy 15:55, $1–5, day_ret <= -3%, vol_ratio >= 1.5x, close_position <= 0.20
-  - Exit 09:35
+  - Buy 15:50, $1–5, day_ret <= -3%, vol_ratio >= 1.5x, close_position <= 0.20
+  - Exit 09:30
 
-Sleeve 2: GDP_BASE (Green-Day Pullback)
-  - Buy 15:55, $1–10, day_ret +1% to +10%, below VWAP, late_mom <= 0
-  - Exit 09:35
+Sleeve 2: GDP_BASE / MOM_CLEAN (Green-Day Pullback)
+  - Buy 15:50, $1–10, day_ret +1% to +10%, below VWAP, late_mom <= 0
+  - Exit 09:30
 
-Allocation: 60/40 MR/GDP for paper trading (12 MR slots, 8 GDP slots)
+Production allocation: static 70/30 MR/GDP, 10% max single-name cap.
 
 Daily Schedule (ET) — bot starts at 9:00 AM:
 
-MORNING (T+1 exits — positions from yesterday's 15:55 entries):
+MORNING (T+1 exits — positions from yesterday's 15:50 entries):
   09:00  Start, detect overnight positions from broker
-  09:30  Market open — positions fill at the open
-  09:35  Market sell ALL positions (both GDP and MR sleeves)
+  09:30  Market sell ALL positions (both GDP and MR sleeves)
   09:45  Post-exit failsafe verification
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca, $1–10, ADV sizing cap protects)
-  15:55  Fetch latest 9:30-15:55 minute bars, build both MR and GDP candidates
-  15:55  Execute entries immediately after scoring
+  15:50  Fetch latest 9:30-15:50 minute bars, build both MR and GDP candidates
+  15:50  Execute entries immediately after scoring
   16:00  Confirm positions held overnight, save state, done
 """
 import logging
@@ -100,8 +99,8 @@ class CombinedOvernightReboundBot:
         # Stage flags
         self.morning_exits_done = False   # All overnight positions exited
         self.data_collected = False       # Universe + daily bars ready
-        self.scoring_done = False         # 3:53 PM scoring complete
-        self.entries_done = False         # 3:55 PM entries executed
+        self.scoring_done = False         # 3:50 PM scoring complete
+        self.entries_done = False         # 3:50 PM entries executed
 
         # Sleeve-specific exit flags
         self.gdp_exits_done = False
@@ -135,11 +134,34 @@ class CombinedOvernightReboundBot:
                 logger.critical("State save also failed after crash", exc_info=True)
             raise
 
+    def _validate_config(self):
+        """Fail fast on config combinations that contradict the researched setup."""
+        total_alloc = config.MR_ALLOCATION_PCT + config.GDP_ALLOCATION_PCT
+        if abs(total_alloc - 1.0) > 1e-6:
+            raise ValueError(
+                f"Allocation must sum to 1.0, got MR={config.MR_ALLOCATION_PCT}, "
+                f"GDP={config.GDP_ALLOCATION_PCT}, total={total_alloc}"
+            )
+
+        if _parse_config_time(config.SCORING_TIME) > _parse_config_time(config.ENTRY_TIME):
+            raise ValueError(
+                f"SCORING_TIME must be <= ENTRY_TIME, got "
+                f"{config.SCORING_TIME} > {config.ENTRY_TIME}"
+            )
+
+        if config.GDP_EXIT_TIME != config.MR_EXIT_TIME:
+            logger.warning(
+                f"GDP_EXIT_TIME ({config.GDP_EXIT_TIME}) != MR_EXIT_TIME ({config.MR_EXIT_TIME}); "
+                f"current bot exits both at GDP_EXIT_TIME"
+            )
+
     def _run(self):
         """Inner run — called by run() which wraps it with top-level error handling."""
         logger.info("=" * 60)
         logger.info("Combined Overnight Rebound Bot Starting")
         logger.info("=" * 60)
+
+        self._validate_config()
 
         # Load any saved state and detect mode
         self._load_state()
@@ -160,11 +182,11 @@ class CombinedOvernightReboundBot:
             self.morning_exits_done = True
 
         # Pre-compute schedule times from config
-        t_exit_all     = _parse_config_time(config.GDP_EXIT_TIME)           # 09:35 (both sleeves)
+        t_exit_all     = _parse_config_time(config.GDP_EXIT_TIME)           # 09:30 (both sleeves)
         t_failsafe     = _parse_config_time(config.V2_FAILSAFE_TIME)        # 09:45
         t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)    # 15:30
-        t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:53
-        t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:55
+        t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:50
+        t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
         t_market_close = dt_time(16, 0)
 
         # If starting after failsafe time with positions, flatten immediately
@@ -206,10 +228,10 @@ class CombinedOvernightReboundBot:
                         has_positions = self.position_mgr.get_position_count() > 0
 
                 if has_positions and not self.morning_exits_done:
-                    # 9:35 AM — Exit ALL positions (both GDP and MR sleeves)
+                    # 09:30 AM — Exit ALL positions (both GDP and MR sleeves)
                     if not self.gdp_exits_done and current_time >= t_exit_all:
-                        self._exit_sleeve_positions("GDP", "09:35 all positions (GDP)")
-                        self._exit_sleeve_positions("MR", "09:35 all positions (MR)")
+                        self._exit_sleeve_positions("GDP", "09:30 all positions (GDP)")
+                        self._exit_sleeve_positions("MR", "09:30 all positions (MR)")
                         self.gdp_exits_done = True
                         self.mr_exits_done = True
                         self._save_state()
@@ -247,11 +269,11 @@ class CombinedOvernightReboundBot:
                     logger.warning("Past 3:50 PM without data collection — attempting now")
                     self._step_collect_data()
 
-            # 3:55 PM — Score and rank using latest available bars
+            # 3:50 PM — Score and rank using 9:30-15:50 bars
             if self.data_collected and not self.scoring_done and current_time >= t_scoring:
                 self._step_score_and_rank()
 
-            # 3:55 PM — Execute entries (requires scoring)
+            # 3:50 PM — Execute entries (requires scoring)
             if self.scoring_done and not self.entries_done and current_time >= t_entry:
                 self._step_execute_entries()
 

@@ -2,12 +2,12 @@
 Combined Overnight Rebound Bot — Unified config re-export.
 
 Sleeve 1: MR_WIDE (Mean Reversion)
-  - Buy 15:55, $1–5, day_ret <= -3%, vol_ratio >= 1.5x
-  - Exit 09:35
+  - Buy 15:50, $1–5, day_ret <= -3%, vol_ratio >= 1.5x
+  - Exit 09:30
 
-Sleeve 2: GDP_BASE (Green-Day Pullback)
-  - Buy 15:55, $1–10, day_ret +1% to +10%, below VWAP
-  - Exit 09:35
+Sleeve 2: GDP_BASE / MOM_CLEAN (Green-Day Pullback)
+  - Buy 15:50, $1–10, day_ret +1% to +10%, below VWAP
+  - Exit 09:30
 
 All settings live in their dedicated files:
   config_broker.py   — API credentials, endpoints, data feed

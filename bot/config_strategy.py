@@ -1,16 +1,25 @@
-"""Strategy configuration — combined MR_WIDE + GDP_BASE sleeves."""
+"""Strategy configuration — static 70/30 combined overnight sleeves.
+
+Production default from combined-cache research:
+- Entry/signal: 15:50
+- Exit: 09:30
+- Static weights: 70% MR / 30% momentum pullback (GDP)
+- Max single-name exposure: 10% of equity
+"""
 
 # ═══════════════════════════════════════════════════
 # Combined sleeve mode
 # ═══════════════════════════════════════════════════
 ENABLE_COMBINED_SLEEVES = True
 
-# Starting live-paper allocation (60/40 MR/GDP)
-MR_ALLOCATION_PCT = 0.60
-GDP_ALLOCATION_PCT = 0.40
+# Static production allocation from robustness sweep.
+# Note: live "GDP" sleeve is the momentum-pullback sleeve from the backtests.
+MR_WEIGHT = 0.70
+MOM_WEIGHT = 0.30
 
-MR_WEIGHT = 0.70                 # MR score weight in combined ranking
-MOM_WEIGHT = 0.30                # Momentum score weight in combined ranking
+# Backward-compatible names used by the live allocator.
+MR_ALLOCATION_PCT = MR_WEIGHT
+GDP_ALLOCATION_PCT = MOM_WEIGHT
 
 COMBINED_MAX_POSITIONS = 20  # Hard cap across both sleeves
 
@@ -34,7 +43,7 @@ MR_VOLUME_RATIO_MIN = 1.5       # today volume / expected volume >= 1.5x
 MR_CLOSE_POSITION_MAX = 0.20    # close in bottom 20% of day range
 MR_LATE_DROP_MAX = None         # optional: set -0.01 for stricter late-drop filter
 
-MR_MAX_POSITIONS = 12           # target slots for MR sleeve (60% of 20)
+MR_MAX_POSITIONS = 12           # max MR slots; dollar budget is controlled by MR_ALLOCATION_PCT
 MR_USE_RANDOM_SELECTION = False # deterministic first-N selection for live trading
 
 # ═══════════════════════════════════════════════════
@@ -48,7 +57,7 @@ GDP_REQUIRE_BELOW_VWAP = True   # price must be below intraday VWAP
 GDP_LATE_MOM_MAX = 0.0          # late momentum 15:30->signal must be <= 0 (decelerating)
 GDP_MAX_CLOSE_POSITION = None   # optional: limit close_position (None = no limit)
 
-GDP_MAX_POSITIONS = 8           # target slots for GDP sleeve (40% of 20)
+GDP_MAX_POSITIONS = 8           # max GDP/MOM slots; dollar budget is controlled by GDP_ALLOCATION_PCT
 
 # ═══════════════════════════════════════════════════
 # Execution safety — buying power buffer + mop-up
@@ -61,7 +70,7 @@ ENTRY_MOPUP_MAX_POSITIONS = 0    # 0 = mop-up disabled (paper trading phase)
 # Afternoon timeline (T-1 entry day)
 # ═══════════════════════════════════════════════════
 DATA_COLLECTION_TIME = "15:30"   # Begin universe pipeline
-SCORING_TIME = "15:55"           # Score using latest available bars/snapshot
+SCORING_TIME = "15:50"           # Score using 9:30-15:50 bars
 ENTRY_TIME = "15:50"             # Execute immediately after scoring
 
 # ═══════════════════════════════════════════════════
