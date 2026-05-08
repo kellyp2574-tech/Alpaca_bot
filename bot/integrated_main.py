@@ -14,8 +14,8 @@ Daily Schedule (ET) — bot starts at 9:00 AM:
 
 MORNING (T+1 exits — positions from yesterday's 15:50 entries):
   09:00  Start, detect overnight positions from broker
-  09:30  Market sell ALL positions (both GDP and MR sleeves)
-  09:45  Post-exit failsafe verification
+  09:30  Green/flat positions sell immediately; red positions get 1% trailing-stop orders
+  10:00  Cancel any remaining trailing orders; force-flatten anything still open
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca, $1–10, ADV sizing cap protects)
@@ -105,6 +105,9 @@ class CombinedOvernightReboundBot:
         # Sleeve-specific exit flags
         self.gdp_exits_done = False
         self.mr_exits_done = False
+        self.red_trail_exit_submitted = False
+        self.red_trail_order_ids: Dict[str, str] = {}
+        self.red_trail_symbols: set = set()
 
         # Failsafe
         self.post_exit_failsafe_done = False
@@ -112,13 +115,9 @@ class CombinedOvernightReboundBot:
         # PDT guard: symbols sold today (no same-day re-entry when equity < $50k)
         self.sold_today: set = set()
 
-        # Retry counters
-        self.universe_retry_count = 0
-
         # Data collection results (stored between steps)
         self._minute_bars: Dict[str, List[dict]] = {}
         self._adv_cache: Dict[str, Tuple[float, float]] = {}
-        self._atr_cache: Dict[str, float] = {}
         self._exec_stats: Dict[str, Any] = {}
         self._exec_diag: Optional[ExecutionDiagnostics] = None
 
@@ -154,6 +153,13 @@ class CombinedOvernightReboundBot:
                 f"GDP_EXIT_TIME ({config.GDP_EXIT_TIME}) != MR_EXIT_TIME ({config.MR_EXIT_TIME}); "
                 f"current bot exits both at GDP_EXIT_TIME"
             )
+        if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
+            if _parse_config_time(config.RED_OPEN_TRAIL_FAILSAFE_TIME) <= _parse_config_time(config.GDP_EXIT_TIME):
+                raise ValueError(
+                    "RED_OPEN_TRAIL_FAILSAFE_TIME must be after the 09:30 exit decision"
+                )
+            if config.RED_OPEN_TRAIL_PCT <= 0:
+                raise ValueError("RED_OPEN_TRAIL_PCT must be positive")
 
     def _run(self):
         """Inner run — called by run() which wraps it with top-level error handling."""
@@ -183,7 +189,11 @@ class CombinedOvernightReboundBot:
 
         # Pre-compute schedule times from config
         t_exit_all     = _parse_config_time(config.GDP_EXIT_TIME)           # 09:30 (both sleeves)
-        t_failsafe     = _parse_config_time(config.V2_FAILSAFE_TIME)        # 09:45
+        t_failsafe     = _parse_config_time(
+            config.RED_OPEN_TRAIL_FAILSAFE_TIME
+            if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False)
+            else config.V2_FAILSAFE_TIME
+        )
         t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)    # 15:30
         t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:50
         t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
@@ -192,7 +202,7 @@ class CombinedOvernightReboundBot:
         # If starting after failsafe time with positions, flatten immediately
         current_time = datetime.now(_ET).time()
         if current_time >= t_failsafe and self.position_mgr.get_position_count() > 0:
-            logger.warning(f"Started after {config.V2_FAILSAFE_TIME} — flattening immediately")
+            logger.warning(f"Started after failsafe time — flattening immediately")
             self._run_failsafe_flatten("late-start flatten")
             self.morning_exits_done = True
 
@@ -228,29 +238,39 @@ class CombinedOvernightReboundBot:
                         has_positions = self.position_mgr.get_position_count() > 0
 
                 if has_positions and not self.morning_exits_done:
-                    # 09:30 AM — Exit ALL positions (both GDP and MR sleeves)
+                    # 09:30 — either run the red-open trailing experiment or fixed exit all.
                     if not self.gdp_exits_done and current_time >= t_exit_all:
-                        self._exit_sleeve_positions("GDP", "09:30 all positions (GDP)")
-                        self._exit_sleeve_positions("MR", "09:30 all positions (MR)")
+                        if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
+                            self._submit_red_open_trail_or_sell_green()
+                        else:
+                            self._exit_sleeve_positions("GDP", "09:30 all positions (GDP)")
+                            self._exit_sleeve_positions("MR", "09:30 all positions (MR)")
                         self.gdp_exits_done = True
                         self.mr_exits_done = True
                         self._save_state()
 
-                    # 9:45 AM — Post-exit failsafe
+                    # Failsafe: 10:00 if red-open trail is enabled, otherwise V2_FAILSAFE_TIME.
                     if (self.gdp_exits_done and self.mr_exits_done
                             and not self.post_exit_failsafe_done and current_time >= t_failsafe):
                         bc = self.position_mgr.broker_position_count()
                         if bc > 0:
                             logger.warning(f"Post-exit failsafe: broker still has {bc} positions")
-                            self._run_failsafe_flatten(f"{config.V2_FAILSAFE_TIME} post-exit failsafe")
+                            self._run_failsafe_flatten(f"{t_failsafe.strftime('%H:%M')} post-exit failsafe")
                         elif bc == 0:
                             logger.info("Post-exit failsafe: broker confirmed flat")
+                            if self.red_trail_order_ids:
+                                logger.warning("Broker flat at failsafe; canceling remembered trailing-stop orders")
+                                self.position_mgr.cancel_all_open_orders()
+                                self.red_trail_order_ids.clear()
+                                self.red_trail_symbols.clear()
+                            self.position_mgr.reconcile_local_positions_from_broker()
                         self.post_exit_failsafe_done = True
                         self.morning_exits_done = True
                         self._save_state()
 
-                    # Early completion — all positions exited before 9:45
-                    if (self.gdp_exits_done and self.mr_exits_done
+                    # Early completion: only allowed before failsafe when no trailing orders are active.
+                    if (not getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False)
+                            and self.gdp_exits_done and self.mr_exits_done
                             and self.position_mgr.get_position_count() == 0
                             and not self.morning_exits_done):
                         logger.info("All exits complete — no positions remaining")
@@ -376,7 +396,7 @@ class CombinedOvernightReboundBot:
             remaining = self.position_mgr.positions[symbol].quantity
             logger.warning(
                 f"EXIT INCOMPLETE {symbol}: {remaining} shares still held — "
-                f"failsafe will catch at {config.V2_FAILSAFE_TIME}"
+                f"failsafe will catch at {config.RED_OPEN_TRAIL_FAILSAFE_TIME if getattr(config, 'ENABLE_RED_OPEN_TRAIL_EXIT', False) else config.V2_FAILSAFE_TIME}"
             )
         self._save_state()
 
@@ -385,20 +405,19 @@ class CombinedOvernightReboundBot:
     # ════════════════════════════════════════════════════════════
 
     def _step_collect_data(self):
-        """~3:30 PM: Build base universe (Stages A+B+D). Stage C runs at 3:48."""
+        """~3:30 PM: Build universe (price/ADV/daily-bar filters). Stage C minute-quality runs at 3:50."""
         logger.info("=" * 50)
         logger.info("DATA COLLECTION: Building base universe (staged pipeline)")
         logger.info("=" * 50)
 
         try:
-            final, diag, adv_cache, atr_cache = build_universe(
+            final, diag, adv_cache, _atr_cache = build_universe(
                 self.massive, self.alpaca,
             )
 
             self.universe = final
             self._universe_diag = diag
             self._adv_cache = adv_cache
-            self._atr_cache = atr_cache
 
             if not self.universe:
                 logger.error("Empty universe after pipeline — cannot proceed")
@@ -408,22 +427,22 @@ class CombinedOvernightReboundBot:
 
             self.data_collected = True
             self._save_state()
-            logger.info(f"Base universe ready: {len(self.universe)} symbols (Stage C deferred to 3:48)")
+            logger.info(f"Base universe ready: {len(self.universe)} symbols (Stage C minute-quality runs at 3:50)")
 
         except Exception as e:
             logger.exception(f"Error in data collection: {e}")
 
     def _step_score_and_rank(self):
-        """~3:55 PM: Fetch latest 9:30-15:55 bars, build both MR and GDP candidates, filter."""
+        """~3:50 PM: Fetch 9:30-15:50 bars, run Stage C quality filter, build MR and GDP candidates."""
         logger.info("=" * 50)
         logger.info("SCORING (combined): Building MR and GDP candidates")
         logger.info("=" * 50)
 
         try:
             today = date.today().isoformat()
-            signal_end = config.ENTRY_TIME  # 15:55
+            signal_end = config.ENTRY_TIME  # 15:50
 
-            # 1. Fetch 9:30-15:55 minute bars for the full base universe
+            # 1. Fetch 9:30-15:50 minute bars for the full base universe
             logger.info(f"Fetching 9:30-{signal_end} minute bars for {len(self.universe)} symbols...")
             self._minute_bars = self.alpaca.get_intraday_bars_for_signal(
                 self.universe, today, start="09:30", end=signal_end,
@@ -568,7 +587,7 @@ class CombinedOvernightReboundBot:
             self.scoring_done = True
 
     def _step_execute_entries(self):
-        """3:55 PM: Dual-sleeve allocation (60/40 MR/GDP budget) -> execution-gate -> market buys."""
+        """3:50 PM: Dual-sleeve allocation (70/30 MR/GDP budget) -> execution-gate -> market buys."""
         logger.info("=" * 50)
         logger.info("ENTRY EXECUTION: Dual-sleeve market buy orders")
         logger.info("=" * 50)
@@ -947,7 +966,7 @@ class CombinedOvernightReboundBot:
                     logger.warning(f"No fill for {symbol} buy order (order canceled)")
                     exec_diag.failed_submissions[symbol] = "no_fill"
 
-            # Mop-up disabled for paper trading (ENTRY_MOPUP_MAX_POSITIONS = 0)
+            # Mop-up disabled (ENTRY_MOPUP_MAX_POSITIONS = 0)
             self.entries_done = True
             self._save_state()
 
@@ -1014,9 +1033,148 @@ class CombinedOvernightReboundBot:
     # INFRASTRUCTURE (failsafe, state, etc.)
     # ════════════════════════════════════════════════════════════
 
+    def _position_reference_price(self, broker_pos: dict, symbol: str) -> Optional[float]:
+        """Best available 09:30 decision price for red-open trailing logic.
+
+        Prefer a fresh snapshot/last price at decision time — the broker
+        position endpoint's current_price can lag around the open. Fall back
+        to broker position fields only if the snapshot call fails.
+        """
+        try:
+            px = self.position_mgr._get_last_price(symbol)
+            if px and px > 0:
+                return float(px)
+        except Exception:
+            logger.warning(f"RED TRAIL {symbol}: failed to fetch last price", exc_info=True)
+
+        for key in ("current_price", "lastday_price"):
+            raw = broker_pos.get(key) if broker_pos else None
+            try:
+                px = float(raw)
+                if px > 0:
+                    return px
+            except (TypeError, ValueError):
+                pass
+
+        return None
+
+    def _submit_red_open_trail_or_sell_green(self):
+        """09:30 exit decision for the red-open trailing-stop paper test.
+
+        - If a position is green/flat versus its stored entry price, sell it at market.
+        - If a position is red versus its stored entry price, submit an Alpaca
+          trailing-stop sell order using config.RED_OPEN_TRAIL_PCT.
+        - Any bad/missing price or qty data falls back to an immediate market sell.
+        - The failsafe at RED_OPEN_TRAIL_FAILSAFE_TIME cancels any remaining
+          trailing orders and force-flattens.
+        """
+        if self.red_trail_exit_submitted:
+            logger.info("RED TRAIL: 09:30 exit decision already submitted; skipping duplicate call")
+            return
+
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("RED TRAIL: cannot read broker positions; falling back to local market exits")
+            for symbol in list(self.position_mgr.positions.keys()):
+                self._exit_single_position(symbol, "red-trail broker read failed fallback")
+            self.red_trail_exit_submitted = True
+            self._save_state()
+            return
+
+        broker_by_symbol = {
+            str(p.get("symbol", "")).upper(): p
+            for p in broker_positions
+            if p.get("symbol")
+        }
+
+        # Reconcile first so UNKNOWN broker-only positions are included in this decision.
+        self.position_mgr.reconcile_local_positions_from_broker()
+
+        submitted_trails = 0
+        market_exits = 0
+        fallbacks = 0
+
+        for symbol, pos in list(self.position_mgr.positions.items()):
+            sym = symbol.upper()
+            broker_pos = broker_by_symbol.get(sym)
+
+            if not broker_pos:
+                logger.warning(f"RED TRAIL {symbol}: broker no longer holds symbol; removing local position")
+                self.position_mgr.positions.pop(symbol, None)
+                continue
+
+            try:
+                broker_qty = int(abs(float(broker_pos.get("qty", pos.quantity))))
+            except (TypeError, ValueError):
+                broker_qty = int(pos.quantity or 0)
+
+            entry_price = float(getattr(pos, "entry_price", 0.0) or broker_pos.get("avg_entry_price", 0.0) or 0.0)
+            decision_price = self._position_reference_price(broker_pos, symbol)
+
+            if broker_qty <= 0:
+                logger.warning(f"RED TRAIL {symbol}: broker qty <= 0; removing local position")
+                self.position_mgr.positions.pop(symbol, None)
+                continue
+
+            if entry_price <= 0 or not decision_price or decision_price <= 0:
+                logger.warning(
+                    f"RED TRAIL {symbol}: bad decision data "
+                    f"entry={entry_price}, price={decision_price}; selling at market fallback"
+                )
+                self._exit_single_position(symbol, "red-trail bad data fallback")
+                fallbacks += 1
+                continue
+
+            # Optional tiny buffer. Default 0.0 means any price below entry is red.
+            red_trigger_price = entry_price * (1.0 - config.RED_OPEN_TRAIL_PRICE_BUFFER_PCT)
+
+            if decision_price < red_trigger_price:
+                resp = self.position_mgr.submit_trailing_stop_sell_order(
+                    symbol=symbol,
+                    qty=broker_qty,
+                    trail_percent=config.RED_OPEN_TRAIL_PCT,
+                )
+                if resp and resp.get("id"):
+                    order_id = resp["id"]
+                    self.red_trail_order_ids[symbol] = order_id
+                    self.red_trail_symbols.add(symbol)
+                    self.sold_today.add(symbol)
+                    submitted_trails += 1
+                    logger.info(
+                        f"RED TRAIL {symbol}: price={decision_price:.4f} < entry={entry_price:.4f}; "
+                        f"submitted {config.RED_OPEN_TRAIL_PCT:.2f}% trailing-stop sell "
+                        f"qty={broker_qty} order_id={order_id}"
+                    )
+                else:
+                    logger.error(f"RED TRAIL {symbol}: trailing-stop submit failed; selling at market fallback")
+                    self._exit_single_position(symbol, "red-trail submit failed fallback")
+                    fallbacks += 1
+            else:
+                logger.info(
+                    f"GREEN/FLAT EXIT {symbol}: price={decision_price:.4f} >= entry={entry_price:.4f}; "
+                    f"selling at market"
+                )
+                self._exit_single_position(symbol, "green/flat 09:30 market exit")
+                market_exits += 1
+
+        self.red_trail_exit_submitted = True
+        logger.warning(
+            f"RED TRAIL DECISION COMPLETE: trailing_orders={submitted_trails}, "
+            f"market_exits={market_exits}, fallbacks={fallbacks}, "
+            f"open_trail_symbols={list(self.red_trail_order_ids.keys())}"
+        )
+        self._save_state()
+
     def _run_failsafe_flatten(self, label: str):
         """Broker-based catch-all flatten with multi-layer retry."""
         logger.warning(f"{label}: starting broker-based failsafe flatten")
+        if self.red_trail_order_ids:
+            logger.warning(
+                f"{label}: canceling open trailing-stop orders before force flatten: "
+                f"{list(self.red_trail_order_ids.keys())}"
+            )
+            self.position_mgr.cancel_all_open_orders()
+            self.sold_today.update(self.red_trail_order_ids.keys())
 
         summary = self.position_mgr.force_flatten_broker_positions(label)
 
@@ -1036,6 +1194,8 @@ class CombinedOvernightReboundBot:
         remaining = self.position_mgr.broker_position_count()
         if remaining == 0:
             self.position_mgr.positions.clear()
+            self.red_trail_order_ids.clear()
+            self.red_trail_symbols.clear()
             logger.warning(f"{label}: broker confirmed flat — local state cleared")
         elif remaining < 0:
             logger.error(f"{label}: broker API unreachable after failsafe — cannot confirm flat")
@@ -1141,6 +1301,9 @@ class CombinedOvernightReboundBot:
                 "morning_exits_done": self.morning_exits_done,
                 "gdp_exits_done": self.gdp_exits_done,
                 "mr_exits_done": self.mr_exits_done,
+                "red_trail_exit_submitted": self.red_trail_exit_submitted,
+                "red_trail_order_ids": self.red_trail_order_ids,
+                "red_trail_symbols": list(self.red_trail_symbols),
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
                 "scoring_done": self.scoring_done,
@@ -1181,6 +1344,9 @@ class CombinedOvernightReboundBot:
         self.scoring_done = bot_state.get("scoring_done", False)
         self.entries_done = bot_state.get("entries_done", False)
         self.sold_today = set(bot_state.get("sold_today", []))
+        self.red_trail_exit_submitted = bot_state.get("red_trail_exit_submitted", False)
+        self.red_trail_order_ids = bot_state.get("red_trail_order_ids", {})
+        self.red_trail_symbols = set(bot_state.get("red_trail_symbols", []))
 
         # Load positions
         saved = self.state_mgr.load_positions()

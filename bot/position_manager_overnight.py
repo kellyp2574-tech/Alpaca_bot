@@ -202,6 +202,57 @@ class PositionManager:
                 )
             return None
 
+    def submit_trailing_stop_sell_order(self, symbol: str, qty: int, trail_percent: float) -> Optional[dict]:
+        """Submit a day trailing-stop sell order via POST /v2/orders.
+
+        Used by the paper red-open trailing exit experiment. Alpaca trails by
+        percent when trail_percent is supplied; the order becomes a market sell
+        when the trailing stop is triggered.
+        """
+        url = f"{self.base_url}/v2/orders"
+        order_data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "trailing_stop",
+            "time_in_force": "day",
+            "trail_percent": str(float(trail_percent)),
+        }
+
+        try:
+            response = self.session.post(url, json=order_data, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            logger.info(
+                f"Trailing-stop sell submitted: {symbol} x{qty} "
+                f"trail={trail_percent:.2f}% (ID: {order_id})"
+            )
+            self._exit_failures.pop(symbol, None)
+            self._exit_failure_times.pop(symbol, None)
+            return data
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "N/A"
+            try:
+                body = e.response.text[:500] if e.response is not None else ""
+            except Exception:
+                body = "<unreadable>"
+            logger.error(
+                f"Trailing-stop sell FAILED | symbol={symbol} | qty={qty} | "
+                f"trail={trail_percent:.2f}% | status={status_code} | body={body}"
+            )
+            self._exit_failures[symbol] = self._exit_failures.get(symbol, 0) + 1
+            self._exit_failure_times[symbol] = datetime.now()
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"Trailing-stop sell FAILED (network) | symbol={symbol} | qty={qty} | "
+                f"trail={trail_percent:.2f}% | error={e}"
+            )
+            self._exit_failures[symbol] = self._exit_failures.get(symbol, 0) + 1
+            self._exit_failure_times[symbol] = datetime.now()
+            return None
+
     def _get_last_price(self, symbol: str) -> Optional[float]:
         """Get last trade price for a symbol (for limit sell fallback)."""
         try:

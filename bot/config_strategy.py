@@ -82,6 +82,17 @@ MR_EXIT_TIME = "09:30"           # MR sleeve exits at market open
 V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 
 # ═══════════════════════════════════════════════════
+# Paper research exit: red-open trailing stop
+# ═══════════════════════════════════════════════════
+# When enabled, positions that open below their afternoon entry price receive
+# a broker trailing-stop sell order at 09:30. Green/flat opens still sell at
+# 09:30. Anything still open is force-flattened at RED_OPEN_TRAIL_FAILSAFE_TIME.
+ENABLE_RED_OPEN_TRAIL_EXIT = True
+RED_OPEN_TRAIL_PCT = 1.0              # Alpaca trail_percent value, e.g. 1.0 = 1%
+RED_OPEN_TRAIL_FAILSAFE_TIME = "10:00"
+RED_OPEN_TRAIL_PRICE_BUFFER_PCT = 0.0    # match backtest: any open/current price below entry is red
+
+# ═══════════════════════════════════════════════════
 # Sector ETFs — kept for future use
 # ═══════════════════════════════════════════════════
 SECTOR_ETFS = {
