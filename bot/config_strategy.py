@@ -85,18 +85,35 @@ V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
 
 # ═══════════════════════════════════════════════════
-# Overnight limit-sell experiment
+# 06:00 IEX-aware dynamic premarket limit management
 # ═══════════════════════════════════════════════════
-# At 20:00, place resting limit sells for overnight positions:
-#   base_limit = max(today_09:30_open, entry_price * (1 + target_gain_pct))
-#   if current_price > base_limit: limit = current_price * (1 + current_price_premium_pct)
-# These are canceled at MORNING_CANCEL_OPEN_ORDERS_TIME before normal 09:30 exits.
-ENABLE_OVERNIGHT_LIMIT_SELLS = True
-OVERNIGHT_LIMIT_SELL_TIME = "20:00"
-OVERNIGHT_LIMIT_TARGET_GAIN_PCT = 0.025
+# The old 20:00 blanket overnight limit workflow is disabled. The bot should
+# start around 05:55, classify each overnight position at 06:00 using sparse
+# IEX premarket bars, and place selective extended-hours DAY limit sells.
+# Any remaining limits are canceled at MORNING_CANCEL_OPEN_ORDERS_TIME before
+# the normal 09:30 exit/trailing-stop path.
+ENABLE_OVERNIGHT_LIMIT_SELLS = False          # legacy 20:00 workflow disabled
+OVERNIGHT_LIMIT_SELL_TIME = "20:00"           # legacy; unused when disabled
+OVERNIGHT_LIMIT_TARGET_GAIN_PCT = 0.025       # legacy; unused when disabled
 OVERNIGHT_LIMIT_CURRENT_PRICE_PREMIUM_PCT = 0.005
 OVERNIGHT_LIMIT_TIME_IN_FORCE = "gtc"
 OVERNIGHT_LIMIT_EXTENDED_HOURS = False
+
+ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS = True
+PREMARKET_DYNAMIC_LIMIT_TIME = "06:00"
+PREMARKET_DYNAMIC_DATA_FEED = "iex"
+PREMARKET_DYNAMIC_LIMIT_TIME_IN_FORCE = "day"
+PREMARKET_DYNAMIC_LIMIT_EXTENDED_HOURS = True
+PREMARKET_DYNAMIC_MAX_STALE_MINUTES = 60
+
+# Dynamic classification thresholds. These are intentionally lenient for IEX:
+# runners should usually show at least some IEX activity, but sparse IEX bars
+# should not automatically invalidate the signal.
+PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT = 0.05
+PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT = 0.10
+PREMARKET_DYNAMIC_VERY_HIGH_RETURN_NO_CAP_PCT = 0.10
+PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT = 0.05
+PREMARKET_DYNAMIC_MODERATE_RETURN_PCT = 0.02
 
 # ═══════════════════════════════════════════════════
 # Paper research exit: red-open trailing stop

@@ -10,10 +10,12 @@ Sleeve 2: GDP_BASE / MOM_CLEAN (Green-Day Pullback)
 
 Production allocation: static 70/30 MR/GDP, 10% max single-name cap.
 
-Daily Schedule (ET) — bot starts at 9:00 AM:
+Daily Schedule (ET) — morning bot starts around 05:55 AM:
 
 MORNING (T+1 exits — positions from yesterday's 15:50 entries):
-  09:00  Start, detect overnight positions from broker
+  05:55  Start, detect overnight positions from broker
+  06:00  IEX premarket dynamic limit classification; place selective limit sells
+  09:25  Cancel any remaining premarket limits before open exits
   09:30  Green/flat positions sell immediately; red positions get 1% trailing-stop orders
   10:00  Cancel any remaining trailing orders; force-flatten anything still open
 
@@ -111,6 +113,9 @@ class CombinedOvernightReboundBot:
 
         # Morning/overnight order management
         self.morning_open_orders_cancelled = False
+        self.premarket_dynamic_limits_done = False
+        self.premarket_limit_order_ids: Dict[str, str] = {}
+        # Legacy 20:00 overnight limit fields kept only for backward-compatible state loading.
         self.overnight_limit_sells_done = False
         self.overnight_limit_order_ids: Dict[str, str] = {}
         self.end_of_day_reports_done = False
@@ -204,7 +209,7 @@ class CombinedOvernightReboundBot:
         t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:50
         t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
         t_cancel_orders = _parse_config_time(getattr(config, "MORNING_CANCEL_OPEN_ORDERS_TIME", "09:25"))
-        t_overnight_limit = _parse_config_time(getattr(config, "OVERNIGHT_LIMIT_SELL_TIME", "20:00"))
+        t_premarket_limit = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_LIMIT_TIME", "06:00"))
         t_market_close = dt_time(16, 0)
 
         # If starting after failsafe time with positions, flatten immediately
@@ -219,29 +224,11 @@ class CombinedOvernightReboundBot:
             self._run_failsafe_flatten("late-start flatten")
             self.morning_exits_done = True
 
-        # After market close, do NOT immediately return if overnight limit sells are enabled.
+        # After market close there is no 20:00 limit workflow anymore.
+        # The bot should be restarted around 05:55 for the 06:00 dynamic limit decision.
         if current_time >= t_market_close:
-            if (
-                getattr(config, "ENABLE_OVERNIGHT_LIMIT_SELLS", False)
-                and self.position_mgr.get_position_count() > 0
-                and not self.overnight_limit_sells_done
-            ):
-                logger.info("Started after market close with positions — waiting/placing overnight limit sells")
-                # Skip morning exits - we're waiting for 20:00 limits
-                self.morning_exits_done = True
-                self.gdp_exits_done = True
-                self.mr_exits_done = True
-                self._save_state()
-                # If already past 20:00, place limits immediately
-                if current_time >= t_overnight_limit:
-                    self._place_overnight_limit_sells()
-                    self.overnight_limit_sells_done = True
-                    self._save_state()
-                    logger.info("20:00 overnight limit-sell placement complete. Day complete.")
-                    return
-            else:
-                logger.info("Started after market close — nothing to do")
-                return
+            logger.info("Started after market close — nothing to do until the 05:55/06:00 premarket run")
+            return
 
         # Main event loop
         while True:
@@ -254,12 +241,23 @@ class CombinedOvernightReboundBot:
 
             # Gate morning exits to prevent after-market execution on restart
             if current_time < t_market_close and not self.morning_exits_done:
-                # 09:25 — cancel any resting overnight limit/trailing orders before normal exits.
+                # 06:00 — IEX premarket dynamic limit classification.
+                # This replaces the old 20:00 blanket overnight limit workflow.
+                if (getattr(config, "ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS", False)
+                        and not self.premarket_dynamic_limits_done
+                        and current_time >= t_premarket_limit
+                        and current_time < t_cancel_orders):
+                    self._place_premarket_dynamic_limit_sells()
+                    self.premarket_dynamic_limits_done = True
+                    self._save_state()
+
+                # 09:25 — cancel any resting premarket limit/trailing orders before normal exits.
                 # Run regardless of local position state for safety.
                 if (not self.morning_open_orders_cancelled
                         and current_time >= t_cancel_orders):
                     logger.warning("09:25 order cleanup: canceling all open orders before 09:30 exits")
                     self.position_mgr.cancel_all_open_orders()
+                    self.premarket_limit_order_ids.clear()
                     self.overnight_limit_order_ids.clear()
                     self.red_trail_order_ids.clear()
                     self.red_trail_symbols.clear()
@@ -360,21 +358,10 @@ class CombinedOvernightReboundBot:
                         self._finalize_day()
                         break
 
-                if (getattr(config, "ENABLE_OVERNIGHT_LIMIT_SELLS", False)
-                        and has_eod_positions
-                        and not self.overnight_limit_sells_done):
-                    if current_time >= t_overnight_limit:
-                        self._place_overnight_limit_sells()
-                        self.overnight_limit_sells_done = True
-                        self._save_state()
-                        logger.info("20:00 overnight limit-sell placement complete. Day complete.")
-                        break
-                    # Keep process alive between close and 20:00 so the resting limits get placed.
-                else:
-                    if self.entries_done or has_eod_positions:
-                        logger.info("Market closed — day complete.")
-                        self._save_state()
-                    break
+                if self.entries_done or has_eod_positions:
+                    logger.info("Market closed — day complete. Restart around 05:55 for 06:00 dynamic limits.")
+                    self._save_state()
+                break
 
             time.sleep(1)
 
@@ -1401,6 +1388,281 @@ class CombinedOvernightReboundBot:
 
         self._save_state()
 
+    def _fetch_live_premarket_bars(self, symbol: str, decision_dt: datetime) -> List[dict]:
+        """Fetch today's live IEX 1-minute bars from 04:00 through the decision time.
+
+        This intentionally uses the Alpaca data API directly so the 06:00 live
+        decision does not depend on historical cache files. With IEX, premarket
+        bars can be sparse; the classifier treats sparse bars as usable signal
+        rather than requiring dense coverage.
+        """
+        start_dt = datetime.combine(decision_dt.date(), dt_time(4, 0), tzinfo=_ET)
+        end_dt = decision_dt
+        data_url = getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+        feed = getattr(config, "PREMARKET_DYNAMIC_DATA_FEED", getattr(config, "DATA_FEED", "iex"))
+        url = f"{data_url}/v2/stocks/{symbol}/bars"
+        params = {
+            "timeframe": "1Min",
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "adjustment": "raw",
+            "feed": feed,
+            "limit": 1000,
+        }
+        try:
+            resp = self.position_mgr.session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+            bars = payload.get("bars", [])
+            return bars if isinstance(bars, list) else []
+        except Exception:
+            logger.warning(f"06:00 LIMIT {symbol}: failed to fetch live premarket bars", exc_info=True)
+            return []
+
+    @staticmethod
+    def _bar_dt(bar: dict) -> Optional[datetime]:
+        """Parse Alpaca bar timestamp into America/New_York datetime."""
+        raw = bar.get("t") or bar.get("timestamp") or bar.get("time")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_ET)
+            return parsed.astimezone(_ET)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _bar_float(bar: dict, *keys: str) -> Optional[float]:
+        """Read a float from Alpaca bar keys, supporting both short and long names."""
+        for key in keys:
+            if key in bar and bar.get(key) is not None:
+                try:
+                    return float(bar.get(key))
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _compute_live_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
+        """Compute lenient IEX premarket metrics for the 06:00 dynamic classifier."""
+        bars_raw = self._fetch_live_premarket_bars(symbol, decision_dt)
+        normalized = []
+        for bar in bars_raw:
+            dt_val = self._bar_dt(bar)
+            close = self._bar_float(bar, "c", "close")
+            high = self._bar_float(bar, "h", "high")
+            low = self._bar_float(bar, "l", "low")
+            volume = self._bar_float(bar, "v", "volume") or 0.0
+            if dt_val and close and high and low:
+                normalized.append({
+                    "dt": dt_val,
+                    "close": close,
+                    "high": high,
+                    "low": low,
+                    "volume": volume,
+                })
+
+        normalized.sort(key=lambda b: b["dt"])
+        if not normalized:
+            return {
+                "has_data": False,
+                "reason": "no_iex_premarket_bars",
+                "premarket_minutes": 0,
+            }
+
+        first = normalized[0]
+        last = normalized[-1]
+        stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
+        premarket_high = max(b["high"] for b in normalized)
+        premarket_low = min(b["low"] for b in normalized)
+        premarket_volume = sum(b["volume"] for b in normalized)
+        current_price = last["close"]
+        first_price = first["close"]
+
+        return {
+            "has_data": True,
+            "reason": "iex_premarket_data",
+            "first_premarket_time": first["dt"],
+            "first_premarket_price": first_price,
+            "current_time": last["dt"],
+            "current_price": current_price,
+            "premarket_high": premarket_high,
+            "premarket_low": premarket_low,
+            "premarket_minutes": len(normalized),
+            "premarket_volume": premarket_volume,
+            "last_bar_age_minutes": stale_minutes,
+            "current_return": current_price / buy_price - 1.0,
+            "distance_from_high": current_price / premarket_high - 1.0 if premarket_high > 0 else 0.0,
+            "return_from_low": current_price / premarket_low - 1.0 if premarket_low > 0 else 0.0,
+            "trend_from_first_bar": current_price / first_price - 1.0 if first_price > 0 else 0.0,
+        }
+
+    def _classify_iex_premarket_limit(self, pos: Position, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Lenient IEX-aware dynamic limit decision.
+
+        Absence of IEX prints is not treated as proof there is no market-wide
+        premarket activity, but it does make it less likely that this is one of
+        the true runners we are trying not to cap. Therefore the fallback is a
+        normal 5% harvest limit rather than no decision.
+        """
+        fallback_limit = getattr(config, "PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT", 0.05)
+        sparse_wide_limit = getattr(config, "PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT", 0.10)
+        very_high = getattr(config, "PREMARKET_DYNAMIC_VERY_HIGH_RETURN_NO_CAP_PCT", 0.10)
+        high = getattr(config, "PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT", 0.05)
+        moderate = getattr(config, "PREMARKET_DYNAMIC_MODERATE_RETURN_PCT", 0.02)
+        stale_max = getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
+
+        if not metrics.get("has_data"):
+            return {
+                "action": "PLACE_LIMIT",
+                "limit_pct": fallback_limit,
+                "reason": metrics.get("reason", "no_iex_data_default_5pct"),
+            }
+
+        bars = int(metrics.get("premarket_minutes", 0) or 0)
+        stale = float(metrics.get("last_bar_age_minutes", 999) or 999)
+        current_return = float(metrics.get("current_return", 0.0) or 0.0)
+        distance_from_high = float(metrics.get("distance_from_high", 0.0) or 0.0)
+        trend = float(metrics.get("trend_from_first_bar", 0.0) or 0.0)
+        sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
+        fresh_enough = stale <= stale_max
+
+        # True runner: even sparse IEX activity is enough not to choke it.
+        if current_return >= very_high and bars >= 1 and fresh_enough:
+            return {"action": "NO_CAP", "limit_pct": None, "reason": "iex_very_high_return_no_cap"}
+
+        # Strong runner: needs at least a little IEX confirmation, but not dense tape.
+        if current_return >= high:
+            if bars >= 2 and fresh_enough:
+                # MR can still harvest below +10%; continuation/unknown stays uncapped.
+                if sleeve == "MR" and current_return < very_high:
+                    return {"action": "PLACE_LIMIT", "limit_pct": fallback_limit, "reason": "iex_high_return_mr_harvest_5pct"}
+                return {"action": "NO_CAP", "limit_pct": None, "reason": "iex_high_return_no_cap"}
+            return {"action": "PLACE_LIMIT", "limit_pct": sparse_wide_limit, "reason": "iex_high_return_sparse_wide_10pct"}
+
+        # Moderate winner: if it is building and near highs, give it more room.
+        if current_return >= moderate:
+            if distance_from_high > -0.01 and trend > 0 and fresh_enough:
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.07, "reason": "iex_moderate_near_high_7pct"}
+            if distance_from_high < -0.03 or trend < 0:
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.05, "reason": "iex_moderate_fading_5pct"}
+            return {"action": "PLACE_LIMIT", "limit_pct": 0.06, "reason": "iex_moderate_default_6pct"}
+
+        if current_return >= 0:
+            return {"action": "PLACE_LIMIT", "limit_pct": 0.04, "reason": "iex_small_winner_4pct"}
+
+        return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "iex_negative_pop_harvest_3pct"}
+
+    def _place_premarket_dynamic_limit_sells(self):
+        """06:00: classify overnight positions and place selective IEX-aware limit sells.
+
+        This replaces the old 20:00 blanket limit workflow. Orders are submitted
+        in a non-blocking batch style, then the normal 09:25 cleanup cancels any
+        remaining open limits before the 09:30 exit logic.
+        """
+        if self.premarket_dynamic_limits_done:
+            logger.info("06:00 LIMITS: already processed; skipping duplicate call")
+            return
+
+        self.position_mgr.reconcile_local_positions_from_broker()
+        symbols = list(self.position_mgr.positions.keys())
+        if not symbols:
+            logger.info("06:00 LIMITS: no overnight positions to classify")
+            return
+
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("06:00 LIMITS: broker position read failed; skipping limit placement")
+            return
+        broker_by_symbol = {
+            str(p.get("symbol", "")).upper(): p
+            for p in broker_positions
+            if p.get("symbol")
+        }
+
+        decision_dt = datetime.combine(datetime.now(_ET).date(), _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_LIMIT_TIME", "06:00")), tzinfo=_ET)
+        if datetime.now(_ET) < decision_dt:
+            decision_dt = datetime.now(_ET)
+
+        placed = 0
+        no_cap = 0
+        skipped = 0
+
+        for symbol in symbols:
+            pos = self.position_mgr.positions.get(symbol)
+            broker_pos = broker_by_symbol.get(symbol.upper())
+            if not pos or not broker_pos:
+                skipped += 1
+                logger.warning(f"06:00 LIMIT {symbol}: missing local/broker position; skipping")
+                continue
+
+            try:
+                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
+            except (TypeError, ValueError):
+                qty = int(pos.quantity or 0)
+            if qty <= 0:
+                skipped += 1
+                logger.warning(f"06:00 LIMIT {symbol}: qty <= 0; skipping")
+                continue
+
+            entry_price = float(getattr(pos, "entry_price", 0.0) or broker_pos.get("avg_entry_price", 0.0) or 0.0)
+            if entry_price <= 0:
+                skipped += 1
+                logger.warning(f"06:00 LIMIT {symbol}: missing entry price; skipping")
+                continue
+
+            metrics = self._compute_live_premarket_metrics(symbol, entry_price, decision_dt)
+            decision = self._classify_iex_premarket_limit(pos, metrics)
+
+            log_metrics = (
+                f"bars={metrics.get('premarket_minutes', 0)}, "
+                f"ret={metrics.get('current_return', 0.0):+.2%}, "
+                f"dist_high={metrics.get('distance_from_high', 0.0):+.2%}, "
+                f"trend={metrics.get('trend_from_first_bar', 0.0):+.2%}, "
+                f"stale={metrics.get('last_bar_age_minutes', 999):.0f}m"
+            )
+
+            if decision["action"] == "NO_CAP":
+                no_cap += 1
+                logger.warning(
+                    f"06:00 LIMIT {symbol}: NO CAP | entry={entry_price:.4f}, "
+                    f"{log_metrics}, reason={decision['reason']}"
+                )
+                continue
+
+            limit_pct = decision.get("limit_pct")
+            if limit_pct is None:
+                no_cap += 1
+                logger.warning(
+                    f"06:00 LIMIT {symbol}: NO LIMIT | entry={entry_price:.4f}, "
+                    f"{log_metrics}, reason={decision['reason']}"
+                )
+                continue
+
+            limit_price = self.position_mgr.round_limit_price(entry_price * (1.0 + float(limit_pct)))
+            resp = self.position_mgr._submit_sell_order(
+                symbol=symbol,
+                qty=qty,
+                order_type="limit",
+                limit_price=limit_price,
+                time_in_force=getattr(config, "PREMARKET_DYNAMIC_LIMIT_TIME_IN_FORCE", "day"),
+                extended_hours=getattr(config, "PREMARKET_DYNAMIC_LIMIT_EXTENDED_HOURS", True),
+            )
+            if resp and resp.get("id"):
+                self.premarket_limit_order_ids[symbol] = resp["id"]
+                placed += 1
+                logger.info(
+                    f"06:00 LIMIT {symbol}: placed qty={qty}, entry={entry_price:.4f}, "
+                    f"limit_pct={limit_pct:.2%}, limit={limit_price:.4f}, {log_metrics}, "
+                    f"reason={decision['reason']}, order_id={resp['id']}"
+                )
+            else:
+                skipped += 1
+                logger.error(f"06:00 LIMIT {symbol}: submit failed | {log_metrics}, reason={decision['reason']}")
+
+        logger.warning(f"06:00 DYNAMIC LIMITS COMPLETE: placed={placed}, no_cap={no_cap}, skipped={skipped}")
+
     def _place_overnight_limit_sells(self):
         """20:00: place resting limit sells for all overnight positions.
 
@@ -1603,6 +1865,9 @@ class CombinedOvernightReboundBot:
                 "red_trail_order_ids": self.red_trail_order_ids,
                 "red_trail_symbols": list(self.red_trail_symbols),
                 "morning_open_orders_cancelled": self.morning_open_orders_cancelled,
+                "premarket_dynamic_limits_done": self.premarket_dynamic_limits_done,
+                "premarket_limit_order_ids": self.premarket_limit_order_ids,
+                # Legacy 20:00 fields kept for backward compatibility
                 "overnight_limit_sells_done": self.overnight_limit_sells_done,
                 "overnight_limit_order_ids": self.overnight_limit_order_ids,
                 "end_of_day_reports_done": self.end_of_day_reports_done,
@@ -1650,6 +1915,10 @@ class CombinedOvernightReboundBot:
         self.red_trail_order_ids = bot_state.get("red_trail_order_ids", {})
         self.red_trail_symbols = set(bot_state.get("red_trail_symbols", []))
         self.morning_open_orders_cancelled = bot_state.get("morning_open_orders_cancelled", False)
+        # New premarket fields
+        self.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
+        self.premarket_limit_order_ids = bot_state.get("premarket_limit_order_ids", {})
+        # Legacy 20:00 fields kept for backward compatibility
         self.overnight_limit_sells_done = bot_state.get("overnight_limit_sells_done", False)
         self.overnight_limit_order_ids = bot_state.get("overnight_limit_order_ids", {})
         self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
