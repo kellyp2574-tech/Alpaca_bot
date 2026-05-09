@@ -141,10 +141,14 @@ class PositionManager:
             return None
 
     def _submit_sell_order(self, symbol: str, qty: int, order_type: str = "market",
-                           limit_price: Optional[float] = None) -> Optional[dict]:
+                           limit_price: Optional[float] = None,
+                           time_in_force: str = "day",
+                           extended_hours: bool = False) -> Optional[dict]:
         """Submit a sell order via POST /v2/orders.
 
         ALL exits go through this method — never DELETE /v2/positions.
+        ``time_in_force`` is configurable so the overnight 20:00 limit-sell
+        orders can rest as GTC orders, while normal 09:30 exits remain DAY.
         """
         url = f"{self.base_url}/v2/orders"
         order_data = {
@@ -152,8 +156,10 @@ class PositionManager:
             "qty": str(qty),
             "side": "sell",
             "type": order_type,
-            "time_in_force": "day",
+            "time_in_force": time_in_force,
         }
+        if extended_hours:
+            order_data["extended_hours"] = True
         if order_type == "limit" and limit_price is not None:
             limit_price = self.round_limit_price(limit_price)
             decimals = 2 if limit_price >= 1.0 else 4

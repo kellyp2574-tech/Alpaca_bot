@@ -81,6 +81,23 @@ GDP_EXIT_TIME = "09:30"          # GDP sleeve exits at market open
 MR_EXIT_TIME = "09:30"           # MR sleeve exits at market open
 V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 
+# Cancel any resting overnight limits before the 09:30 market exit logic.
+MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
+
+# ═══════════════════════════════════════════════════
+# Overnight limit-sell experiment
+# ═══════════════════════════════════════════════════
+# At 20:00, place resting limit sells for overnight positions:
+#   base_limit = max(today_09:30_open, entry_price * (1 + target_gain_pct))
+#   if current_price > base_limit: limit = current_price * (1 + current_price_premium_pct)
+# These are canceled at MORNING_CANCEL_OPEN_ORDERS_TIME before normal 09:30 exits.
+ENABLE_OVERNIGHT_LIMIT_SELLS = True
+OVERNIGHT_LIMIT_SELL_TIME = "20:00"
+OVERNIGHT_LIMIT_TARGET_GAIN_PCT = 0.025
+OVERNIGHT_LIMIT_CURRENT_PRICE_PREMIUM_PCT = 0.005
+OVERNIGHT_LIMIT_TIME_IN_FORCE = "gtc"
+OVERNIGHT_LIMIT_EXTENDED_HOURS = False
+
 # ═══════════════════════════════════════════════════
 # Paper research exit: red-open trailing stop
 # ═══════════════════════════════════════════════════

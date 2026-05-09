@@ -109,6 +109,12 @@ class CombinedOvernightReboundBot:
         self.red_trail_order_ids: Dict[str, str] = {}
         self.red_trail_symbols: set = set()
 
+        # Morning/overnight order management
+        self.morning_open_orders_cancelled = False
+        self.overnight_limit_sells_done = False
+        self.overnight_limit_order_ids: Dict[str, str] = {}
+        self.end_of_day_reports_done = False
+
         # Failsafe
         self.post_exit_failsafe_done = False
 
@@ -197,19 +203,45 @@ class CombinedOvernightReboundBot:
         t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)    # 15:30
         t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:50
         t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
+        t_cancel_orders = _parse_config_time(getattr(config, "MORNING_CANCEL_OPEN_ORDERS_TIME", "09:25"))
+        t_overnight_limit = _parse_config_time(getattr(config, "OVERNIGHT_LIMIT_SELL_TIME", "20:00"))
         t_market_close = dt_time(16, 0)
 
         # If starting after failsafe time with positions, flatten immediately
+        # Only late-flatten during the morning exit window, not after market close.
         current_time = datetime.now(_ET).time()
-        if current_time >= t_failsafe and self.position_mgr.get_position_count() > 0:
-            logger.warning(f"Started after failsafe time — flattening immediately")
+        if (
+            current_time >= t_failsafe
+            and current_time < t_market_close
+            and self.position_mgr.get_position_count() > 0
+        ):
+            logger.warning("Started after morning failsafe during regular session — flattening immediately")
             self._run_failsafe_flatten("late-start flatten")
             self.morning_exits_done = True
 
-        # If starting after 4:00 PM, nothing to do
+        # After market close, do NOT immediately return if overnight limit sells are enabled.
         if current_time >= t_market_close:
-            logger.error("Started after market close — nothing to do")
-            return
+            if (
+                getattr(config, "ENABLE_OVERNIGHT_LIMIT_SELLS", False)
+                and self.position_mgr.get_position_count() > 0
+                and not self.overnight_limit_sells_done
+            ):
+                logger.info("Started after market close with positions — waiting/placing overnight limit sells")
+                # Skip morning exits - we're waiting for 20:00 limits
+                self.morning_exits_done = True
+                self.gdp_exits_done = True
+                self.mr_exits_done = True
+                self._save_state()
+                # If already past 20:00, place limits immediately
+                if current_time >= t_overnight_limit:
+                    self._place_overnight_limit_sells()
+                    self.overnight_limit_sells_done = True
+                    self._save_state()
+                    logger.info("20:00 overnight limit-sell placement complete. Day complete.")
+                    return
+            else:
+                logger.info("Started after market close — nothing to do")
+                return
 
         # Main event loop
         while True:
@@ -220,7 +252,20 @@ class CombinedOvernightReboundBot:
             # MORNING: Manage overnight position exits
             # ════════════════════════════════════════════
 
-            if not self.morning_exits_done:
+            # Gate morning exits to prevent after-market execution on restart
+            if current_time < t_market_close and not self.morning_exits_done:
+                # 09:25 — cancel any resting overnight limit/trailing orders before normal exits.
+                # Run regardless of local position state for safety.
+                if (not self.morning_open_orders_cancelled
+                        and current_time >= t_cancel_orders):
+                    logger.warning("09:25 order cleanup: canceling all open orders before 09:30 exits")
+                    self.position_mgr.cancel_all_open_orders()
+                    self.overnight_limit_order_ids.clear()
+                    self.red_trail_order_ids.clear()
+                    self.red_trail_symbols.clear()
+                    self.morning_open_orders_cancelled = True
+                    self._save_state()
+
                 has_positions = self.position_mgr.get_position_count() > 0
 
                 if not has_positions:
@@ -302,19 +347,33 @@ class CombinedOvernightReboundBot:
             # ════════════════════════════════════════════
 
             if current_time >= t_market_close:
-                if self.entries_done:
-                    logger.info("Market closed — positions held overnight. Day complete.")
-                    self._save_end_of_day_reports()
-                    self._save_state()
-                    break
-                elif self.position_mgr.get_position_count() > 0:
-                    logger.info("Market closed with positions — holding overnight as intended.")
-                    self._save_end_of_day_reports()
-                    self._save_state()
-                    break
+                has_eod_positions = self.position_mgr.get_position_count() > 0
+
+                if not self.end_of_day_reports_done:
+                    if self.entries_done or has_eod_positions:
+                        logger.info("Market closed — positions held overnight.")
+                        self._save_end_of_day_reports()
+                        self.end_of_day_reports_done = True
+                        self._save_state()
+                    else:
+                        logger.info("Market closed — no entries made today.")
+                        self._finalize_day()
+                        break
+
+                if (getattr(config, "ENABLE_OVERNIGHT_LIMIT_SELLS", False)
+                        and has_eod_positions
+                        and not self.overnight_limit_sells_done):
+                    if current_time >= t_overnight_limit:
+                        self._place_overnight_limit_sells()
+                        self.overnight_limit_sells_done = True
+                        self._save_state()
+                        logger.info("20:00 overnight limit-sell placement complete. Day complete.")
+                        break
+                    # Keep process alive between close and 20:00 so the resting limits get placed.
                 else:
-                    logger.info("Market closed — no entries made today.")
-                    self._finalize_day()
+                    if self.entries_done or has_eod_positions:
+                        logger.info("Market closed — day complete.")
+                        self._save_state()
                     break
 
             time.sleep(1)
@@ -325,6 +384,10 @@ class CombinedOvernightReboundBot:
 
     def _exit_sleeve_positions(self, sleeve: str, reason: str):
         """Exit all positions of a specific sleeve at market.
+
+        Batch behavior: submit every sell order first, then monitor fills.
+        This prevents one slow/partial fill from delaying the next symbol's
+        sell order by minutes at the open.
 
         Args:
             sleeve: "MR" or "GDP"
@@ -354,8 +417,95 @@ class CombinedOvernightReboundBot:
             return
 
         logger.info(f"EXIT {sleeve}: market selling {len(positions)} positions: {positions}")
+
+        # Pass 1: submit all sell orders
+        submitted_orders = []  # List of (order_id, symbol, qty)
+
         for symbol in positions:
-            self._exit_single_position(symbol, reason)
+            position = self.position_mgr.positions.get(symbol)
+            if not position:
+                continue
+
+            # Verify broker actually holds this position
+            broker_pos = self.position_mgr.get_broker_position(symbol)
+            if broker_pos is None:
+                logger.warning(f"EXIT DEFER {symbol}: broker API error — skipping for retry")
+                continue
+            if broker_pos is self.position_mgr.BROKER_NOT_FOUND:
+                logger.warning(f"EXIT SKIP {symbol}: broker confirmed no position — removing local")
+                self.position_mgr.positions.pop(symbol, None)
+                continue
+
+            broker_qty = abs(int(float(broker_pos.get("qty", 0))))
+            if broker_qty <= 0:
+                logger.warning(f"EXIT SKIP {symbol}: broker qty=0 — removing local")
+                self.position_mgr.positions.pop(symbol, None)
+                continue
+
+            qty = min(position.quantity, broker_qty)
+            if qty != position.quantity:
+                logger.warning(f"EXIT {symbol}: local qty={position.quantity} but broker qty={broker_qty} — selling {qty}")
+                position.quantity = qty
+
+            # Market sell
+            sell_resp = self.position_mgr._submit_sell_order(symbol, qty)
+            if not sell_resp:
+                # Limit fallback
+                last_price = self.position_mgr._get_last_price(symbol)
+                if last_price and last_price > 0:
+                    limit_price = self.position_mgr.round_limit_price(last_price * 0.97)
+                    logger.warning(f"Market sell failed for {symbol}, trying limit @ {limit_price}")
+                    sell_resp = self.position_mgr._submit_sell_order(symbol, qty, "limit", limit_price)
+
+            if sell_resp and sell_resp.get("id"):
+                order_id = sell_resp["id"]
+                submitted_orders.append((order_id, symbol, qty))
+            else:
+                logger.error(f"Failed to submit sell for {symbol} x{qty}")
+
+        # Pass 2: monitor fills
+        for order_id, symbol, qty in submitted_orders:
+            position = self.position_mgr.positions.get(symbol)
+            if not position:
+                continue
+
+            fill = self.position_mgr.get_order_fill(order_id, max_wait=30)
+            if fill and int(fill.get("filled_qty", 0)) > 0:
+                filled_qty = int(fill["filled_qty"])
+                exit_price = fill["filled_avg_price"]
+
+                # PDT guard
+                if filled_qty > 0:
+                    self.sold_today.add(symbol)
+
+                remaining = position.quantity - filled_qty
+                if remaining > 0:
+                    position.quantity = remaining
+                    # Immediate resubmit for residual (same logic as old _exit_position)
+                    slice_residual = qty - filled_qty
+                    fill_status = fill.get("status", "unknown")
+                    if slice_residual > 0 and fill_status != "filled":
+                        logger.warning(f"EXIT PARTIAL {symbol}: filled {filled_qty}/{qty} — resubmitting {slice_residual}")
+                        resub_resp = self.position_mgr._submit_sell_order(symbol, slice_residual)
+                        if resub_resp and resub_resp.get("id"):
+                            resub_id = resub_resp["id"]
+                            resub_fill = self.position_mgr.get_order_fill(resub_id, max_wait=15)
+                            if resub_fill:
+                                resub_qty = int(resub_fill.get("filled_qty", 0))
+                                remaining -= resub_qty
+                                position.quantity = remaining
+                                if resub_qty > 0:
+                                    self.sold_today.add(symbol)
+                                logger.info(f"EXIT RESUBMIT {symbol}: filled additional {resub_qty}, now {remaining} remaining")
+                            else:
+                                logger.warning(f"EXIT RESUBMIT {symbol}: no fill on resubmit order")
+                        else:
+                            logger.error(f"EXIT RESUBMIT {symbol}: resubmit failed")
+                else:
+                    self.position_mgr.positions.pop(symbol, None)
+                    logger.info(f"EXIT FILLED {symbol}: qty={filled_qty}, price={exit_price:.4f}")
+            else:
+                logger.warning(f"EXIT NO FILL {symbol}: keeping for retry")
 
         # Reconcile local state with broker
         actions = self.position_mgr.reconcile_local_positions_from_broker()
@@ -873,6 +1023,9 @@ class CombinedOvernightReboundBot:
             # Hard cutoff for new buy submissions (don't chase too close to close)
             entry_cutoff = dt_time(15, 58, 30)
 
+            # Pass 1: submit all buy orders
+            submitted_orders = []  # List of (order_id, alloc, qty, candidate)
+
             for alloc in allocations:
                 # Check cutoff before processing
                 if datetime.now(_ET).time() >= entry_cutoff:
@@ -930,7 +1083,11 @@ class CombinedOvernightReboundBot:
                     continue
 
                 exec_diag.submitted_symbols.append(symbol)
+                submitted_orders.append((order_id, alloc, qty, candidate))
 
+            # Pass 2: monitor fills for all submitted orders
+            for order_id, alloc, qty, candidate in submitted_orders:
+                symbol = alloc.symbol
                 fill = self.position_mgr.get_order_fill(order_id, max_wait=10)
                 if fill and int(fill["filled_qty"]) > 0:
                     filled_qty = int(fill["filled_qty"])
@@ -1061,6 +1218,12 @@ class CombinedOvernightReboundBot:
     def _submit_red_open_trail_or_sell_green(self):
         """09:30 exit decision for the red-open trailing-stop paper test.
 
+        Batch behavior:
+        - Trailing-stop orders are submitted without waiting.
+        - Green/flat market exits are all submitted first, then monitored.
+        - This prevents one slow/partial fill from delaying the next symbol's
+          sell order by minutes at the open.
+
         - If a position is green/flat versus its stored entry price, sell it at market.
         - If a position is red versus its stored entry price, submit an Alpaca
           trailing-stop sell order using config.RED_OPEN_TRAIL_PCT.
@@ -1093,7 +1256,9 @@ class CombinedOvernightReboundBot:
         submitted_trails = 0
         market_exits = 0
         fallbacks = 0
+        market_orders: Dict[str, Dict[str, Any]] = {}
 
+        # Pass 1: submit trailing stops and collect market exit symbols
         for symbol, pos in list(self.position_mgr.positions.items()):
             sym = symbol.upper()
             broker_pos = broker_by_symbol.get(sym)
@@ -1119,10 +1284,14 @@ class CombinedOvernightReboundBot:
             if entry_price <= 0 or not decision_price or decision_price <= 0:
                 logger.warning(
                     f"RED TRAIL {symbol}: bad decision data "
-                    f"entry={entry_price}, price={decision_price}; selling at market fallback"
+                    f"entry={entry_price}, price={decision_price}; submitting market fallback"
                 )
-                self._exit_single_position(symbol, "red-trail bad data fallback")
-                fallbacks += 1
+                resp = self.position_mgr._submit_sell_order(symbol, broker_qty)
+                if resp and resp.get("id"):
+                    market_orders[symbol] = {"order_id": resp["id"], "qty": broker_qty}
+                    market_exits += 1
+                else:
+                    fallbacks += 1
                 continue
 
             # Optional tiny buffer. Default 0.0 means any price below entry is red.
@@ -1146,17 +1315,45 @@ class CombinedOvernightReboundBot:
                         f"qty={broker_qty} order_id={order_id}"
                     )
                 else:
-                    logger.error(f"RED TRAIL {symbol}: trailing-stop submit failed; selling at market fallback")
-                    self._exit_single_position(symbol, "red-trail submit failed fallback")
-                    fallbacks += 1
+                    logger.error(f"RED TRAIL {symbol}: trailing-stop submit failed; submitting market fallback")
+                    resp = self.position_mgr._submit_sell_order(symbol, broker_qty)
+                    if resp and resp.get("id"):
+                        market_orders[symbol] = {"order_id": resp["id"], "qty": broker_qty}
+                        market_exits += 1
+                    else:
+                        fallbacks += 1
             else:
                 logger.info(
                     f"GREEN/FLAT EXIT {symbol}: price={decision_price:.4f} >= entry={entry_price:.4f}; "
-                    f"selling at market"
+                    f"submitting market sell"
                 )
-                self._exit_single_position(symbol, "green/flat 09:30 market exit")
-                market_exits += 1
+                resp = self.position_mgr._submit_sell_order(symbol, broker_qty)
+                if resp and resp.get("id"):
+                    market_orders[symbol] = {"order_id": resp["id"], "qty": broker_qty}
+                    market_exits += 1
+                else:
+                    fallbacks += 1
 
+        # Pass 2: monitor green/flat market exits only after all orders are in
+        for symbol, meta in market_orders.items():
+            pos = self.position_mgr.positions.get(symbol)
+            if not pos:
+                continue
+            fill = self.position_mgr.get_order_fill(meta["order_id"], max_wait=20)
+            if fill and int(fill.get("filled_qty", 0)) > 0:
+                filled_qty = int(fill["filled_qty"])
+                self.sold_today.add(symbol)
+                remaining = int(pos.quantity) - filled_qty
+                if remaining > 0:
+                    pos.quantity = remaining
+                    logger.warning(f"GREEN/FLAT EXIT {symbol}: partial fill {filled_qty}; {remaining} remaining")
+                else:
+                    logger.info(f"GREEN/FLAT EXIT {symbol}: filled {filled_qty}; removing local position")
+                    self.position_mgr.positions.pop(symbol, None)
+            else:
+                logger.warning(f"GREEN/FLAT EXIT {symbol}: no confirmed fill yet — failsafe will retry")
+
+        self.position_mgr.reconcile_local_positions_from_broker()
         self.red_trail_exit_submitted = True
         logger.warning(
             f"RED TRAIL DECISION COMPLETE: trailing_orders={submitted_trails}, "
@@ -1203,6 +1400,107 @@ class CombinedOvernightReboundBot:
             logger.error(f"{label}: broker still shows {remaining} open positions after failsafe")
 
         self._save_state()
+
+    def _place_overnight_limit_sells(self):
+        """20:00: place resting limit sells for all overnight positions.
+
+        Limit formula:
+            base = max(today_open_price, entry_price * (1 + target_gain_pct))
+            if current_price > base: limit = current_price * (1 + current_price_premium_pct)
+        The 09:25 cleanup cancels these orders before the normal 09:30 exit path.
+        """
+        if self.overnight_limit_sells_done:
+            logger.info("OVERNIGHT LIMITS: already placed; skipping duplicate call")
+            return
+
+        self.position_mgr.reconcile_local_positions_from_broker()
+        symbols = list(self.position_mgr.positions.keys())
+        if not symbols:
+            logger.info("OVERNIGHT LIMITS: no positions to place limits for")
+            return
+
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("OVERNIGHT LIMITS: broker position read failed; skipping limit placement")
+            return
+        broker_by_symbol = {
+            str(p.get("symbol", "")).upper(): p
+            for p in broker_positions
+            if p.get("symbol")
+        }
+
+        snapshots = self.alpaca.get_snapshots(symbols)
+        placed = 0
+        skipped = 0
+
+        target_gain = getattr(config, "OVERNIGHT_LIMIT_TARGET_GAIN_PCT", 0.025)
+        current_premium = getattr(config, "OVERNIGHT_LIMIT_CURRENT_PRICE_PREMIUM_PCT", 0.005)
+        tif = getattr(config, "OVERNIGHT_LIMIT_TIME_IN_FORCE", "gtc")
+        extended = getattr(config, "OVERNIGHT_LIMIT_EXTENDED_HOURS", False)
+
+        for symbol in symbols:
+            pos = self.position_mgr.positions.get(symbol)
+            broker_pos = broker_by_symbol.get(symbol.upper())
+            if not pos or not broker_pos:
+                skipped += 1
+                logger.warning(f"OVERNIGHT LIMIT {symbol}: missing local/broker position; skipping")
+                continue
+
+            try:
+                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
+            except (TypeError, ValueError):
+                qty = int(pos.quantity or 0)
+            if qty <= 0:
+                skipped += 1
+                logger.warning(f"OVERNIGHT LIMIT {symbol}: qty <= 0; skipping")
+                continue
+
+            snap = snapshots.get(symbol, {}) if snapshots else {}
+            today_open = snap.get("open") or 0.0
+            current_price = snap.get("last_price") or snap.get("close") or 0.0
+            try:
+                today_open = float(today_open or 0.0)
+                current_price = float(current_price or 0.0)
+            except (TypeError, ValueError):
+                today_open = 0.0
+                current_price = 0.0
+
+            entry_price = float(getattr(pos, "entry_price", 0.0) or broker_pos.get("avg_entry_price", 0.0) or 0.0)
+            if entry_price <= 0:
+                skipped += 1
+                logger.warning(f"OVERNIGHT LIMIT {symbol}: missing entry price; skipping")
+                continue
+
+            base_limit = entry_price * (1.0 + target_gain)
+            if today_open > 0:
+                base_limit = max(base_limit, today_open)
+
+            limit_price = base_limit
+            if current_price > base_limit:
+                limit_price = current_price * (1.0 + current_premium)
+
+            limit_price = self.position_mgr.round_limit_price(limit_price)
+            resp = self.position_mgr._submit_sell_order(
+                symbol=symbol,
+                qty=qty,
+                order_type="limit",
+                limit_price=limit_price,
+                time_in_force=tif,
+                extended_hours=extended,
+            )
+            if resp and resp.get("id"):
+                self.overnight_limit_order_ids[symbol] = resp["id"]
+                placed += 1
+                logger.info(
+                    f"OVERNIGHT LIMIT {symbol}: qty={qty}, entry={entry_price:.4f}, "
+                    f"open={today_open:.4f}, current={current_price:.4f}, limit={limit_price:.4f}, "
+                    f"tif={tif}, order_id={resp['id']}"
+                )
+            else:
+                skipped += 1
+                logger.error(f"OVERNIGHT LIMIT {symbol}: submit failed")
+
+        logger.warning(f"OVERNIGHT LIMITS COMPLETE: placed={placed}, skipped={skipped}")
 
     def _save_end_of_day_reports(self):
         """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
@@ -1304,6 +1602,10 @@ class CombinedOvernightReboundBot:
                 "red_trail_exit_submitted": self.red_trail_exit_submitted,
                 "red_trail_order_ids": self.red_trail_order_ids,
                 "red_trail_symbols": list(self.red_trail_symbols),
+                "morning_open_orders_cancelled": self.morning_open_orders_cancelled,
+                "overnight_limit_sells_done": self.overnight_limit_sells_done,
+                "overnight_limit_order_ids": self.overnight_limit_order_ids,
+                "end_of_day_reports_done": self.end_of_day_reports_done,
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
                 "scoring_done": self.scoring_done,
@@ -1347,6 +1649,10 @@ class CombinedOvernightReboundBot:
         self.red_trail_exit_submitted = bot_state.get("red_trail_exit_submitted", False)
         self.red_trail_order_ids = bot_state.get("red_trail_order_ids", {})
         self.red_trail_symbols = set(bot_state.get("red_trail_symbols", []))
+        self.morning_open_orders_cancelled = bot_state.get("morning_open_orders_cancelled", False)
+        self.overnight_limit_sells_done = bot_state.get("overnight_limit_sells_done", False)
+        self.overnight_limit_order_ids = bot_state.get("overnight_limit_order_ids", {})
+        self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
 
         # Load positions
         saved = self.state_mgr.load_positions()
