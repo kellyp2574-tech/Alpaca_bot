@@ -118,6 +118,14 @@ PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT = 0.05
 PREMARKET_DYNAMIC_MODERATE_RETURN_PCT = 0.02
 
 # ═══════════════════════════════════════════════════
+# Fast open market exit (streamlined 09:30 liquidation)
+# ═══════════════════════════════════════════════════
+# When enabled, at 09:30 the bot submits all market sells in batch using
+# the frozen 09:25 broker-position plan. No green/red decisions, no trailing stops,
+# just simple market sell for everything. This is faster and more reliable.
+ENABLE_FAST_OPEN_MARKET_EXIT = True
+
+# ═══════════════════════════════════════════════════
 # Paper research exit: red-open trailing stop
 # ═══════════════════════════════════════════════════
 # When enabled, positions that open below their afternoon entry price receive

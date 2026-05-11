@@ -111,6 +111,7 @@ class CombinedOvernightReboundBot:
         self.red_trail_exit_submitted = False
         self.red_trail_order_ids: Dict[str, str] = {}
         self.red_trail_symbols: set = set()
+        self.open_exit_plan: List[Dict[str, Any]] = []  # Frozen broker-position sell plan built after 09:25 cleanup
 
         # Morning/overnight order management
         self.morning_open_orders_cancelled = False
@@ -294,6 +295,7 @@ class CombinedOvernightReboundBot:
                     self.red_trail_order_ids.clear()
                     self.red_trail_symbols.clear()
                     self.morning_open_orders_cancelled = True
+                    self._build_open_exit_plan_from_broker(reason="09:25 post-cancel broker snapshot")
                     self._save_state()
 
                 has_positions = self.position_mgr.get_position_count() > 0
@@ -313,9 +315,12 @@ class CombinedOvernightReboundBot:
                         has_positions = self.position_mgr.get_position_count() > 0
 
                 if has_positions and not self.morning_exits_done:
-                    # 09:30 — either run the red-open trailing experiment or fixed exit all.
+                    # 09:30 — fast open liquidation. Use the frozen 09:25 broker-position
+                    # plan and submit every market sell before monitoring fills.
                     if not self.gdp_exits_done and current_time >= t_exit_all:
-                        if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
+                        if getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", True):
+                            self._submit_open_exit_market_sells()
+                        elif getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
                             self._submit_red_open_trail_or_sell_green()
                         else:
                             self._exit_sleeve_positions("GDP", "09:30 all positions (GDP)")
@@ -568,6 +573,134 @@ class CombinedOvernightReboundBot:
                 f"failsafe will catch at {config.RED_OPEN_TRAIL_FAILSAFE_TIME if getattr(config, 'ENABLE_RED_OPEN_TRAIL_EXIT', False) else config.V2_FAILSAFE_TIME}"
             )
         self._save_state()
+
+    def _build_open_exit_plan_from_broker(self, reason: str = "broker snapshot") -> List[Dict[str, Any]]:
+        """Freeze the remaining broker positions into a simple 09:30 market-sell plan.
+
+        This is intentionally called before the open, after canceling premarket
+        limit orders. The 09:30 path should not fetch prices or make
+        green/red decisions; it should only submit these prepared market sells.
+        """
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("OPEN_EXIT_PLAN: broker position read failed during %s", reason)
+            self.open_exit_plan = []
+            return self.open_exit_plan
+
+        plan: List[Dict[str, Any]] = []
+        for broker_pos in broker_positions:
+            symbol = str(broker_pos.get("symbol", "")).upper().strip()
+            if not symbol:
+                continue
+            try:
+                qty = int(abs(float(broker_pos.get("qty", 0))))
+            except (TypeError, ValueError):
+                logger.warning("OPEN_EXIT_PLAN: bad qty for %s: %s", symbol, broker_pos.get("qty"))
+                continue
+            if qty <= 0:
+                continue
+
+            plan.append({
+                "symbol": symbol,
+                "qty": qty,
+                "avg_entry_price": broker_pos.get("avg_entry_price"),
+                "source": reason,
+            })
+
+        self.open_exit_plan = plan
+        logger.warning(
+            "OPEN_EXIT_PLAN_READY reason=%s count=%d symbols=%s",
+            reason,
+            len(plan),
+            [p["symbol"] for p in plan],
+        )
+        return plan
+
+    def _submit_open_exit_market_sells(self):
+        """09:30 fast liquidation: submit all market sells first, then reconcile.
+
+        No snapshots. No green/red branch. No trailing stops. No fill-wait inside
+        the submit loop. This keeps the 09:30 minute focused purely on order
+        submission.
+        """
+        if not self.open_exit_plan:
+            logger.warning("OPEN_EXIT: no frozen 09:25 plan found; building one from broker now")
+            self._build_open_exit_plan_from_broker(reason="09:30 fallback broker snapshot")
+
+        if not self.open_exit_plan:
+            logger.warning("OPEN_EXIT: no broker positions to submit")
+            self.position_mgr.reconcile_local_positions_from_broker()
+            return
+
+        logger.warning(
+            "OPEN_EXIT_BATCH_START count=%d symbols=%s",
+            len(self.open_exit_plan),
+            [p["symbol"] for p in self.open_exit_plan],
+        )
+
+        submitted_orders: List[Tuple[str, str, int]] = []
+
+        # Phase 1: submit every market sell as quickly as possible.
+        for item in list(self.open_exit_plan):
+            symbol = item.get("symbol")
+            qty = int(item.get("qty", 0) or 0)
+            if not symbol or qty <= 0:
+                continue
+
+            submit_start = datetime.now(_ET)
+            t0 = time.perf_counter()
+            try:
+                resp = self.position_mgr._submit_sell_order(
+                    symbol,
+                    qty,
+                    order_type="market",
+                    time_in_force="day",
+                    extended_hours=False,
+                )
+            except TypeError:
+                # Backward compatibility with older PositionManager signatures.
+                resp = self.position_mgr._submit_sell_order(symbol, qty)
+            except Exception:
+                logger.exception("OPEN_EXIT_SUBMIT_FAILED symbol=%s qty=%s", symbol, qty)
+                continue
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            order_id = resp.get("id") if resp else None
+            if order_id:
+                submitted_orders.append((order_id, symbol, qty))
+                self.sold_today.add(symbol)
+                logger.warning(
+                    "OPEN_EXIT_SUBMITTED symbol=%s qty=%s order_id=%s start=%s elapsed_ms=%.1f type=market tif=day ext=false",
+                    symbol,
+                    qty,
+                    order_id,
+                    submit_start.isoformat(),
+                    elapsed_ms,
+                )
+            else:
+                logger.error("OPEN_EXIT_SUBMIT_NO_ORDER_ID symbol=%s qty=%s resp=%s", symbol, qty, resp)
+
+        logger.warning(
+            "OPEN_EXIT_BATCH_ALL_SUBMITTED submitted=%d planned=%d",
+            len(submitted_orders),
+            len(self.open_exit_plan),
+        )
+
+        # Phase 2: do not block the opening submissions. Reconcile once after all
+        # orders are out; the normal failsafe can catch anything still held.
+        actions = self.position_mgr.reconcile_local_positions_from_broker()
+        if actions:
+            logger.info("OPEN_EXIT: post-submit reconciliation adjustments: %s", actions)
+
+        remaining = self.position_mgr.broker_position_count()
+        if remaining == 0:
+            logger.warning("OPEN_EXIT: broker confirmed flat after batch submit")
+            self.position_mgr.positions.clear()
+            self.open_exit_plan = []
+        elif remaining > 0:
+            logger.warning("OPEN_EXIT: broker still shows %d positions after batch submit; failsafe will retry", remaining)
+        else:
+            logger.error("OPEN_EXIT: broker position count unavailable after batch submit")
 
     # ════════════════════════════════════════════════════════════
     # AFTERNOON DATA & SCORING METHODS
@@ -2029,6 +2162,7 @@ class CombinedOvernightReboundBot:
                 "red_trail_exit_submitted": self.red_trail_exit_submitted,
                 "red_trail_order_ids": self.red_trail_order_ids,
                 "red_trail_symbols": list(self.red_trail_symbols),
+                "open_exit_plan": self.open_exit_plan,
                 "morning_open_orders_cancelled": self.morning_open_orders_cancelled,
                 "premarket_dynamic_limits_done": self.premarket_dynamic_limits_done,
                 "premarket_limit_order_ids": self.premarket_limit_order_ids,
@@ -2080,6 +2214,7 @@ class CombinedOvernightReboundBot:
         self.red_trail_exit_submitted = bot_state.get("red_trail_exit_submitted", False)
         self.red_trail_order_ids = bot_state.get("red_trail_order_ids", {})
         self.red_trail_symbols = set(bot_state.get("red_trail_symbols", []))
+        self.open_exit_plan = bot_state.get("open_exit_plan", [])
         self.morning_open_orders_cancelled = bot_state.get("morning_open_orders_cancelled", False)
         # New premarket fields
         self.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
