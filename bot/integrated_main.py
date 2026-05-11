@@ -251,7 +251,7 @@ class CombinedOvernightReboundBot:
                 if (getattr(config, "ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS", False)
                         and not self.premarket_dynamic_limits_done
                         and current_time >= t_premarket_start
-                        and current_time < t_cancel_orders):
+                        and current_time < t_premarket_final):
                     # Calculate which checkpoint we're at
                     minutes_since_start = (current_time.hour * 60 + current_time.minute) - (t_premarket_start.hour * 60 + t_premarket_start.minute)
                     checkpoint_num = minutes_since_start // t_premarket_interval
@@ -259,11 +259,29 @@ class CombinedOvernightReboundBot:
                         t_premarket_start.hour + checkpoint_num // 60,
                         t_premarket_start.minute + checkpoint_num % 60
                     )
-                    # Only trigger if we're at a checkpoint time (within 1 minute tolerance)
-                    if abs((current_time.hour * 60 + current_time.minute) - (checkpoint_time.hour * 60 + checkpoint_time.minute)) <= 1:
+                    
+                    # If bot started after a checkpoint, run it immediately (catch-up)
+                    # Otherwise, only trigger if we're at a checkpoint time (within 1 minute tolerance)
+                    minutes_diff = (current_time.hour * 60 + current_time.minute) - (checkpoint_time.hour * 60 + checkpoint_time.minute)
+                    if minutes_diff > 1:
+                        # Bot started after this checkpoint - run it now as catch-up
+                        checkpoint_str = checkpoint_time.strftime("%H:%M")
+                        logger.info(f"PREMARKET CHECKPOINT CATCH-UP: {checkpoint_str} - running dynamic limit classification (started after checkpoint time)")
+                        self._place_premarket_dynamic_limit_sells(decision_time_str=checkpoint_str)
+                    elif abs(minutes_diff) <= 1:
+                        # Bot is at checkpoint time - run normally
                         checkpoint_str = checkpoint_time.strftime("%H:%M")
                         logger.info(f"PREMARKET CHECKPOINT: {checkpoint_str} - running dynamic limit classification")
                         self._place_premarket_dynamic_limit_sells(decision_time_str=checkpoint_str)
+                
+                # If bot started after 06:00 (final checkpoint time), skip premarket entirely
+                if (getattr(config, "ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS", False)
+                        and not self.premarket_dynamic_limits_done
+                        and current_time >= t_premarket_final
+                        and current_time < t_cancel_orders):
+                    logger.info(f"Bot started after {t_premarket_final.strftime('%H:%M')} - skipping premarket limits, proceeding to morning exits")
+                    self.premarket_dynamic_limits_done = True
+                    self._save_state()
 
                 # 09:25 — cancel any resting premarket limit/trailing orders before normal exits.
                 # Run regardless of local position state for safety.
