@@ -1723,7 +1723,7 @@ class CombinedOvernightReboundBot:
 
             # Check if signal is decisive (act now) or should wait
             is_decisive, decisive_reason = self._is_decisive_premarket_signal(
-                decision_time_str=decision_time_str,
+                decision_time=decision_time_str,
                 final_time=final_time_str,
                 current_return=metrics.get("current_return", 0.0),
                 distance_from_high=metrics.get("distance_from_high", 0.0),
