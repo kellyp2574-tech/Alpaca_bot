@@ -44,7 +44,6 @@ MR_CLOSE_POSITION_MAX = 0.20    # close in bottom 20% of day range
 MR_LATE_DROP_MAX = None         # optional: set -0.01 for stricter late-drop filter
 
 MR_MAX_POSITIONS = 12           # max MR slots; dollar budget is controlled by MR_ALLOCATION_PCT
-MR_USE_RANDOM_SELECTION = False # deterministic first-N selection for live trading
 
 # ═══════════════════════════════════════════════════
 # Sleeve 2: Green-Day Pullback — GDP_BASE
@@ -60,11 +59,14 @@ GDP_MAX_CLOSE_POSITION = None   # optional: limit close_position (None = no limi
 GDP_MAX_POSITIONS = 8           # max GDP/MOM slots; dollar budget is controlled by GDP_ALLOCATION_PCT
 
 # ═══════════════════════════════════════════════════
-# Execution safety — buying power buffer + mop-up
+# Execution safety — buying power buffer
 # ═══════════════════════════════════════════════════
 ENTRY_BP_BUFFER_PCT = 0.98       # Size each order to 98% of reported buying power
-ENTRY_MIN_DEPLOY_PCT = 0.95      # If first pass deploys <95%, run mop-up pass
-ENTRY_MOPUP_MAX_POSITIONS = 0    # 0 = mop-up disabled (paper trading phase)
+
+# Daily loss circuit breaker — abort 15:50 entries if today's drawdown
+# (equity vs yesterday's close equity) is worse than this threshold.
+# 0.0 disables the check. 0.05 = abort if today's PnL < -5%.
+DAILY_LOSS_LIMIT_PCT = 0.05
 
 # ═══════════════════════════════════════════════════
 # Afternoon timeline (T-1 entry day)
@@ -87,18 +89,9 @@ MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
 # ═══════════════════════════════════════════════════
 # Rolling premarket dynamic limit management (05:00 → 06:00)
 # ═══════════════════════════════════════════════════
-# The old 20:00 blanket overnight limit workflow is disabled. The bot should
-# start around 05:00 and perform rolling premarket classification at 15-minute
-# intervals. Only "decisive" symbols are acted on early; unclear symbols wait for
-# the final 06:00 checkpoint. Any remaining limits are canceled at
-# MORNING_CANCEL_OPEN_ORDERS_TIME before the normal 09:30 exit/trailing-stop path.
-ENABLE_OVERNIGHT_LIMIT_SELLS = False          # legacy 20:00 workflow disabled
-OVERNIGHT_LIMIT_SELL_TIME = "20:00"           # legacy; unused when disabled
-OVERNIGHT_LIMIT_TARGET_GAIN_PCT = 0.025       # legacy; unused when disabled
-OVERNIGHT_LIMIT_CURRENT_PRICE_PREMIUM_PCT = 0.005
-OVERNIGHT_LIMIT_TIME_IN_FORCE = "gtc"
-OVERNIGHT_LIMIT_EXTENDED_HOURS = False
-
+# At 15-minute checkpoints, only "decisive" symbols are acted on; unclear
+# symbols wait for the final 06:00 checkpoint. Any remaining limits are
+# canceled at MORNING_CANCEL_OPEN_ORDERS_TIME before the 09:30 exit path.
 ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS = True
 PREMARKET_DYNAMIC_START_TIME = "05:00"
 PREMARKET_DYNAMIC_FINAL_TIME = "06:00"
@@ -128,29 +121,13 @@ ENABLE_FAST_OPEN_MARKET_EXIT = True
 # ═══════════════════════════════════════════════════
 # Paper research exit: red-open trailing stop
 # ═══════════════════════════════════════════════════
-# When enabled, positions that open below their afternoon entry price receive
-# a broker trailing-stop sell order at 09:30. Green/flat opens still sell at
-# 09:30. Anything still open is force-flattened at RED_OPEN_TRAIL_FAILSAFE_TIME.
-ENABLE_RED_OPEN_TRAIL_EXIT = True
+# Mutually exclusive with ENABLE_FAST_OPEN_MARKET_EXIT — the fast-exit branch
+# wins in integrated_main when both are True, but having both enabled also
+# pushes the bot onto the 10:00 failsafe schedule and blocks early-completion,
+# producing a confusing hybrid. Keep this False whenever fast exit is on.
+ENABLE_RED_OPEN_TRAIL_EXIT = False
 RED_OPEN_TRAIL_PCT = 1.0              # Alpaca trail_percent value, e.g. 1.0 = 1%
 RED_OPEN_TRAIL_FAILSAFE_TIME = "10:00"
 RED_OPEN_TRAIL_PRICE_BUFFER_PCT = 0.0    # match backtest: any open/current price below entry is red
 
-# ═══════════════════════════════════════════════════
-# Sector ETFs — kept for future use
-# ═══════════════════════════════════════════════════
-SECTOR_ETFS = {
-    "XLK": "Technology",
-    "XLF": "Financials",
-    "XLV": "Healthcare",
-    "XLE": "Energy",
-    "XLI": "Industrials",
-    "XLC": "Communication Services",
-    "XLY": "Consumer Discretionary",
-    "XLP": "Consumer Staples",
-    "XLU": "Utilities",
-    "XLRE": "Real Estate",
-    "XLB": "Materials",
-}
-MARKET_BENCHMARK = "SPY"
 

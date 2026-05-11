@@ -124,9 +124,13 @@ def filter_asset_type(
             diag._inc("warrant_right_unit", symbol=symbol)
             continue
 
-        # Reject preferred stock (contains "-" like "BAC-L")
-        if "-" in symbol or len(symbol) > 5:
-            diag._inc("preferred_or_long_symbol", symbol=symbol)
+        # Reject preferred stock (e.g. "BAC-L") and class shares (e.g. "BRK.B").
+        # The blanket ``len(symbol) > 5`` rule used to live here too but it
+        # rejected legitimate 6-letter common-stock tickers (e.g. some IEX-only
+        # microcaps). Stage D's broker tradability check is a better catch-all
+        # for any genuinely non-tradeable symbol.
+        if "-" in symbol or "." in symbol:
+            diag._inc("preferred_or_class_share", symbol=symbol)
             continue
 
         # Reject blacklisted
@@ -173,18 +177,21 @@ def filter_price(
 def filter_adv(
     symbols: List[str],
     daily_bars: Dict[str, List[dict]],
-    min_adv_dollars: float,
     adv_lookback: int,
     diag: UniverseDiagnostics,
-) -> Tuple[List[str], Dict[str, Tuple[float, float]], Dict[str, float]]:
-    """Filter by 20-day ADV minimum.
+) -> Tuple[List[str], Dict[str, Tuple[float, float]]]:
+    """Build the per-symbol ADV cache from daily bars.
+
+    The hard ADV-dollars gate has been removed because the live sizer
+    already protects via ``ADV_CAP_PCT`` (each position is capped at
+    0.3% of the symbol's ADV). Symbols with no daily bars are still
+    rejected because we cannot size them.
 
     Returns:
-        (passed_symbols, adv_cache {sym: (shares, dollars)}, atr_cache {sym: atr})
+        (passed_symbols, adv_cache {sym: (shares, dollars)})
     """
     passed = []
     adv_cache: Dict[str, Tuple[float, float]] = {}
-    atr_cache: Dict[str, float] = {}
 
     for symbol in symbols:
         bars = daily_bars.get(symbol, [])
@@ -193,17 +200,11 @@ def filter_adv(
             continue
 
         adv_shares, adv_dollars = AlpacaDataClient.calculate_adv(bars, adv_lookback)
-        atr = AlpacaDataClient.calculate_atr(bars, config.ATR_LOOKBACK_DAYS)
         adv_cache[symbol] = (adv_shares, adv_dollars)
-        atr_cache[symbol] = atr
-
-        if adv_dollars < min_adv_dollars:
-            diag._inc("adv_too_low", symbol=symbol)
-            continue
         passed.append(symbol)
 
     diag.after_adv = len(passed)
-    return passed, adv_cache, atr_cache
+    return passed, adv_cache
 
 
 # ──────────────────────────────────────────────────────────────
@@ -378,8 +379,14 @@ def filter_execution_ready(
                 if age > max_stale_seconds:
                     rejected[symbol] = f"stale_quote_{age:.0f}s"
                     continue
-            except (ValueError, TypeError):
-                pass  # unparseable timestamp — don't reject on parse failure
+            except (ValueError, TypeError) as e:
+                # A parse failure means we cannot prove freshness either way.
+                # Log explicitly so a feed-format change is visible instead of
+                # silently disabling the staleness gate.
+                logger.warning(
+                    f"filter_execution_ready: cannot parse snapshot timestamp "
+                    f"for {symbol} ({ts_raw!r}): {e}"
+                )
 
         bid = snap.get("bid")
         ask = snap.get("ask")
@@ -424,7 +431,7 @@ def filter_execution_ready(
 def build_universe(
     massive: MassiveClient,
     alpaca: AlpacaDataClient,
-) -> Tuple[List[str], UniverseDiagnostics, Dict[str, Tuple[float, float]], Dict[str, float]]:
+) -> Tuple[List[str], UniverseDiagnostics, Dict[str, Tuple[float, float]]]:
     """Run the base universe pipeline (Stages A + B + D).
 
     Stage C (data quality) is intentionally NOT run here because minute bars
@@ -432,7 +439,7 @@ def build_universe(
     after fetching signal bars, using ``filter_minute_data_quality()``.
 
     Returns:
-        (base_universe, diagnostics, adv_cache, atr_cache)
+        (base_universe, diagnostics, adv_cache)
     """
     diag = UniverseDiagnostics()
 
@@ -461,37 +468,33 @@ def build_universe(
     )
     logger.info(f"  Stage B-price: {diag.after_asset_type} -> {diag.after_price}")
 
-    # Stage B-adv: ADV filter using daily bars
-    logger.info("Universe Stage B: ADV filter...")
+    # Stage B-adv: build ADV cache from daily bars (sizing uses ADV_CAP_PCT)
+    logger.info("Universe Stage B: ADV cache build...")
     daily_bars = alpaca.get_daily_bars(
         price_passed,
-        days=max(config.ADV_LOOKBACK_DAYS, config.ATR_LOOKBACK_DAYS) + 5,
+        days=config.ADV_LOOKBACK_DAYS + 5,
     )
-    adv_passed, adv_cache, atr_cache = filter_adv(
-        price_passed, daily_bars, config.MIN_ADV_DOLLARS,
-        config.ADV_LOOKBACK_DAYS, diag,
+    adv_passed, adv_cache = filter_adv(
+        price_passed, daily_bars, config.ADV_LOOKBACK_DAYS, diag,
     )
     logger.info(f"  Stage B-adv: {diag.after_price} -> {diag.after_adv}")
 
     # Stage C: deferred — run by orchestrator at 3:48 after minute bars arrive
     diag.after_data_quality = len(adv_passed)
 
-    # Stage D: Fresh broker tradability check
-    # This is an independent call — NOT just re-checking Stage A.
-    # Catches symbols that became untradable since the Stage A fetch,
-    # or that Stage A's asset-type filter let through but the broker
-    # now reports as restricted.
-    logger.info("Universe Stage D: fresh broker tradability check...")
-    fresh_assets = alpaca.get_tradable_assets_full()
-    fresh_tradable_set: Set[str] = {
-        a["symbol"] for a in fresh_assets
+    # Stage D: Broker tradability check — reuses the Stage A asset list.
+    # The list is at most a couple of minutes old at this point and re-fetching
+    # adds an unnecessary round-trip on a payload of thousands of assets.
+    logger.info("Universe Stage D: broker tradability check (reusing Stage A asset list)...")
+    tradable_set: Set[str] = {
+        a["symbol"] for a in raw_assets
         if a.get("tradable") and a.get("status") == "active"
     }
-    final = filter_broker_tradable(adv_passed, fresh_tradable_set, diag)
+    final = filter_broker_tradable(adv_passed, tradable_set, diag)
     logger.info(f"  Stage D: {diag.after_adv} -> {diag.after_tradability}")
 
     logger.info(diag.summary())
-    return final, diag, adv_cache, atr_cache
+    return final, diag, adv_cache
 
 
 # ──────────────────────────────────────────────────────────────

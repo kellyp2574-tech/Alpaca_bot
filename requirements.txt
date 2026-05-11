@@ -1,18 +1,17 @@
-# Core trading
-alpaca-py>=0.21.0
-python-dotenv>=1.0.0
+# Combined Overnight Rebound Bot — runtime dependencies
+#
+# Lower bounds reflect the API surface we use today; upper bounds
+# left open intentionally so security patches install cleanly.
 
-# Market data
-yfinance>=0.2.31
-massive>=1.0.0
+# Alpaca REST + Massive HTTP
+requests>=2.28
 
-# Required by alpaca-py for live streaming (StockDataStream)
+# Alpaca trade_updates websocket (FillStream)
 websockets>=12.0
 
-# Data / utilities
-pandas>=2.0.0
-numpy>=1.24.0
-pydantic>=2.0.0
-requests>=2.28.0
-msgpack>=1.0.0
-sseclient-py>=1.7.0
+# .env loader for ALPACA_* / MASSIVE_API_KEY
+python-dotenv>=1.0
+
+# ── Test-only ────────────────────────────────────────────────
+# Used by test_audit_fixes.py. Safe to omit in production deploys.
+pytest>=8.0

@@ -1,11 +1,41 @@
-"""State management for gap momentum bot"""
+"""State management for the overnight bot."""
 import json
 import logging
 import os
+import tempfile
 from typing import Dict, Optional
 from bot import config
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """Write JSON to ``path`` atomically.
+
+    Strategy: serialize to a temp file in the same directory, fsync, then
+    os.replace() onto the target. This guarantees that a crash mid-write
+    cannot leave a half-written state file behind.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync not supported (e.g. some Windows mounts) — skip.
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup of the temp file before bubbling up.
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class StateManager:
@@ -20,7 +50,7 @@ class StateManager:
         os.makedirs(os.path.dirname(self.positions_file), exist_ok=True)
 
     def save_positions(self, positions: Dict):
-        """Save current positions to file"""
+        """Save current positions to file (atomic write)."""
         state = {}
         for symbol, pos in positions.items():
             if isinstance(pos, dict):
@@ -37,8 +67,7 @@ class StateManager:
                 }
 
         try:
-            with open(self.positions_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            _atomic_write_json(self.positions_file, state)
         except Exception as e:
             logger.error(f"Error saving positions: {e}")
 
@@ -74,11 +103,10 @@ class StateManager:
             os.remove(bot_state_file)
 
     def save_bot_state(self, state: dict):
-        """Save bot state (VIX, stages) to file"""
+        """Save bot state to file (atomic write)."""
         bot_state_file = os.path.join(self.state_dir, "bot_state.json")
         try:
-            with open(bot_state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            _atomic_write_json(bot_state_file, state)
         except Exception as e:
             logger.error(f"Error saving bot state: {e}")
 

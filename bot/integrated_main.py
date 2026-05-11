@@ -15,15 +15,18 @@ Daily Schedule (ET) — morning bot starts around 05:00 AM:
 MORNING (T+1 exits — positions from yesterday's 15:50 entries):
   05:00  Start, detect overnight positions from broker
   05:00, 05:15, 05:30, 05:45  Rolling premarket dynamic limit classification (decisive symbols only)
-  06:00  Final premarket classification for all unresolved symbols
-  09:25  Cancel any remaining premarket limits before open exits
-  09:30  Green/flat positions sell immediately; red positions get 1% trailing-stop orders
-  10:00  Cancel any remaining trailing orders; force-flatten anything still open
+  06:00  Final premarket classification for all unresolved symbols (runs once,
+         within the 06:00–06:02 cutoff window)
+  09:25  Cancel any remaining premarket limits, freeze broker exit plan
+  09:30  Submit batched market sells against the frozen plan
+         (ENABLE_FAST_OPEN_MARKET_EXIT=True; the alternative red-trail mode
+         is mutually exclusive and currently disabled)
+  09:45  V2 failsafe — verify broker is flat or force-flatten any stragglers
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca, $1–10, ADV sizing cap protects)
   15:50  Fetch latest 9:30-15:50 minute bars, build both MR and GDP candidates
-  15:50  Execute entries immediately after scoring
+  15:50  Daily-loss circuit breaker check, then execute entries
   16:00  Confirm positions held overnight, save state, done
 """
 import logging
@@ -84,6 +87,25 @@ def _parse_config_time(time_str: str) -> dt_time:
     return dt_time(int(parts[0]), int(parts[1]))
 
 
+# Hot windows where the main loop should tick at 1s for prompt action.
+# Outside these windows the loop sleeps up to 30s to save CPU and rate-limit
+# budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
+_HOT_WINDOWS_HHMM = (
+    (5, 0, 6, 2),     # Premarket dynamic-limit checkpoints (incl. final 06:00 trip)
+    (9, 24, 10, 5),   # Order cancel, 09:30 batch sells, fills, failsafe
+    (15, 29, 16, 1),  # Universe build, scoring, entries, EOD
+)
+
+
+def _is_hot_window(now_t: dt_time) -> bool:
+    """True if ``now_t`` falls inside any pre-defined hot window."""
+    cur = now_t.hour * 60 + now_t.minute
+    for sh, sm, eh, em in _HOT_WINDOWS_HHMM:
+        if (sh * 60 + sm) <= cur < (eh * 60 + em):
+            return True
+    return False
+
+
 class CombinedOvernightReboundBot:
     """Main bot orchestrator for combined MR_WIDE + GDP_BASE strategy"""
 
@@ -118,9 +140,7 @@ class CombinedOvernightReboundBot:
         self.premarket_dynamic_limits_done = False
         self.premarket_limit_order_ids: Dict[str, str] = {}
         self.premarket_decided_symbols: set = set()  # Track symbols already decided in rolling checks
-        # Legacy 20:00 overnight limit fields kept only for backward-compatible state loading.
-        self.overnight_limit_sells_done = False
-        self.overnight_limit_order_ids: Dict[str, str] = {}
+        self.premarket_checkpoints_done: set = set()  # Per-checkpoint completion guard (HH:MM strings)
         self.end_of_day_reports_done = False
 
         # Failsafe
@@ -146,6 +166,15 @@ class CombinedOvernightReboundBot:
             except Exception:
                 logger.critical("State save also failed after crash", exc_info=True)
             raise
+        finally:
+            # Always tear down the trade_updates websocket cleanly so the
+            # daemon thread doesn't keep the process alive on shutdown.
+            try:
+                stream = getattr(self.position_mgr, "fill_stream", None)
+                if stream is not None:
+                    stream.stop(timeout=2.0)
+            except Exception:
+                logger.warning("FillStream stop failed on shutdown", exc_info=True)
 
     def _validate_config(self):
         """Fail fast on config combinations that contradict the researched setup."""
@@ -168,6 +197,12 @@ class CombinedOvernightReboundBot:
                 f"current bot exits both at GDP_EXIT_TIME"
             )
         if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
+            if getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", False):
+                raise ValueError(
+                    "ENABLE_FAST_OPEN_MARKET_EXIT and ENABLE_RED_OPEN_TRAIL_EXIT are "
+                    "mutually exclusive — fast-exit wins at 09:30 but red-trail still "
+                    "forces the 10:00 failsafe schedule. Set exactly one to True."
+                )
             if _parse_config_time(config.RED_OPEN_TRAIL_FAILSAFE_TIME) <= _parse_config_time(config.GDP_EXIT_TIME):
                 raise ValueError(
                     "RED_OPEN_TRAIL_FAILSAFE_TIME must be after the 09:30 exit decision"
@@ -246,41 +281,57 @@ class CombinedOvernightReboundBot:
 
             # Gate morning exits to prevent after-market execution on restart
             if current_time < t_market_close and not self.morning_exits_done:
-                # Rolling premarket dynamic limit classification (05:00 → 06:00)
-                # At each 15-minute checkpoint, classify only "decisive" symbols.
-                # Leave unclear symbols unresolved for the next checkpoint.
+                # Rolling premarket dynamic limit classification (05:00 → 06:00).
+                # At each 15-minute checkpoint we classify only "decisive"
+                # symbols; unclear ones wait for the next checkpoint. The
+                # final 06:00 checkpoint must run too — that is when any
+                # remaining unresolved symbol gets a normal harvest limit.
+                #
+                # We run this block while ``current_time < t_premarket_cutoff``
+                # (06:02) so the 06:00 minute itself is included exactly once.
+                # Any checkpoint slot computed past 06:00 is clamped down to
+                # the 06:00 string so the dedup set still works correctly.
+                t_premarket_cutoff = dt_time(t_premarket_final.hour, t_premarket_final.minute + 2)
                 if (getattr(config, "ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS", False)
                         and not self.premarket_dynamic_limits_done
                         and current_time >= t_premarket_start
-                        and current_time < t_premarket_final):
-                    # Calculate which checkpoint we're at
+                        and current_time < t_premarket_cutoff):
                     minutes_since_start = (current_time.hour * 60 + current_time.minute) - (t_premarket_start.hour * 60 + t_premarket_start.minute)
                     checkpoint_num = minutes_since_start // t_premarket_interval
-                    checkpoint_time = dt_time(
-                        t_premarket_start.hour + checkpoint_num // 60,
-                        t_premarket_start.minute + checkpoint_num % 60
-                    )
-                    
-                    # If bot started after a checkpoint, run it immediately (catch-up)
-                    # Otherwise, only trigger if we're at a checkpoint time (within 1 minute tolerance)
-                    minutes_diff = (current_time.hour * 60 + current_time.minute) - (checkpoint_time.hour * 60 + checkpoint_time.minute)
-                    if minutes_diff > 1:
-                        # Bot started after this checkpoint - run it now as catch-up
-                        checkpoint_str = checkpoint_time.strftime("%H:%M")
-                        logger.info(f"PREMARKET CHECKPOINT CATCH-UP: {checkpoint_str} - running dynamic limit classification (started after checkpoint time)")
+                    checkpoint_minutes = (t_premarket_start.hour * 60 + t_premarket_start.minute) + checkpoint_num * t_premarket_interval
+
+                    # Clamp anything beyond the configured final to the final
+                    # checkpoint so 06:01 / 06:02 ticks still trigger the
+                    # canonical "06:00" run rather than inventing a new slot.
+                    final_minutes = t_premarket_final.hour * 60 + t_premarket_final.minute
+                    checkpoint_minutes = min(checkpoint_minutes, final_minutes)
+                    checkpoint_time = dt_time(checkpoint_minutes // 60, checkpoint_minutes % 60)
+                    checkpoint_str = checkpoint_time.strftime("%H:%M")
+
+                    # Per-checkpoint dedup: each HH:MM runs at most once per session.
+                    if checkpoint_str not in self.premarket_checkpoints_done:
+                        is_final = (checkpoint_minutes >= final_minutes)
+                        logger.info(
+                            f"PREMARKET CHECKPOINT: {checkpoint_str} - running dynamic limit classification"
+                            f"{' (FINAL)' if is_final else ''}"
+                        )
                         self._place_premarket_dynamic_limit_sells(decision_time_str=checkpoint_str)
-                    elif abs(minutes_diff) <= 1:
-                        # Bot is at checkpoint time - run normally
-                        checkpoint_str = checkpoint_time.strftime("%H:%M")
-                        logger.info(f"PREMARKET CHECKPOINT: {checkpoint_str} - running dynamic limit classification")
-                        self._place_premarket_dynamic_limit_sells(decision_time_str=checkpoint_str)
-                
-                # If bot started after 06:00 (final checkpoint time), skip premarket entirely
+                        self.premarket_checkpoints_done.add(checkpoint_str)
+                        # Once the final 06:00 slot has run, mark the whole
+                        # premarket window done so we don't keep re-entering.
+                        if is_final:
+                            self.premarket_dynamic_limits_done = True
+                            self._save_state()
+
+                # Bot started after the final-checkpoint cutoff: skip premarket entirely.
                 if (getattr(config, "ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS", False)
                         and not self.premarket_dynamic_limits_done
-                        and current_time >= t_premarket_final
+                        and current_time >= t_premarket_cutoff
                         and current_time < t_cancel_orders):
-                    logger.info(f"Bot started after {t_premarket_final.strftime('%H:%M')} - skipping premarket limits, proceeding to morning exits")
+                    logger.info(
+                        f"Bot started after {t_premarket_cutoff.strftime('%H:%M')} cutoff "
+                        f"- skipping premarket limits, proceeding to morning exits"
+                    )
                     self.premarket_dynamic_limits_done = True
                     self._save_state()
 
@@ -291,7 +342,6 @@ class CombinedOvernightReboundBot:
                     logger.warning("09:25 order cleanup: canceling all open orders before 09:30 exits")
                     self.position_mgr.cancel_all_open_orders()
                     self.premarket_limit_order_ids.clear()
-                    self.overnight_limit_order_ids.clear()
                     self.red_trail_order_ids.clear()
                     self.red_trail_symbols.clear()
                     self.morning_open_orders_cancelled = True
@@ -400,7 +450,11 @@ class CombinedOvernightReboundBot:
                     self._save_state()
                 break
 
-            time.sleep(1)
+            # Adaptive sleep: 1s during hot windows (open, close, premarket
+            # checkpoints) so transitions are prompt; 30s otherwise so the bot
+            # spends ~1500 ticks/day instead of ~36000 — drastically lower CPU
+            # and shared rate-limit pressure.
+            time.sleep(1 if _is_hot_window(current_time) else 30)
 
     # ════════════════════════════════════════════════════════════
     # MORNING EXIT METHODS
@@ -713,7 +767,7 @@ class CombinedOvernightReboundBot:
         logger.info("=" * 50)
 
         try:
-            final, diag, adv_cache, _atr_cache = build_universe(
+            final, diag, adv_cache = build_universe(
                 self.massive, self.alpaca,
             )
 
@@ -1029,17 +1083,53 @@ class CombinedOvernightReboundBot:
             return result
 
         try:
-            # Get account equity and buying power
-            equity = self.position_mgr.get_account_equity()
-            if not equity or equity <= 0:
+            # Single account fetch — was previously 2 calls here plus 1 per
+            # allocation in _adaptive_qty (~22 account calls per entry pass).
+            account = self.position_mgr.get_account()
+            if not account:
+                logger.error("Cannot fetch account — skipping entries")
+                self.entries_done = True
+                return
+            try:
+                equity = float(account.get("equity") or 0.0)
+                buying_power = float(account.get("buying_power") or 0.0)
+            except (TypeError, ValueError):
+                equity = 0.0
+                buying_power = 0.0
+            if equity <= 0:
                 logger.error("Cannot determine account equity — skipping entries")
                 self.entries_done = True
                 return
-
-            buying_power = self.position_mgr.get_total_capital()
-            if not buying_power or buying_power <= 0:
+            if buying_power <= 0:
                 logger.warning("Cannot determine buying power — falling back to equity")
                 buying_power = equity
+
+            # Daily loss circuit breaker — abort entries if today's PnL is worse
+            # than DAILY_LOSS_LIMIT_PCT. account['last_equity'] is yesterday's
+            # market-close equity, so today's drawdown is a clean comparison.
+            loss_limit = float(getattr(config, "DAILY_LOSS_LIMIT_PCT", 0.0) or 0.0)
+            if loss_limit > 0:
+                try:
+                    last_equity = float(account.get("last_equity") or 0.0)
+                except (TypeError, ValueError):
+                    last_equity = 0.0
+                if last_equity > 0:
+                    day_ret = (equity - last_equity) / last_equity
+                    if day_ret <= -loss_limit:
+                        logger.critical(
+                            f"DAILY LOSS CIRCUIT BREAKER TRIPPED — equity ${equity:,.2f} "
+                            f"vs last_equity ${last_equity:,.2f} = {day_ret:+.2%}; "
+                            f"limit -{loss_limit:.0%}. SKIPPING all entries today."
+                        )
+                        self.entries_done = True
+                        return
+                    logger.info(
+                        f"Daily PnL check OK: {day_ret:+.2%} (limit -{loss_limit:.0%})"
+                    )
+                else:
+                    logger.warning(
+                        "Daily loss check skipped — last_equity unavailable from account API"
+                    )
 
             deployable = min(buying_power, equity * config.MAX_LEVERAGE)
             logger.info(
@@ -1159,13 +1249,17 @@ class CombinedOvernightReboundBot:
             # Submit market buy orders
             total_deployed = 0.0
 
-            def _adaptive_qty(alloc: SleeveAllocation, bp_buffer: float = config.ENTRY_BP_BUFFER_PCT) -> int:
+            # Track buying power locally to avoid hitting /v2/account once per
+            # symbol. Decremented after each submission by the planned notional;
+            # reconciles with broker on submit failure (one fresh fetch then).
+            bp_remaining = buying_power
+
+            def _adaptive_qty(alloc: SleeveAllocation, bp_avail: float,
+                              bp_buffer: float = config.ENTRY_BP_BUFFER_PCT) -> int:
                 """Return shares clamped to current buying power using target_dollars."""
-                bp = self.position_mgr.get_total_capital()
-                if not bp or bp <= 0:
-                    return alloc.shares
-                max_notional = bp * bp_buffer
-                # Use target_dollars as the primary constraint, but cap at buying power
+                if bp_avail <= 0:
+                    return 0
+                max_notional = bp_avail * bp_buffer
                 target = min(alloc.target_dollars, max_notional)
                 price_ref = alloc.candidate.signal_price
                 if price_ref <= 0:
@@ -1190,30 +1284,30 @@ class CombinedOvernightReboundBot:
 
                 candidate = alloc.candidate
                 price_ref = candidate.signal_price
-                qty = _adaptive_qty(alloc)
+                qty = _adaptive_qty(alloc, bp_remaining)
 
                 # Pre-submit logging
                 planned_notional = qty * price_ref
-                bp_before = self.position_mgr.get_total_capital() or 0.0
                 logger.info(
                     f"ENTRY PLANNED {symbol}: qty={qty}, price_ref={price_ref:.4f}, "
-                    f"notional={planned_notional:,.2f}, bp_before={bp_before:,.2f}, "
+                    f"notional={planned_notional:,.2f}, bp_remaining={bp_remaining:,.2f}, "
                     f"sleeve={alloc.sleeve}, rank={alloc.rank}"
                 )
 
                 if qty < config.MIN_SHARES:
                     logger.warning(
                         f"ENTRY SKIP {symbol}: adaptive qty {qty} < {config.MIN_SHARES} min shares "
-                        f"(bp=${bp_before:,.2f}, price={price_ref:.4f})"
+                        f"(bp=${bp_remaining:,.2f}, price={price_ref:.4f})"
                     )
                     exec_diag.failed_submissions[symbol] = "bp_resize_below_min"
                     continue
 
                 buy_resp = self.position_mgr.submit_buy_order(symbol, qty)
                 if not buy_resp:
-                    # Retry once with fresh BP
+                    # Submit failed — refresh BP from broker once and retry smaller.
                     fresh_bp = self.position_mgr.get_total_capital()
                     if fresh_bp and fresh_bp > 0 and price_ref > 0:
+                        bp_remaining = fresh_bp  # resync local tracker
                         retry_qty = math.floor((fresh_bp * config.ENTRY_BP_BUFFER_PCT) / price_ref)
                         if retry_qty >= config.MIN_SHARES and retry_qty < qty:
                             logger.warning(
@@ -1234,6 +1328,8 @@ class CombinedOvernightReboundBot:
                     exec_diag.failed_submissions[symbol] = "no_order_id"
                     continue
 
+                # Decrement local BP tracker by the submitted notional.
+                bp_remaining = max(0.0, bp_remaining - qty * price_ref)
                 exec_diag.submitted_symbols.append(symbol)
                 submitted_orders.append((order_id, alloc, qty, candidate))
 
@@ -1961,107 +2057,6 @@ class CombinedOvernightReboundBot:
             # Save state after each checkpoint to track decided symbols
             self._save_state()
 
-    def _place_overnight_limit_sells(self):
-        """20:00: place resting limit sells for all overnight positions.
-
-        Limit formula:
-            base = max(today_open_price, entry_price * (1 + target_gain_pct))
-            if current_price > base: limit = current_price * (1 + current_price_premium_pct)
-        The 09:25 cleanup cancels these orders before the normal 09:30 exit path.
-        """
-        if self.overnight_limit_sells_done:
-            logger.info("OVERNIGHT LIMITS: already placed; skipping duplicate call")
-            return
-
-        self.position_mgr.reconcile_local_positions_from_broker()
-        symbols = list(self.position_mgr.positions.keys())
-        if not symbols:
-            logger.info("OVERNIGHT LIMITS: no positions to place limits for")
-            return
-
-        broker_positions = self.position_mgr.get_broker_positions()
-        if broker_positions is None:
-            logger.error("OVERNIGHT LIMITS: broker position read failed; skipping limit placement")
-            return
-        broker_by_symbol = {
-            str(p.get("symbol", "")).upper(): p
-            for p in broker_positions
-            if p.get("symbol")
-        }
-
-        snapshots = self.alpaca.get_snapshots(symbols)
-        placed = 0
-        skipped = 0
-
-        target_gain = getattr(config, "OVERNIGHT_LIMIT_TARGET_GAIN_PCT", 0.025)
-        current_premium = getattr(config, "OVERNIGHT_LIMIT_CURRENT_PRICE_PREMIUM_PCT", 0.005)
-        tif = getattr(config, "OVERNIGHT_LIMIT_TIME_IN_FORCE", "gtc")
-        extended = getattr(config, "OVERNIGHT_LIMIT_EXTENDED_HOURS", False)
-
-        for symbol in symbols:
-            pos = self.position_mgr.positions.get(symbol)
-            broker_pos = broker_by_symbol.get(symbol.upper())
-            if not pos or not broker_pos:
-                skipped += 1
-                logger.warning(f"OVERNIGHT LIMIT {symbol}: missing local/broker position; skipping")
-                continue
-
-            try:
-                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
-            except (TypeError, ValueError):
-                qty = int(pos.quantity or 0)
-            if qty <= 0:
-                skipped += 1
-                logger.warning(f"OVERNIGHT LIMIT {symbol}: qty <= 0; skipping")
-                continue
-
-            snap = snapshots.get(symbol, {}) if snapshots else {}
-            today_open = snap.get("open") or 0.0
-            current_price = snap.get("last_price") or snap.get("close") or 0.0
-            try:
-                today_open = float(today_open or 0.0)
-                current_price = float(current_price or 0.0)
-            except (TypeError, ValueError):
-                today_open = 0.0
-                current_price = 0.0
-
-            entry_price = float(getattr(pos, "entry_price", 0.0) or broker_pos.get("avg_entry_price", 0.0) or 0.0)
-            if entry_price <= 0:
-                skipped += 1
-                logger.warning(f"OVERNIGHT LIMIT {symbol}: missing entry price; skipping")
-                continue
-
-            base_limit = entry_price * (1.0 + target_gain)
-            if today_open > 0:
-                base_limit = max(base_limit, today_open)
-
-            limit_price = base_limit
-            if current_price > base_limit:
-                limit_price = current_price * (1.0 + current_premium)
-
-            limit_price = self.position_mgr.round_limit_price(limit_price)
-            resp = self.position_mgr._submit_sell_order(
-                symbol=symbol,
-                qty=qty,
-                order_type="limit",
-                limit_price=limit_price,
-                time_in_force=tif,
-                extended_hours=extended,
-            )
-            if resp and resp.get("id"):
-                self.overnight_limit_order_ids[symbol] = resp["id"]
-                placed += 1
-                logger.info(
-                    f"OVERNIGHT LIMIT {symbol}: qty={qty}, entry={entry_price:.4f}, "
-                    f"open={today_open:.4f}, current={current_price:.4f}, limit={limit_price:.4f}, "
-                    f"tif={tif}, order_id={resp['id']}"
-                )
-            else:
-                skipped += 1
-                logger.error(f"OVERNIGHT LIMIT {symbol}: submit failed")
-
-        logger.warning(f"OVERNIGHT LIMITS COMPLETE: placed={placed}, skipped={skipped}")
-
     def _save_end_of_day_reports(self):
         """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
         try:
@@ -2167,9 +2162,7 @@ class CombinedOvernightReboundBot:
                 "premarket_dynamic_limits_done": self.premarket_dynamic_limits_done,
                 "premarket_limit_order_ids": self.premarket_limit_order_ids,
                 "premarket_decided_symbols": list(self.premarket_decided_symbols),
-                # Legacy 20:00 fields kept for backward compatibility
-                "overnight_limit_sells_done": self.overnight_limit_sells_done,
-                "overnight_limit_order_ids": self.overnight_limit_order_ids,
+                "premarket_checkpoints_done": list(self.premarket_checkpoints_done),
                 "end_of_day_reports_done": self.end_of_day_reports_done,
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
@@ -2220,9 +2213,7 @@ class CombinedOvernightReboundBot:
         self.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
         self.premarket_limit_order_ids = bot_state.get("premarket_limit_order_ids", {})
         self.premarket_decided_symbols = set(bot_state.get("premarket_decided_symbols", []))
-        # Legacy 20:00 fields kept for backward compatibility
-        self.overnight_limit_sells_done = bot_state.get("overnight_limit_sells_done", False)
-        self.overnight_limit_order_ids = bot_state.get("overnight_limit_order_ids", {})
+        self.premarket_checkpoints_done = set(bot_state.get("premarket_checkpoints_done", []))
         self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
 
         # Load positions

@@ -124,40 +124,6 @@ class AlpacaDataClient:
             "timestamp": latest_trade.get("t"),
         }
 
-    def get_latest_trade(self, symbol: str) -> Optional[dict]:
-        """Get latest trade for a single symbol"""
-        url = f"{self.data_url}/v2/stocks/{symbol}/trades/latest"
-        params = {"feed": self.feed}
-
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            trade = data.get("trade", {})
-
-            return {
-                "symbol": symbol,
-                "price": trade.get("p"),
-                "size": trade.get("s"),
-                "timestamp": trade.get("t"),
-            }
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting latest trade for {symbol}: {e}")
-            return None
-
-    # get_regular_session_open() removed - was unused and misleading
-    # The implementation used limit=1 without time filtering, which doesn't reliably
-    # return the first RTH quote after 9:30. If needed in future, reimplement with
-    # proper start/end time parameters to filter for RTH session.
-
-    def get_tradable_assets(self) -> List[str]:
-        """
-        Get list of tradable asset symbols from Alpaca API.
-        Used as fallback when Massive universe build fails.
-        """
-        full = self.get_tradable_assets_full()
-        return [a.get("symbol") for a in full if a.get("symbol")]
-
     def get_tradable_assets_full(self) -> List[dict]:
         """
         Get full asset dicts from Alpaca API (symbol, name, exchange, class, etc.).
@@ -306,81 +272,6 @@ class AlpacaDataClient:
         avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
         avg_close = sum(closes) / len(closes) if closes else 0.0
         return avg_vol, avg_vol * avg_close
-
-    @staticmethod
-    def calculate_atr(daily_bars: List[dict], period: int = 14) -> float:
-        """Calculate Average True Range from daily bars.
-
-        ATR = SMA of True Range over `period` bars.
-        True Range = max(H-L, |H-prev_C|, |L-prev_C|)
-        """
-        if len(daily_bars) < 2:
-            return 0.0
-        recent = daily_bars[-(period + 1):] if len(daily_bars) > period + 1 else daily_bars
-        true_ranges = []
-        for j in range(1, len(recent)):
-            h = recent[j].get("h", 0)
-            l = recent[j].get("l", 0)
-            prev_c = recent[j - 1].get("c", 0)
-            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-            true_ranges.append(tr)
-        return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
-
-    # ═══════════════════════════════════════════════════
-    # Overnight Momentum — Benchmark & sector ETF returns
-    # ═══════════════════════════════════════════════════
-
-    def get_intraday_etf_returns(
-        self, etf_symbols: List[str], bar_date: str
-    ) -> Dict[str, float]:
-        """Get intraday returns (open to ~3:30 PM) for benchmark/sector ETFs.
-
-        Args:
-            etf_symbols: List of ETF symbols (e.g., ["SPY", "XLK", "XLF", ...])
-            bar_date: Date string "YYYY-MM-DD"
-
-        Returns: {symbol: intraday_return_pct}
-        """
-        start = f"{bar_date}T09:30:00-04:00"
-        end = f"{bar_date}T15:30:00-04:00"
-
-        returns = {}
-        # Fetch snapshots for simplicity (open and current price)
-        snapshots = self.get_snapshots(etf_symbols)
-        for sym, snap in snapshots.items():
-            open_p = snap.get("open")
-            last_p = snap.get("last_price") or snap.get("close")
-            if open_p and last_p and open_p > 0:
-                returns[sym] = (last_p - open_p) / open_p
-            else:
-                returns[sym] = 0.0
-
-        logger.info(f"ETF returns: {returns}")
-        return returns
-
-    def get_volume_profile_60min(
-        self, minute_bars: List[dict]
-    ) -> Tuple[int, float]:
-        """Compute volume in last 60 minutes and average 60-min bucket volume.
-
-        Used by the 3:50 PM signal model — last 60 minutes = 2:50-3:50 PM.
-
-        Args:
-            minute_bars: List of 1-minute bars for a single symbol, sorted by time.
-
-        Returns: (volume_last_60min, avg_60min_volume)
-        """
-        if not minute_bars or len(minute_bars) < 2:
-            return 0, 0.0
-
-        last_60 = minute_bars[-60:] if len(minute_bars) >= 60 else minute_bars
-        vol_last_60 = sum(b.get("v", 0) for b in last_60)
-
-        total_vol = sum(b.get("v", 0) for b in minute_bars)
-        num_60min_buckets = max(1, len(minute_bars) / 60)
-        avg_60min_vol = total_vol / num_60min_buckets
-
-        return vol_last_60, avg_60min_vol
 
     # ═══════════════════════════════════════════════════
     # Overnight Momentum — Dedicated signal bar fetch

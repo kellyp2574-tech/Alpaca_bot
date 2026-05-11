@@ -10,9 +10,10 @@ Pipeline:
 """
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from bot import config
+from bot.scorer_utils import compute_intraday_base_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -34,35 +35,6 @@ class MeanReversionCandidate:
     close_position: float = 0.0        # 0.0 = at low, 1.0 = at high
     late_drop_1530_1550: float = 0.0   # return from ~15:30 bar to signal
     selection_score: float = 0.0
-
-
-def _bar_near_1530(bars: List[dict]) -> Optional[dict]:
-    """Return the last bar at or before 15:30 ET.
-
-    Tries timestamp-based lookup first (handles gaps in IEX data).
-    Falls back to index approximation only if timestamps are absent.
-    """
-    if not bars:
-        return None
-
-    # Timestamp-based: walk backwards to find last bar at or before 15:30
-    for bar in reversed(bars):
-        ts = bar.get("t", "")
-        if not ts:
-            break  # no timestamps on any bar — fall through to index fallback
-        # Timestamps are ISO-8601 e.g. "2026-05-02T15:31:00-04:00"
-        # Extract HH:MM from the time portion
-        try:
-            time_part = ts[11:16]  # "HH:MM"
-            if time_part <= "15:30":
-                return bar
-        except (IndexError, TypeError):
-            break
-
-    # Index fallback: assume continuous bars ending at 15:50
-    if len(bars) >= 21:
-        return bars[-21]
-    return bars[0]
 
 
 def build_mean_reversion_candidates(
@@ -92,50 +64,26 @@ def build_mean_reversion_candidates(
             skipped_bars += 1
             continue
 
-        open_price = bars[0].get("o", 0)
-        signal_price = bars[-1].get("c", 0)
-        high_price = max((b.get("h", 0) for b in bars), default=0)
-        low_price = min((b.get("l", 0) for b in bars if b.get("l", 0) > 0), default=0)
-        total_volume = sum(b.get("v", 0) for b in bars)
-
-        if open_price <= 0 or signal_price <= 0 or high_price <= 0 or low_price <= 0:
+        adv_shares, adv_dollars = adv_cache.get(symbol, (0.0, 0.0))
+        m = compute_intraday_base_metrics(bars, adv_shares)
+        if m is None:
             skipped_price += 1
             continue
 
-        adv_shares, adv_dollars = adv_cache.get(symbol, (0.0, 0.0))
-
-        c = MeanReversionCandidate(
+        candidates.append(MeanReversionCandidate(
             symbol=symbol,
-            signal_price=signal_price,
-            open_price_930=open_price,
-            high_930_to_signal=high_price,
-            low_930_to_signal=low_price,
-            volume_930_to_signal=total_volume,
+            signal_price=m.signal_price,
+            open_price_930=m.open_price,
+            high_930_to_signal=m.high_price,
+            low_930_to_signal=m.low_price,
+            volume_930_to_signal=m.total_volume,
             adv_20d=adv_shares,
             adv_dollars=adv_dollars,
-        )
-
-        c.day_return = (signal_price / open_price) - 1.0
-
-        # Volume ratio: today partial-day vs expected partial-day volume.
-        # 0.70 factor adjusts ADV (full day) to 9:30-3:50 window (~82% of RTH).
-        if adv_shares > 0:
-            c.volume_ratio = total_volume / (adv_shares * 0.70)
-
-        # Close position within today's range: 0.0 = at low, 1.0 = at high
-        day_range = high_price - low_price
-        if day_range > 0:
-            c.close_position = (signal_price - low_price) / day_range
-        else:
-            c.close_position = 1.0
-
-        # Late-day momentum: return from ~15:30 bar to signal close
-        bar_1530 = _bar_near_1530(bars)
-        price_1530 = bar_1530.get("c", 0) if bar_1530 else 0
-        if price_1530 > 0:
-            c.late_drop_1530_1550 = (signal_price / price_1530) - 1.0
-
-        candidates.append(c)
+            day_return=m.day_return,
+            volume_ratio=m.volume_ratio,
+            close_position=m.close_position,
+            late_drop_1530_1550=m.late_return_1530_signal,
+        ))
 
     logger.info(
         f"build_mean_reversion_candidates: {len(candidates)} built, "

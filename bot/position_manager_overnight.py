@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import requests
 from bot import config
+from bot.fill_stream import FillStream
 from bot.market_data import AlpacaDataClient
 from bot.rate_limiter import create_alpaca_session
 
@@ -50,6 +51,22 @@ class PositionManager:
         self._max_exit_failures = 3
         self._exit_cooldown_seconds = 60
 
+        # Push-fill side-channel: subscribes to /stream trade_updates so
+        # get_order_fill can short-circuit REST polling when the websocket
+        # already saw a terminal event. Falls back to polling cleanly if
+        # the stream is down.
+        self.fill_stream: Optional[FillStream] = None
+        try:
+            self.fill_stream = FillStream(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+            )
+            self.fill_stream.start()
+        except Exception:
+            logger.exception("FillStream init failed — falling back to REST polling only")
+            self.fill_stream = None
+
     # ────────────────────────────────────────────────────────
     # Position loading / account queries
     # ────────────────────────────────────────────────────────
@@ -72,28 +89,46 @@ class PositionManager:
             except Exception as e:
                 logger.error(f"Failed to restore position {symbol}: {e}")
 
-    def get_account_equity(self) -> float:
-        """Get current account equity"""
+    def get_account(self) -> Optional[dict]:
+        """Fetch the full account dict from /v2/account (single API call).
+
+        Returns the raw JSON dict on success, None on error. Use this when
+        you need both equity and buying_power to avoid two account calls.
+        """
         url = f"{self.base_url}/v2/account"
         try:
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            data = response.json()
-            return float(data.get("equity", 0))
+            return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting account equity: {e}")
+            logger.error(f"Error getting account: {e}")
+            return None
+
+    def get_account_equity(self) -> float:
+        """Get current account equity (single API call)."""
+        data = self.get_account()
+        if not data:
+            return 0.0
+        try:
+            return float(data.get("equity", 0))
+        except (TypeError, ValueError):
             return 0.0
 
     def get_total_capital(self) -> float:
-        """Get total buying power from account for deployment tracking"""
-        url = f"{self.base_url}/v2/account"
+        """Get total buying power from account (single API call)."""
+        data = self.get_account()
+        if not data:
+            return 0.0
         try:
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            account_data = response.json()
-            return float(account_data.get("buying_power", 0))
-        except requests.exceptions.RequestException:
-            return self.get_account_equity()
+            bp = float(data.get("buying_power", 0))
+        except (TypeError, ValueError):
+            bp = 0.0
+        if bp > 0:
+            return bp
+        try:
+            return float(data.get("equity", 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def get_position_count(self) -> int:
         return len(self.positions)
@@ -324,16 +359,63 @@ class PositionManager:
             logger.error(f"Error canceling order {order_id}: {e}")
             return False
 
-    def get_order_fill(self, order_id: str, max_wait: int = 30, allow_partial_cancel: bool = True) -> Optional[dict]:
-        """Poll order until filled, partially filled, or timeout.
+    def _stream_terminal_to_fill(self, order_id: str, evt: dict) -> Optional[dict]:
+        """Translate a FillStream terminal event into the legacy fill dict
+        that callers expect from ``get_order_fill``.
 
-        On partial fill, cancel residual immediately inside this function,
-        then re-read order state to return final filled quantity.
+        Returns None if the terminal had zero fill (i.e. plain cancel/reject),
+        matching the existing REST-polling contract.
         """
+        status = evt.get("status") or evt.get("event")
+        filled_qty = float(evt.get("filled_qty") or 0)
+        filled_avg = evt.get("filled_avg_price")
+        if filled_qty > 0 and filled_avg:
+            normalised_status = "filled" if status == "filled" else "partially_filled"
+            return {
+                "order_id": order_id,
+                "filled_qty": filled_qty,
+                "filled_avg_price": float(filled_avg),
+                "status": normalised_status,
+            }
+        return None
+
+    def get_order_fill(self, order_id: str, max_wait: int = 30, allow_partial_cancel: bool = True) -> Optional[dict]:
+        """Wait for an order to reach a terminal state.
+
+        Strategy:
+        1. If the trade_updates websocket already cached a terminal event
+           for this order, return it immediately (sub-second latency, zero
+           REST calls).
+        2. Otherwise poll /v2/orders/{id} as a fallback, with the existing
+           partial-fill-cancel logic preserved.
+        """
+        # Fast path: the websocket may already have recorded a terminal.
+        if self.fill_stream is not None:
+            cached = self.fill_stream.get_terminal_event(order_id)
+            if cached is not None:
+                fill = self._stream_terminal_to_fill(order_id, cached)
+                if fill is not None:
+                    return fill
+                # Cached terminal but no fill (canceled/rejected with zero qty)
+                if cached.get("status") in ("canceled", "expired", "rejected"):
+                    return None
+
         url = f"{self.base_url}/v2/orders/{order_id}"
         start_time = datetime.now()
 
         while (datetime.now() - start_time).total_seconds() < max_wait:
+            # Stream re-check: avoids waking up to make a REST call when the
+            # websocket has already reported the terminal state since the
+            # previous iteration.
+            if self.fill_stream is not None:
+                cached = self.fill_stream.get_terminal_event(order_id)
+                if cached is not None:
+                    fill = self._stream_terminal_to_fill(order_id, cached)
+                    if fill is not None:
+                        return fill
+                    if cached.get("status") in ("canceled", "expired", "rejected"):
+                        return None
+
             try:
                 response = self.session.get(url, timeout=10)
                 response.raise_for_status()
@@ -768,6 +850,35 @@ class PositionManager:
                 if not symbol or qty <= 0:
                     continue
 
+                # Pull a fallback price from the broker position itself —
+                # current_price / lastday_price / avg_entry_price — so Layer
+                # 2/3 can still place a sane limit order if the live snapshot
+                # fetch fails. Without this, a snapshot outage caused the
+                # failsafe to silently skip the price-based layers.
+                broker_fallback_price: Optional[float] = None
+                for key in ("current_price", "lastday_price", "avg_entry_price"):
+                    raw = pos.get(key)
+                    try:
+                        v = float(raw) if raw is not None else 0.0
+                    except (TypeError, ValueError):
+                        v = 0.0
+                    if v > 0:
+                        broker_fallback_price = v
+                        break
+
+                def _resolve_price() -> Optional[float]:
+                    """Live snapshot first; fall back to broker-position price."""
+                    px = self._get_last_price(symbol)
+                    if px and px > 0:
+                        return float(px)
+                    if broker_fallback_price is not None:
+                        logger.warning(
+                            f"FAILSAFE {symbol}: snapshot unavailable, "
+                            f"using broker fallback price {broker_fallback_price:.4f}"
+                        )
+                        return broker_fallback_price
+                    return None
+
                 remaining_qty = qty
                 total_filled = 0
 
@@ -789,9 +900,9 @@ class PositionManager:
 
                 # Layer 2: Limit sell at -3%
                 if remaining_qty > 0:
-                    last_price = self._get_last_price(symbol)
-                    if last_price and last_price > 0:
-                        limit_price = self.round_limit_price(last_price * 0.97)
+                    ref_price = _resolve_price()
+                    if ref_price and ref_price > 0:
+                        limit_price = self.round_limit_price(ref_price * 0.97)
                         logger.warning(f"FAILSAFE L2 {symbol}: trying limit sell {remaining_qty} @ {limit_price:.4f}")
                         sell_resp = self._submit_sell_order(symbol, remaining_qty, "limit", limit_price)
                         if sell_resp:
@@ -803,14 +914,47 @@ class PositionManager:
                                     filled = int(fill["filled_qty"])
                                     total_filled += filled
                                     remaining_qty -= filled
+                    else:
+                        logger.error(
+                            f"FAILSAFE L2 {symbol}: no price available "
+                            f"(snapshot + broker fallback both failed) — skipping to L3 market"
+                        )
 
-                # Layer 3: Limit sell at -5%, half then rest
+                # Layer 3: Limit sell at -5%, half then rest. If we have no
+                # reference price at all, escalate to a half/half market sell
+                # rather than giving up silently.
                 if remaining_qty > 0:
-                    last_price = self._get_last_price(symbol) or last_price
-                    if last_price and last_price > 0:
-                        limit_price = self.round_limit_price(last_price * 0.95)
-                        half_qty = max(1, remaining_qty // 2)
+                    ref_price = _resolve_price()
+                    half_qty = max(1, remaining_qty // 2)
+
+                    if ref_price and ref_price > 0:
+                        limit_price = self.round_limit_price(ref_price * 0.95)
+                        logger.warning(
+                            f"FAILSAFE L3 {symbol}: limit sell half {half_qty} @ {limit_price:.4f}"
+                        )
                         sell_resp = self._submit_sell_order(symbol, half_qty, "limit", limit_price)
+                    else:
+                        logger.error(
+                            f"FAILSAFE L3 {symbol}: still no price — escalating to market sell half {half_qty}"
+                        )
+                        limit_price = None
+                        sell_resp = self._submit_sell_order(symbol, half_qty)
+
+                    if sell_resp:
+                        order_id = sell_resp.get("id")
+                        if order_id:
+                            summary["closes_submitted"] += 1
+                            fill = self.get_order_fill(order_id, max_wait=15)
+                            if fill:
+                                filled = int(fill["filled_qty"])
+                                total_filled += filled
+                                remaining_qty -= filled
+
+                    if remaining_qty > 0:
+                        if limit_price is not None:
+                            sell_resp = self._submit_sell_order(symbol, remaining_qty, "limit", limit_price)
+                        else:
+                            sell_resp = self._submit_sell_order(symbol, remaining_qty)
                         if sell_resp:
                             order_id = sell_resp.get("id")
                             if order_id:
@@ -820,18 +964,6 @@ class PositionManager:
                                     filled = int(fill["filled_qty"])
                                     total_filled += filled
                                     remaining_qty -= filled
-
-                        if remaining_qty > 0:
-                            sell_resp = self._submit_sell_order(symbol, remaining_qty, "limit", limit_price)
-                            if sell_resp:
-                                order_id = sell_resp.get("id")
-                                if order_id:
-                                    summary["closes_submitted"] += 1
-                                    fill = self.get_order_fill(order_id, max_wait=15)
-                                    if fill:
-                                        filled = int(fill["filled_qty"])
-                                        total_filled += filled
-                                        remaining_qty -= filled
 
                 if total_filled > 0:
                     summary["fills_confirmed"] += 1
