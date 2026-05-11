@@ -85,13 +85,13 @@ V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
 
 # ═══════════════════════════════════════════════════
-# 06:00 IEX-aware dynamic premarket limit management
+# Rolling premarket dynamic limit management (05:00 → 06:00)
 # ═══════════════════════════════════════════════════
 # The old 20:00 blanket overnight limit workflow is disabled. The bot should
-# start around 05:55, classify each overnight position at 06:00 using sparse
-# IEX premarket bars, and place selective extended-hours DAY limit sells.
-# Any remaining limits are canceled at MORNING_CANCEL_OPEN_ORDERS_TIME before
-# the normal 09:30 exit/trailing-stop path.
+# start around 05:00 and perform rolling premarket classification at 15-minute
+# intervals. Only "decisive" symbols are acted on early; unclear symbols wait for
+# the final 06:00 checkpoint. Any remaining limits are canceled at
+# MORNING_CANCEL_OPEN_ORDERS_TIME before the normal 09:30 exit/trailing-stop path.
 ENABLE_OVERNIGHT_LIMIT_SELLS = False          # legacy 20:00 workflow disabled
 OVERNIGHT_LIMIT_SELL_TIME = "20:00"           # legacy; unused when disabled
 OVERNIGHT_LIMIT_TARGET_GAIN_PCT = 0.025       # legacy; unused when disabled
@@ -100,7 +100,9 @@ OVERNIGHT_LIMIT_TIME_IN_FORCE = "gtc"
 OVERNIGHT_LIMIT_EXTENDED_HOURS = False
 
 ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS = True
-PREMARKET_DYNAMIC_LIMIT_TIME = "06:00"
+PREMARKET_DYNAMIC_START_TIME = "05:00"
+PREMARKET_DYNAMIC_FINAL_TIME = "06:00"
+PREMARKET_DYNAMIC_CHECK_INTERVAL_MINUTES = 15
 PREMARKET_DYNAMIC_DATA_FEED = "iex"
 PREMARKET_DYNAMIC_LIMIT_TIME_IN_FORCE = "day"
 PREMARKET_DYNAMIC_LIMIT_EXTENDED_HOURS = True

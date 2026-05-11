@@ -10,11 +10,12 @@ Sleeve 2: GDP_BASE / MOM_CLEAN (Green-Day Pullback)
 
 Production allocation: static 70/30 MR/GDP, 10% max single-name cap.
 
-Daily Schedule (ET) — morning bot starts around 05:55 AM:
+Daily Schedule (ET) — morning bot starts around 05:00 AM:
 
 MORNING (T+1 exits — positions from yesterday's 15:50 entries):
-  05:55  Start, detect overnight positions from broker
-  06:00  IEX premarket dynamic limit classification; place selective limit sells
+  05:00  Start, detect overnight positions from broker
+  05:00, 05:15, 05:30, 05:45  Rolling premarket dynamic limit classification (decisive symbols only)
+  06:00  Final premarket classification for all unresolved symbols
   09:25  Cancel any remaining premarket limits before open exits
   09:30  Green/flat positions sell immediately; red positions get 1% trailing-stop orders
   10:00  Cancel any remaining trailing orders; force-flatten anything still open
@@ -115,6 +116,7 @@ class CombinedOvernightReboundBot:
         self.morning_open_orders_cancelled = False
         self.premarket_dynamic_limits_done = False
         self.premarket_limit_order_ids: Dict[str, str] = {}
+        self.premarket_decided_symbols: set = set()  # Track symbols already decided in rolling checks
         # Legacy 20:00 overnight limit fields kept only for backward-compatible state loading.
         self.overnight_limit_sells_done = False
         self.overnight_limit_order_ids: Dict[str, str] = {}
@@ -209,7 +211,9 @@ class CombinedOvernightReboundBot:
         t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:50
         t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
         t_cancel_orders = _parse_config_time(getattr(config, "MORNING_CANCEL_OPEN_ORDERS_TIME", "09:25"))
-        t_premarket_limit = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_LIMIT_TIME", "06:00"))
+        t_premarket_start = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_START_TIME", "05:00"))
+        t_premarket_final = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_FINAL_TIME", "06:00"))
+        t_premarket_interval = getattr(config, "PREMARKET_DYNAMIC_CHECK_INTERVAL_MINUTES", 15)
         t_market_close = dt_time(16, 0)
 
         # If starting after failsafe time with positions, flatten immediately
@@ -225,9 +229,9 @@ class CombinedOvernightReboundBot:
             self.morning_exits_done = True
 
         # After market close there is no 20:00 limit workflow anymore.
-        # The bot should be restarted around 05:55 for the 06:00 dynamic limit decision.
+        # The bot should be restarted around 05:00 for the 05:00-06:00 rolling premarket dynamic limits.
         if current_time >= t_market_close:
-            logger.info("Started after market close — nothing to do until the 05:55/06:00 premarket run")
+            logger.info("Started after market close — nothing to do until the 05:00-06:00 premarket run")
             return
 
         # Main event loop
@@ -241,15 +245,25 @@ class CombinedOvernightReboundBot:
 
             # Gate morning exits to prevent after-market execution on restart
             if current_time < t_market_close and not self.morning_exits_done:
-                # 06:00 — IEX premarket dynamic limit classification.
-                # This replaces the old 20:00 blanket overnight limit workflow.
+                # Rolling premarket dynamic limit classification (05:00 → 06:00)
+                # At each 15-minute checkpoint, classify only "decisive" symbols.
+                # Leave unclear symbols unresolved for the next checkpoint.
                 if (getattr(config, "ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS", False)
                         and not self.premarket_dynamic_limits_done
-                        and current_time >= t_premarket_limit
+                        and current_time >= t_premarket_start
                         and current_time < t_cancel_orders):
-                    self._place_premarket_dynamic_limit_sells()
-                    self.premarket_dynamic_limits_done = True
-                    self._save_state()
+                    # Calculate which checkpoint we're at
+                    minutes_since_start = (current_time.hour * 60 + current_time.minute) - (t_premarket_start.hour * 60 + t_premarket_start.minute)
+                    checkpoint_num = minutes_since_start // t_premarket_interval
+                    checkpoint_time = dt_time(
+                        t_premarket_start.hour + checkpoint_num // 60,
+                        t_premarket_start.minute + checkpoint_num % 60
+                    )
+                    # Only trigger if we're at a checkpoint time (within 1 minute tolerance)
+                    if abs((current_time.hour * 60 + current_time.minute) - (checkpoint_time.hour * 60 + checkpoint_time.minute)) <= 1:
+                        checkpoint_str = checkpoint_time.strftime("%H:%M")
+                        logger.info(f"PREMARKET CHECKPOINT: {checkpoint_str} - running dynamic limit classification")
+                        self._place_premarket_dynamic_limit_sells(decision_time_str=checkpoint_str)
 
                 # 09:25 — cancel any resting premarket limit/trailing orders before normal exits.
                 # Run regardless of local position state for safety.
@@ -1554,26 +1568,94 @@ class CombinedOvernightReboundBot:
 
         return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "iex_negative_pop_harvest_3pct"}
 
-    def _place_premarket_dynamic_limit_sells(self):
-        """06:00: classify overnight positions and place selective IEX-aware limit sells.
+    def _is_decisive_premarket_signal(
+        self,
+        decision_time: str,
+        final_time: str,
+        current_return: float,
+        distance_from_high: float,
+        trend_from_first_bar: float,
+        minutes_traded: int,
+        last_bar_age_minutes: float = 999,
+        sleeve: str = "UNKNOWN",
+    ) -> tuple[bool, str]:
+        """
+        Decisive = act now.
+        Not decisive = leave unresolved and check again in 15 minutes.
+        """
+        # Final checkpoint: no more waiting.
+        if decision_time >= final_time:
+            return True, "final_checkpoint"
+
+        fresh = last_bar_age_minutes <= getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
+
+        # 1. Obvious monster runner.
+        # Even sparse IEX is enough here.
+        if current_return >= 0.10 and minutes_traded >= 1 and fresh:
+            return True, "decisive_very_high_return"
+
+        # 2. Strong runner.
+        # Needs a little confirmation, but not dense tape.
+        if current_return >= 0.05 and minutes_traded >= 2 and fresh:
+            return True, "decisive_high_return"
+
+        # 3. Moderate runner candidate: already up, near high, building.
+        if (
+            current_return >= 0.02
+            and distance_from_high > -0.01
+            and trend_from_first_bar > 0
+            and minutes_traded >= 2
+            and fresh
+        ):
+            return True, "decisive_moderate_near_high_building"
+
+        # 4. Clear harvest / fade signal.
+        # It had strength but is already meaningfully below its premarket high.
+        if (
+            current_return >= 0.02
+            and distance_from_high < -0.03
+            and minutes_traded >= 2
+            and fresh
+        ):
+            return True, "decisive_moderate_fading"
+
+        # 5. MR-specific harvest signal.
+        # MR does not need as much upside continuation evidence to justify taking profit.
+        if (
+            sleeve.upper() == "MR"
+            and current_return >= 0.03
+            and minutes_traded >= 2
+            and fresh
+        ):
+            return True, "decisive_mr_harvest"
+
+        return False, "not_decisive_wait"
+
+    def _place_premarket_dynamic_limit_sells(self, decision_time_str: str = None):
+        """Rolling premarket dynamic limit classification (05:00 → 06:00).
+
+        At each 15-minute checkpoint (05:00, 05:15, 05:30, 05:45), classify only
+        "decisive" symbols - those with clear enough signals to act now. Leave unclear
+        symbols unresolved for the next checkpoint. At 06:00 (final checkpoint),
+        classify all remaining unresolved symbols with the normal dynamic rule.
 
         This replaces the old 20:00 blanket limit workflow. Orders are submitted
         in a non-blocking batch style, then the normal 09:25 cleanup cancels any
         remaining open limits before the 09:30 exit logic.
         """
         if self.premarket_dynamic_limits_done:
-            logger.info("06:00 LIMITS: already processed; skipping duplicate call")
+            logger.info("PREMARKET LIMITS: already completed; skipping duplicate call")
             return
 
         self.position_mgr.reconcile_local_positions_from_broker()
         symbols = list(self.position_mgr.positions.keys())
         if not symbols:
-            logger.info("06:00 LIMITS: no overnight positions to classify")
+            logger.info("PREMARKET LIMITS: no overnight positions to classify")
             return
 
         broker_positions = self.position_mgr.get_broker_positions()
         if broker_positions is None:
-            logger.error("06:00 LIMITS: broker position read failed; skipping limit placement")
+            logger.error("PREMARKET LIMITS: broker position read failed; skipping limit placement")
             return
         broker_by_symbol = {
             str(p.get("symbol", "")).upper(): p
@@ -1581,20 +1663,43 @@ class CombinedOvernightReboundBot:
             if p.get("symbol")
         }
 
-        decision_dt = datetime.combine(datetime.now(_ET).date(), _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_LIMIT_TIME", "06:00")), tzinfo=_ET)
+        # Determine decision time
+        start_time = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_START_TIME", "05:00"))
+        final_time = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_FINAL_TIME", "06:00"))
+        interval_min = getattr(config, "PREMARKET_DYNAMIC_CHECK_INTERVAL_MINUTES", 15)
+
+        current_time = datetime.now(_ET).time()
+        decision_time_str = decision_time_str or current_time.strftime("%H:%M")
+        decision_time_dt = _parse_config_time(decision_time_str)
+
+        if decision_time_str is None:
+            # Auto-detect which checkpoint we're at
+            minutes_since_start = (current_time.hour * 60 + current_time.minute) - (start_time.hour * 60 + start_time.minute)
+            checkpoint_num = minutes_since_start // interval_min
+            decision_time_dt = dt_time(start_time.hour + checkpoint_num // 60, start_time.minute + checkpoint_num % 60)
+            decision_time_str = decision_time_dt.strftime("%H:%M")
+
+        decision_dt = datetime.combine(datetime.now(_ET).date(), decision_time_dt, tzinfo=_ET)
         if datetime.now(_ET) < decision_dt:
             decision_dt = datetime.now(_ET)
+
+        final_time_str = final_time.strftime("%H:%M")
 
         placed = 0
         no_cap = 0
         skipped = 0
+        waited = 0
 
         for symbol in symbols:
+            # Skip symbols already decided in previous checkpoints
+            if symbol in self.premarket_decided_symbols:
+                continue
+
             pos = self.position_mgr.positions.get(symbol)
             broker_pos = broker_by_symbol.get(symbol.upper())
             if not pos or not broker_pos:
                 skipped += 1
-                logger.warning(f"06:00 LIMIT {symbol}: missing local/broker position; skipping")
+                logger.warning(f"PREMARKET LIMIT {symbol}: missing local/broker position; skipping")
                 continue
 
             try:
@@ -1603,16 +1708,41 @@ class CombinedOvernightReboundBot:
                 qty = int(pos.quantity or 0)
             if qty <= 0:
                 skipped += 1
-                logger.warning(f"06:00 LIMIT {symbol}: qty <= 0; skipping")
+                logger.warning(f"PREMARKET LIMIT {symbol}: qty <= 0; skipping")
                 continue
 
             entry_price = float(getattr(pos, "entry_price", 0.0) or broker_pos.get("avg_entry_price", 0.0) or 0.0)
             if entry_price <= 0:
                 skipped += 1
-                logger.warning(f"06:00 LIMIT {symbol}: missing entry price; skipping")
+                logger.warning(f"PREMARKET LIMIT {symbol}: missing entry price; skipping")
                 continue
 
+            sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
+
             metrics = self._compute_live_premarket_metrics(symbol, entry_price, decision_dt)
+
+            # Check if signal is decisive (act now) or should wait
+            is_decisive, decisive_reason = self._is_decisive_premarket_signal(
+                decision_time_str=decision_time_str,
+                final_time=final_time_str,
+                current_return=metrics.get("current_return", 0.0),
+                distance_from_high=metrics.get("distance_from_high", 0.0),
+                trend_from_first_bar=metrics.get("trend_from_first_bar", 0.0),
+                minutes_traded=int(metrics.get("premarket_minutes", 0) or 0),
+                last_bar_age_minutes=float(metrics.get("last_bar_age_minutes", 999) or 999),
+                sleeve=sleeve,
+            )
+
+            if not is_decisive:
+                waited += 1
+                logger.info(
+                    f"PREMARKET LIMIT {symbol}: NOT DECISIVE at {decision_time_str} | "
+                    f"reason={decisive_reason}, ret={metrics.get('current_return', 0.0):+.2%}, "
+                    f"will check again in 15 minutes"
+                )
+                continue
+
+            # Symbol is decisive - classify and act
             decision = self._classify_iex_premarket_limit(pos, metrics)
 
             log_metrics = (
@@ -1623,11 +1753,14 @@ class CombinedOvernightReboundBot:
                 f"stale={metrics.get('last_bar_age_minutes', 999):.0f}m"
             )
 
+            # Mark as decided so we don't reclassify in future checkpoints
+            self.premarket_decided_symbols.add(symbol)
+
             if decision["action"] == "NO_CAP":
                 no_cap += 1
                 logger.warning(
-                    f"06:00 LIMIT {symbol}: NO CAP | entry={entry_price:.4f}, "
-                    f"{log_metrics}, reason={decision['reason']}"
+                    f"PREMARKET LIMIT {symbol} [{decision_time_str}]: NO CAP | entry={entry_price:.4f}, "
+                    f"{log_metrics}, decisive={decisive_reason}, action={decision['reason']}"
                 )
                 continue
 
@@ -1635,8 +1768,8 @@ class CombinedOvernightReboundBot:
             if limit_pct is None:
                 no_cap += 1
                 logger.warning(
-                    f"06:00 LIMIT {symbol}: NO LIMIT | entry={entry_price:.4f}, "
-                    f"{log_metrics}, reason={decision['reason']}"
+                    f"PREMARKET LIMIT {symbol} [{decision_time_str}]: NO LIMIT | entry={entry_price:.4f}, "
+                    f"{log_metrics}, decisive={decisive_reason}, action={decision['reason']}"
                 )
                 continue
 
@@ -1653,15 +1786,29 @@ class CombinedOvernightReboundBot:
                 self.premarket_limit_order_ids[symbol] = resp["id"]
                 placed += 1
                 logger.info(
-                    f"06:00 LIMIT {symbol}: placed qty={qty}, entry={entry_price:.4f}, "
+                    f"PREMARKET LIMIT {symbol} [{decision_time_str}]: placed qty={qty}, entry={entry_price:.4f}, "
                     f"limit_pct={limit_pct:.2%}, limit={limit_price:.4f}, {log_metrics}, "
-                    f"reason={decision['reason']}, order_id={resp['id']}"
+                    f"decisive={decisive_reason}, action={decision['reason']}, order_id={resp['id']}"
                 )
             else:
                 skipped += 1
-                logger.error(f"06:00 LIMIT {symbol}: submit failed | {log_metrics}, reason={decision['reason']}")
+                logger.error(f"PREMARKET LIMIT {symbol} [{decision_time_str}]: submit failed | {log_metrics}, decisive={decisive_reason}, action={decision['reason']}")
 
-        logger.warning(f"06:00 DYNAMIC LIMITS COMPLETE: placed={placed}, no_cap={no_cap}, skipped={skipped}")
+        # Check if we're at the final checkpoint
+        is_final = decision_time_str >= final_time_str
+
+        logger.warning(
+            f"PREMARKET LIMITS [{decision_time_str}] COMPLETE: placed={placed}, no_cap={no_cap}, "
+            f"skipped={skipped}, waited={waited}, final_checkpoint={is_final}"
+        )
+
+        # If final checkpoint, mark as done
+        if is_final:
+            self.premarket_dynamic_limits_done = True
+            self._save_state()
+        else:
+            # Save state after each checkpoint to track decided symbols
+            self._save_state()
 
     def _place_overnight_limit_sells(self):
         """20:00: place resting limit sells for all overnight positions.
@@ -1867,6 +2014,7 @@ class CombinedOvernightReboundBot:
                 "morning_open_orders_cancelled": self.morning_open_orders_cancelled,
                 "premarket_dynamic_limits_done": self.premarket_dynamic_limits_done,
                 "premarket_limit_order_ids": self.premarket_limit_order_ids,
+                "premarket_decided_symbols": list(self.premarket_decided_symbols),
                 # Legacy 20:00 fields kept for backward compatibility
                 "overnight_limit_sells_done": self.overnight_limit_sells_done,
                 "overnight_limit_order_ids": self.overnight_limit_order_ids,
@@ -1918,6 +2066,7 @@ class CombinedOvernightReboundBot:
         # New premarket fields
         self.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
         self.premarket_limit_order_ids = bot_state.get("premarket_limit_order_ids", {})
+        self.premarket_decided_symbols = set(bot_state.get("premarket_decided_symbols", []))
         # Legacy 20:00 fields kept for backward compatibility
         self.overnight_limit_sells_done = bot_state.get("overnight_limit_sells_done", False)
         self.overnight_limit_order_ids = bot_state.get("overnight_limit_order_ids", {})
