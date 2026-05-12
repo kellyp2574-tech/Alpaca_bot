@@ -1194,29 +1194,117 @@ class CombinedOvernightReboundBot:
                 gdp_orderable, gdp_budget, equity, "GDP", config.GDP_MAX_POSITIONS
             )
 
+            # Calculate leftover from sleeve allocations
+            mr_allocated = sum(r["target_dollars"] for r in mr_results)
+            gdp_allocated = sum(r["target_dollars"] for r in gdp_results)
+            mr_leftover = mr_budget - mr_allocated
+            gdp_leftover = gdp_budget - gdp_allocated
+            total_leftover = mr_leftover + gdp_leftover
+
+            # Log sleeve allocation results
+            logger.info(
+                f"MR sleeve: budget=${mr_budget:,.2f}, allocated=${mr_allocated:,.2f}, leftover=${mr_leftover:,.2f}, "
+                f"positions={len(mr_results)}"
+            )
+            logger.info(
+                f"GDP sleeve: budget=${gdp_budget:,.2f}, allocated=${gdp_allocated:,.2f}, leftover=${gdp_leftover:,.2f}, "
+                f"positions={len(gdp_results)}"
+            )
+
+            # Global leftover redeployment pass
+            # Fallback order: MR leftover → GDP candidates → all remaining orderable candidates
+            if total_leftover > config.MIN_POSITION_DOLLARS:
+                # Build set of already allocated symbols
+                allocated_symbols = {r["symbol"] for r in mr_results + gdp_results}
+
+                # Fallback 1: MR leftover → GDP candidates
+                if mr_leftover > config.MIN_POSITION_DOLLARS and gdp_orderable:
+                    gdp_unallocated = [c for c in gdp_orderable if c.symbol not in allocated_symbols]
+                    if gdp_unallocated:
+                        gdp_fallback = allocate_waterfall(
+                            gdp_unallocated, mr_leftover, equity, "MR_FALLBACK_GDP", config.GDP_MAX_POSITIONS
+                        )
+                        if gdp_fallback:
+                            gdp_fallback_allocated = sum(r["target_dollars"] for r in gdp_fallback)
+                            logger.info(
+                                f"MR fallback to GDP: budget=${mr_leftover:,.2f}, allocated=${gdp_fallback_allocated:,.2f}, "
+                                f"positions={len(gdp_fallback)}"
+                            )
+                            # Add to GDP results with original sleeve label
+                            for r in gdp_fallback:
+                                r["fallback"] = True
+                            gdp_results.extend(gdp_fallback)
+                            allocated_symbols.update(r["symbol"] for r in gdp_fallback)
+                            mr_leftover -= gdp_fallback_allocated
+                            total_leftover -= gdp_fallback_allocated
+
+                # Fallback 2: Remaining leftover → all remaining orderable candidates sorted by score
+                if total_leftover > config.MIN_POSITION_DOLLARS:
+                    # Combine all orderable candidates, remove already allocated
+                    all_orderable = mr_orderable + gdp_orderable
+                    overflow_pool = [c for c in all_orderable if c.symbol not in allocated_symbols]
+                    # Sort by selection score (highest first)
+                    overflow_pool.sort(key=lambda x: getattr(x, "selection_score", 0.0), reverse=True)
+                    
+                    if overflow_pool:
+                        # Build symbol sets for sleeve detection
+                        mr_orderable_symbols = {c.symbol for c in mr_orderable}
+                        gdp_orderable_symbols = {c.symbol for c in gdp_orderable}
+                        
+                        # Use combined max positions for overflow
+                        current_positions = len(mr_results) + len(gdp_results)
+                        remaining_slots = max(0, config.COMBINED_MAX_POSITIONS - current_positions)
+                        
+                        if remaining_slots > 0:
+                            overflow_fallback = allocate_waterfall(
+                                overflow_pool, total_leftover, equity, "OVERFLOW", remaining_slots
+                            )
+                            if overflow_fallback:
+                                overflow_allocated = sum(r["target_dollars"] for r in overflow_fallback)
+                                logger.info(
+                                    f"Overflow fallback: budget=${total_leftover:,.2f}, allocated=${overflow_allocated:,.2f}, "
+                                    f"positions={len(overflow_fallback)}"
+                                )
+                                # Assign sleeve based on original candidate source using symbol membership
+                                for r in overflow_fallback:
+                                    r["fallback"] = True
+                                    if r["candidate"].symbol in mr_orderable_symbols:
+                                        mr_results.append(r)
+                                    else:
+                                        gdp_results.append(r)
+                                total_leftover -= overflow_allocated
+
+                # Log final leftover
+                if total_leftover > config.MIN_POSITION_DOLLARS:
+                    logger.warning(
+                        f"Final leftover after fallback: ${total_leftover:,.2f} (no more orderable candidates)"
+                    )
+
             # Build SleeveAllocation list with shares calculated from target dollars
             allocations: List[SleeveAllocation] = []
             for rank, r in enumerate(mr_results, start=1):
                 c = r["candidate"]
                 shares = math.floor(r["target_dollars"] / c.signal_price) if c.signal_price > 0 else 0
+                sleeve_label = "MR" if not r.get("fallback") else "MR_FALLBACK"
                 allocations.append(SleeveAllocation(
                     symbol=c.symbol,
                     shares=shares,
                     target_dollars=r["target_dollars"],
                     rank=rank,
-                    sleeve="MR",
+                    sleeve=sleeve_label,
                     candidate=c
                 ))
 
             for rank, r in enumerate(gdp_results, start=1):
                 c = r["candidate"]
                 shares = math.floor(r["target_dollars"] / c.signal_price) if c.signal_price > 0 else 0
+                sleeve_label = "GDP" if not r.get("fallback") else "GDP_FALLBACK"
                 allocations.append(SleeveAllocation(
                     symbol=c.symbol,
                     shares=shares,
                     target_dollars=r["target_dollars"],
                     rank=rank,
-                    sleeve="GDP",
+                    sleeve=sleeve_label,
                     candidate=c
                 ))
 
@@ -1238,8 +1326,8 @@ class CombinedOvernightReboundBot:
             total_target = sum(a.target_dollars for a in allocations)
             logger.info(
                 f"Selected {len(allocations)} allocations: "
-                f"{sum(1 for a in allocations if a.sleeve=='MR')} MR + "
-                f"{sum(1 for a in allocations if a.sleeve=='GDP')} GDP, "
+                f"{sum(1 for a in allocations if a.sleeve.startswith('MR'))} MR + "
+                f"{sum(1 for a in allocations if a.sleeve.startswith('GDP'))} GDP, "
                 f"total_target=${total_target:,.2f}"
             )
             logger.info(
@@ -1376,10 +1464,14 @@ class CombinedOvernightReboundBot:
             self._save_state()
 
             # Execution stats
-            mr_filled = sum(1 for s in exec_diag.filled_symbols
-                             if exec_diag.fill_details.get(s, {}).get("sleeve") == "MR")
-            gdp_filled = sum(1 for s in exec_diag.filled_symbols
-                              if exec_diag.fill_details.get(s, {}).get("sleeve") == "GDP")
+            mr_filled = sum(
+                1 for s in exec_diag.filled_symbols
+                if exec_diag.fill_details.get(s, {}).get("sleeve", "").startswith("MR")
+            )
+            gdp_filled = sum(
+                1 for s in exec_diag.filled_symbols
+                if exec_diag.fill_details.get(s, {}).get("sleeve", "").startswith("GDP")
+            )
 
             self._exec_stats = {
                 "selected": len(exec_diag.selected_symbols),
