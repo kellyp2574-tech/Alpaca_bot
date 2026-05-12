@@ -1706,7 +1706,12 @@ class CombinedOvernightReboundBot:
         return None
 
     def _compute_live_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
-        """Compute lenient IEX premarket metrics for the 06:00 dynamic classifier."""
+        """Compute lenient IEX premarket metrics for the 06:00 dynamic classifier.
+        
+        First attempts to fetch IEX bars from 04:00 through decision time.
+        If no bars are available, falls back to Alpaca snapshot/quote data.
+        Only returns has_data=False if both bars and snapshot fail.
+        """
         bars_raw = self._fetch_live_premarket_bars(symbol, decision_dt)
         normalized = []
         for bar in bars_raw:
@@ -1725,39 +1730,147 @@ class CombinedOvernightReboundBot:
                 })
 
         normalized.sort(key=lambda b: b["dt"])
-        if not normalized:
+        if normalized:
+            # Use bar data
+            first = normalized[0]
+            last = normalized[-1]
+            stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
+            premarket_high = max(b["high"] for b in normalized)
+            premarket_low = min(b["low"] for b in normalized)
+            premarket_volume = sum(b["volume"] for b in normalized)
+            current_price = last["close"]
+            first_price = first["close"]
+
+            return {
+                "has_data": True,
+                "reason": "iex_premarket_data",
+                "first_premarket_time": first["dt"],
+                "first_premarket_price": first_price,
+                "current_time": last["dt"],
+                "current_price": current_price,
+                "premarket_high": premarket_high,
+                "premarket_low": premarket_low,
+                "premarket_minutes": len(normalized),
+                "premarket_volume": premarket_volume,
+                "last_bar_age_minutes": stale_minutes,
+                "current_return": current_price / buy_price - 1.0,
+                "distance_from_high": current_price / premarket_high - 1.0 if premarket_high > 0 else 0.0,
+                "return_from_low": current_price / premarket_low - 1.0 if premarket_low > 0 else 0.0,
+                "trend_from_first_bar": current_price / first_price - 1.0 if first_price > 0 else 0.0,
+            }
+        
+        # No bars - try snapshot fallback
+        snapshot_metrics = self._compute_snapshot_metrics(symbol, buy_price, decision_dt)
+        if snapshot_metrics.get("has_data"):
+            return snapshot_metrics
+        
+        # Both failed - return true no data
+        return {
+            "has_data": False,
+            "reason": "no_bars_and_no_snapshot",
+            "premarket_minutes": 0,
+        }
+
+    def _compute_snapshot_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
+        """Compute premarket metrics from Alpaca snapshot/quote data as fallback.
+        
+        Uses latest trade, bid/ask midpoint from snapshot endpoint.
+        Returns metrics in same format as bar-based metrics for compatibility.
+        """
+        try:
+            # Fetch snapshot using alpaca data client
+            snapshots = self.alpaca.get_snapshots([symbol])
+            if not snapshots or symbol not in snapshots:
+                return {
+                    "has_data": False,
+                    "reason": "snapshot_not_available",
+                    "premarket_minutes": 0,
+                }
+            
+            snap = snapshots[symbol]
+            if not snap:
+                return {
+                    "has_data": False,
+                    "reason": "snapshot_empty",
+                    "premarket_minutes": 0,
+                }
+            
+            # Extract price data from snapshot
+            last_price = snap.get("latestTrade") or snap.get("last_trade") or {}
+            current_price = float(last_price.get("p", 0) or last_price.get("price", 0) or 0)
+            
+            quote = snap.get("latestQuote") or snap.get("quote") or {}
+            bid = float(quote.get("bp", 0) or quote.get("bid", 0) or 0)
+            ask = float(quote.get("ap", 0) or quote.get("ask", 0) or 0)
+            
+            # Use midpoint if last_price not available
+            if current_price <= 0 and bid > 0 and ask > 0:
+                current_price = (bid + ask) / 2.0
+            
+            if current_price <= 0:
+                return {
+                    "has_data": False,
+                    "reason": "snapshot_no_price",
+                    "premarket_minutes": 0,
+                }
+            
+            # Calculate staleness from timestamp
+            timestamp = last_price.get("t") or last_price.get("timestamp") or quote.get("t") or quote.get("timestamp")
+            last_trade_time = None
+            if timestamp:
+                try:
+                    parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=_ET)
+                    last_trade_time = parsed.astimezone(_ET)
+                except Exception:
+                    pass
+            
+            if last_trade_time:
+                stale_minutes = (decision_dt - last_trade_time).total_seconds() / 60.0
+            else:
+                stale_minutes = 999.0
+            
+            # Calculate spread
+            spread_pct = 0.0
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                spread_pct = (ask - bid) / mid if mid > 0 else 0.0
+            
+            # Calculate return
+            current_return = current_price / buy_price - 1.0 if buy_price > 0 else 0.0
+            
+            # Log snapshot data for debugging
+            logger.warning(
+                f"PREMARKET DATA GAP: source=snapshot symbol={symbol} "
+                f"bid={bid:.2f} ask={ask:.2f} mid={(bid+ask)/2 if bid>0 and ask>0 else 0:.2f} "
+                f"last={current_price:.2f} entry={buy_price:.2f} ret={current_return:+.2%} "
+                f"spread={spread_pct:.2%} stale={stale_minutes:.0f}m"
+            )
+            
+            return {
+                "has_data": True,
+                "reason": "snapshot_data",
+                "current_time": last_trade_time or decision_dt,
+                "current_price": current_price,
+                "premarket_minutes": 0,  # No bar count from snapshot
+                "premarket_volume": 0,  # No volume from snapshot
+                "last_bar_age_minutes": stale_minutes,
+                "current_return": current_return,
+                "distance_from_high": 0.0,  # No high from snapshot
+                "return_from_low": 0.0,  # No low from snapshot
+                "trend_from_first_bar": 0.0,  # No first bar from snapshot
+                "snapshot_bid": bid,
+                "snapshot_ask": ask,
+                "snapshot_spread_pct": spread_pct,
+            }
+        except Exception:
+            logger.warning(f"PREMARKET SNAPSHOT FALLBACK FAILED for {symbol}", exc_info=True)
             return {
                 "has_data": False,
-                "reason": "no_iex_premarket_bars",
+                "reason": "snapshot_fetch_failed",
                 "premarket_minutes": 0,
             }
-
-        first = normalized[0]
-        last = normalized[-1]
-        stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
-        premarket_high = max(b["high"] for b in normalized)
-        premarket_low = min(b["low"] for b in normalized)
-        premarket_volume = sum(b["volume"] for b in normalized)
-        current_price = last["close"]
-        first_price = first["close"]
-
-        return {
-            "has_data": True,
-            "reason": "iex_premarket_data",
-            "first_premarket_time": first["dt"],
-            "first_premarket_price": first_price,
-            "current_time": last["dt"],
-            "current_price": current_price,
-            "premarket_high": premarket_high,
-            "premarket_low": premarket_low,
-            "premarket_minutes": len(normalized),
-            "premarket_volume": premarket_volume,
-            "last_bar_age_minutes": stale_minutes,
-            "current_return": current_price / buy_price - 1.0,
-            "distance_from_high": current_price / premarket_high - 1.0 if premarket_high > 0 else 0.0,
-            "return_from_low": current_price / premarket_low - 1.0 if premarket_low > 0 else 0.0,
-            "trend_from_first_bar": current_price / first_price - 1.0 if first_price > 0 else 0.0,
-        }
 
     def _classify_iex_premarket_limit(self, pos: Position, metrics: Dict[str, Any]) -> Dict[str, Any]:
         """Lenient IEX-aware dynamic limit decision.
@@ -1766,6 +1879,9 @@ class CombinedOvernightReboundBot:
         premarket activity, but it does make it less likely that this is one of
         the true runners we are trying not to cap. Therefore the fallback is a
         normal 5% harvest limit rather than no decision.
+        
+        Now includes snapshot fallback when bars are unavailable. Snapshot data
+        is treated as a single price point without bar count requirements.
         """
         fallback_limit = getattr(config, "PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT", 0.05)
         sparse_wide_limit = getattr(config, "PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT", 0.10)
@@ -1788,7 +1904,27 @@ class CombinedOvernightReboundBot:
         trend = float(metrics.get("trend_from_first_bar", 0.0) or 0.0)
         sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
         fresh_enough = stale <= stale_max
+        data_source = metrics.get("reason", "")
+        
+        # Snapshot data: treat as single price point without bar count requirements
+        is_snapshot = data_source == "snapshot_data"
+        
+        if is_snapshot:
+            # Snapshot-based decision: simpler logic based on current_return and staleness
+            if current_return >= very_high and fresh_enough:
+                return {"action": "NO_CAP", "limit_pct": None, "reason": "snapshot_very_high_return_no_cap"}
+            elif current_return >= high:
+                if sleeve == "MR" and current_return < very_high:
+                    return {"action": "PLACE_LIMIT", "limit_pct": fallback_limit, "reason": "snapshot_high_return_mr_harvest_5pct"}
+                return {"action": "NO_CAP", "limit_pct": None, "reason": "snapshot_high_return_no_cap"}
+            elif current_return >= moderate:
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.06, "reason": "snapshot_moderate_return_6pct"}
+            elif current_return >= 0:
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.04, "reason": "snapshot_small_winner_4pct"}
+            else:
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "snapshot_negative_pop_harvest_3pct"}
 
+        # Bar-based decision: original logic with bar count requirements
         # True runner: even sparse IEX activity is enough not to choke it.
         if current_return >= very_high and bars >= 1 and fresh_enough:
             return {"action": "NO_CAP", "limit_pct": None, "reason": "iex_very_high_return_no_cap"}
@@ -1918,13 +2054,6 @@ class CombinedOvernightReboundBot:
         current_time = datetime.now(_ET).time()
         decision_time_str = decision_time_str or current_time.strftime("%H:%M")
         decision_time_dt = _parse_config_time(decision_time_str)
-
-        if decision_time_str is None:
-            # Auto-detect which checkpoint we're at
-            minutes_since_start = (current_time.hour * 60 + current_time.minute) - (start_time.hour * 60 + start_time.minute)
-            checkpoint_num = minutes_since_start // interval_min
-            decision_time_dt = dt_time(start_time.hour + checkpoint_num // 60, start_time.minute + checkpoint_num % 60)
-            decision_time_str = decision_time_dt.strftime("%H:%M")
 
         decision_dt = datetime.combine(datetime.now(_ET).date(), decision_time_dt, tzinfo=_ET)
         if datetime.now(_ET) < decision_dt:
