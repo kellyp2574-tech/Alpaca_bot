@@ -24,13 +24,20 @@ class AlpacaDataClient:
             "APCA-API-SECRET-KEY": self.secret_key,
         })
 
-    def get_snapshots(self, symbols: List[str]) -> Dict[str, dict]:
+    def get_snapshots(self, symbols: List[str], feed: Optional[str] = None) -> Dict[str, dict]:
         """
-        Fetch IEX snapshots for given symbols.
+        Fetch IEX or SIP snapshots for given symbols.
         Max 1000 symbols per request (Alpaca limit).
+        
+        Args:
+            symbols: List of symbols to fetch snapshots for
+            feed: Override feed (e.g., "sip" for SIP, "iex" for IEX). If None, uses self.feed
         """
         if not symbols:
             return {}
+
+        # Use provided feed or fall back to instance feed
+        use_feed = feed if feed is not None else self.feed
 
         all_snapshots = {}
         batch_size = 1000
@@ -42,13 +49,13 @@ class AlpacaDataClient:
             url = f"{self.data_url}/v2/stocks/snapshots"
             params = {
                 "symbols": symbols_param,
-                "feed": self.feed,
+                "feed": use_feed,
             }
 
             try:
                 response = self.session.get(url, params=params, timeout=30)
                 response.raise_for_status()
-                data = response.json()
+                data = data = response.json()
                 
                 # Check if response is paginated (has 'NEXT' key) or direct snapshots
                 if "snapshots" in data:
@@ -70,9 +77,9 @@ class AlpacaDataClient:
                         logger.debug(f"Empty/invalid snapshot for {symbol}: {type(snapshot)}")
 
             except requests.exceptions.RequestException as e:
-                logger.error(f"Alpaca snapshot error for batch {i//batch_size + 1}: {e}")
+                logger.error(f"Alpaca snapshot error for batch {i//batch_size + 1} (feed={use_feed}): {e}")
 
-        logger.info(f"Alpaca snapshots: {len(all_snapshots)} symbols")
+        logger.info(f"Alpaca snapshots (feed={use_feed}): {len(all_snapshots)} symbols")
         return all_snapshots
 
     def _parse_snapshot(self, symbol: str, data: dict) -> dict:

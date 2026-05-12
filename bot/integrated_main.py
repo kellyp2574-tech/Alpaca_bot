@@ -1706,11 +1706,15 @@ class CombinedOvernightReboundBot:
         return None
 
     def _compute_live_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
-        """Compute lenient IEX premarket metrics for the 06:00 dynamic classifier.
-        
-        First attempts to fetch IEX bars from 04:00 through decision time.
-        If no bars are available, falls back to Alpaca snapshot/quote data.
-        Only returns has_data=False if both bars and snapshot fail.
+        """Compute premarket metrics with IEX bars + SIP snapshot backup.
+
+        IEX bars remain the primary source for the premarket *shape*:
+        first print, high/low, volume, distance from high, and trend.
+
+        SIP snapshot data is used as a current-price cross-check even when IEX
+        bars exist. This protects the 05:00-06:00 limit classifier from thin,
+        stale, or understated IEX premarket prints. If there are no usable IEX
+        bars, the same SIP snapshot path becomes the full fallback.
         """
         bars_raw = self._fetch_live_premarket_bars(symbol, decision_dt)
         normalized = []
@@ -1730,41 +1734,127 @@ class CombinedOvernightReboundBot:
                 })
 
         normalized.sort(key=lambda b: b["dt"])
+
+        # Always try the SIP snapshot when enabled. If bars exist, this is a
+        # cross-check/current-price correction. If bars are missing, this is the
+        # full fallback.
+        use_sip_backup = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
+        snapshot_metrics = {}
+        if use_sip_backup:
+            snapshot_metrics = self._compute_snapshot_metrics(symbol, buy_price, decision_dt)
+
         if normalized:
-            # Use bar data
             first = normalized[0]
             last = normalized[-1]
-            stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
-            premarket_high = max(b["high"] for b in normalized)
-            premarket_low = min(b["low"] for b in normalized)
+            iex_stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
+            iex_high = max(b["high"] for b in normalized)
+            iex_low = min(b["low"] for b in normalized)
             premarket_volume = sum(b["volume"] for b in normalized)
-            current_price = last["close"]
+            iex_current = last["close"]
             first_price = first["close"]
+
+            resolved_current = iex_current
+            resolved_source = "iex_only"
+            resolved_stale_minutes = iex_stale_minutes
+            effective_high = iex_high
+            sip_current = None
+            sip_spread_pct = None
+            sip_stale_minutes = None
+            sip_reason = snapshot_metrics.get("reason") if snapshot_metrics else None
+
+            if snapshot_metrics.get("has_data"):
+                sip_current = float(snapshot_metrics.get("current_price", 0.0) or 0.0)
+                sip_spread_pct = snapshot_metrics.get("snapshot_spread_pct")
+                sip_stale_minutes = float(snapshot_metrics.get("last_bar_age_minutes", 999) or 999)
+                max_spread = getattr(config, "SIP_SNAPSHOT_MAX_SPREAD_PCT", 0.02)
+                confirm_diff = getattr(config, "SIP_IEX_CONFIRM_DIFF_PCT", 0.0075)
+
+                spread_ok = (
+                    sip_spread_pct is None
+                    or sip_spread_pct <= 0
+                    or float(sip_spread_pct) <= max_spread
+                )
+
+                if sip_current > 0 and spread_ok and iex_current > 0:
+                    diff_pct = abs(sip_current - iex_current) / iex_current
+                    if diff_pct <= confirm_diff:
+                        resolved_current = sip_current
+                        resolved_source = "sip_confirmed"
+                        resolved_stale_minutes = sip_stale_minutes
+                    elif sip_current > iex_current:
+                        resolved_current = sip_current
+                        resolved_source = "sip_higher_than_iex"
+                        resolved_stale_minutes = sip_stale_minutes
+                    else:
+                        # SIP lower than IEX: use the lower/conservative mark.
+                        resolved_current = min(iex_current, sip_current)
+                        resolved_source = "conservative_min_iex_sip"
+                        resolved_stale_minutes = min(iex_stale_minutes, sip_stale_minutes)
+                elif sip_current > 0 and not spread_ok:
+                    resolved_source = "iex_only_sip_wide_spread"
+
+                if (
+                    getattr(config, "SIP_ALLOW_HIGH_CORRECTION", True)
+                    and sip_current
+                    and sip_current > effective_high
+                    and (sip_spread_pct is None or sip_spread_pct <= 0 or sip_spread_pct <= getattr(config, "SIP_SNAPSHOT_MAX_SPREAD_PCT", 0.02))
+                ):
+                    effective_high = sip_current
+
+            current_return = resolved_current / buy_price - 1.0 if buy_price > 0 else 0.0
+            distance_from_high = resolved_current / effective_high - 1.0 if effective_high > 0 else 0.0
+            return_from_low = resolved_current / iex_low - 1.0 if iex_low > 0 else 0.0
+            trend_from_first_bar = resolved_current / first_price - 1.0 if first_price > 0 else 0.0
+
+            logger.info(
+                "PREMARKET PRICE RESOLVE %s: entry=%.4f iex_latest=%.4f sip_price=%s "
+                "sip_spread=%s resolved=%.4f source=%s ret=%+.2f%% iex_high=%.4f effective_high=%.4f "
+                "iex_stale=%.0fm resolved_stale=%.0fm sip_reason=%s",
+                symbol,
+                buy_price,
+                iex_current,
+                f"{sip_current:.4f}" if sip_current else "None",
+                f"{sip_spread_pct:.2%}" if sip_spread_pct is not None else "None",
+                resolved_current,
+                resolved_source,
+                current_return * 100.0,
+                iex_high,
+                effective_high,
+                iex_stale_minutes,
+                resolved_stale_minutes,
+                sip_reason,
+            )
 
             return {
                 "has_data": True,
                 "reason": "iex_premarket_data",
+                "price_source": resolved_source,
                 "first_premarket_time": first["dt"],
                 "first_premarket_price": first_price,
                 "current_time": last["dt"],
-                "current_price": current_price,
-                "premarket_high": premarket_high,
-                "premarket_low": premarket_low,
+                "current_price": resolved_current,
+                "iex_current_price": iex_current,
+                "sip_current_price": sip_current,
+                "sip_snapshot_reason": sip_reason,
+                "premarket_high": effective_high,
+                "iex_premarket_high": iex_high,
+                "premarket_low": iex_low,
                 "premarket_minutes": len(normalized),
                 "premarket_volume": premarket_volume,
-                "last_bar_age_minutes": stale_minutes,
-                "current_return": current_price / buy_price - 1.0,
-                "distance_from_high": current_price / premarket_high - 1.0 if premarket_high > 0 else 0.0,
-                "return_from_low": current_price / premarket_low - 1.0 if premarket_low > 0 else 0.0,
-                "trend_from_first_bar": current_price / first_price - 1.0 if first_price > 0 else 0.0,
+                "last_bar_age_minutes": resolved_stale_minutes,
+                "iex_last_bar_age_minutes": iex_stale_minutes,
+                "snapshot_spread_pct": sip_spread_pct,
+                "current_return": current_return,
+                "distance_from_high": distance_from_high,
+                "return_from_low": return_from_low,
+                "trend_from_first_bar": trend_from_first_bar,
             }
-        
-        # No bars - try snapshot fallback
-        snapshot_metrics = self._compute_snapshot_metrics(symbol, buy_price, decision_dt)
+
+        # No bars - use snapshot fallback if available.
         if snapshot_metrics.get("has_data"):
             return snapshot_metrics
-        
-        # Both failed - return true no data
+
+        # Both failed - return true no data.
         return {
             "has_data": False,
             "reason": "no_bars_and_no_snapshot",
@@ -1772,21 +1862,30 @@ class CombinedOvernightReboundBot:
         }
 
     def _compute_snapshot_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
-        """Compute premarket metrics from Alpaca snapshot/quote data as fallback.
-        
-        Uses latest trade, bid/ask midpoint from snapshot endpoint.
-        Returns metrics in same format as bar-based metrics for compatibility.
+        """Compute premarket metrics from Alpaca SIP snapshot/quote data.
+
+        This method is intentionally reusable in two modes:
+        1. Full fallback when IEX has no premarket bars.
+        2. Current-price backup when IEX bars exist but may be stale/thin.
+
+        Price priority:
+        - Fresh NBBO midpoint when spread is sane.
+        - Fresh latest trade when midpoint is unavailable/stale.
+        Wide spreads reject the midpoint but do not automatically reject a fresh
+        latest trade; the caller may still decide whether to use it.
         """
         try:
-            # Fetch snapshot using alpaca data client
-            snapshots = self.alpaca.get_snapshots([symbol])
+            # Use SIP feed for snapshot backup when enabled
+            use_sip_feed = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
+            feed = "sip" if use_sip_feed else None
+            snapshots = self.alpaca.get_snapshots([symbol], feed=feed)
             if not snapshots or symbol not in snapshots:
                 return {
                     "has_data": False,
                     "reason": "snapshot_not_available",
                     "premarket_minutes": 0,
                 }
-            
+
             snap = snapshots[symbol]
             if not snap:
                 return {
@@ -1794,75 +1893,146 @@ class CombinedOvernightReboundBot:
                     "reason": "snapshot_empty",
                     "premarket_minutes": 0,
                 }
-            
-            # Extract price data from snapshot
-            last_price = snap.get("latestTrade") or snap.get("last_trade") or {}
-            current_price = float(last_price.get("p", 0) or last_price.get("price", 0) or 0)
-            
-            quote = snap.get("latestQuote") or snap.get("quote") or {}
-            bid = float(quote.get("bp", 0) or quote.get("bid", 0) or 0)
-            ask = float(quote.get("ap", 0) or quote.get("ask", 0) or 0)
-            
-            # Use midpoint if last_price not available
-            if current_price <= 0 and bid > 0 and ask > 0:
-                current_price = (bid + ask) / 2.0
-            
-            if current_price <= 0:
-                return {
-                    "has_data": False,
-                    "reason": "snapshot_no_price",
-                    "premarket_minutes": 0,
-                }
-            
-            # Calculate staleness from timestamp
-            timestamp = last_price.get("t") or last_price.get("timestamp") or quote.get("t") or quote.get("timestamp")
-            last_trade_time = None
-            if timestamp:
+
+            latest_trade = snap.get("latestTrade") or snap.get("last_trade") or snap.get("latest_trade") or {}
+            latest_quote = snap.get("latestQuote") or snap.get("quote") or snap.get("latest_quote") or {}
+
+            def _snap_float(container: dict, *keys: str) -> float:
+                for key in keys:
+                    try:
+                        val = container.get(key)
+                        if val is not None:
+                            return float(val)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                return 0.0
+
+            last_trade_price = _snap_float(latest_trade, "p", "price")
+            bid = _snap_float(latest_quote, "bp", "bid_price", "bid")
+            ask = _snap_float(latest_quote, "ap", "ask_price", "ask")
+
+            quote_timestamp = latest_quote.get("t") or latest_quote.get("timestamp") if latest_quote else None
+            trade_timestamp = latest_trade.get("t") or latest_trade.get("timestamp") if latest_trade else None
+
+            def _parse_snap_time(raw) -> Optional[datetime]:
+                if not raw:
+                    return None
                 try:
-                    parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
                     if parsed.tzinfo is None:
                         parsed = parsed.replace(tzinfo=_ET)
-                    last_trade_time = parsed.astimezone(_ET)
+                    return parsed.astimezone(_ET)
                 except Exception:
-                    pass
-            
-            if last_trade_time:
-                stale_minutes = (decision_dt - last_trade_time).total_seconds() / 60.0
-            else:
-                stale_minutes = 999.0
-            
-            # Calculate spread
-            spread_pct = 0.0
-            if bid > 0 and ask > 0:
-                mid = (bid + ask) / 2.0
-                spread_pct = (ask - bid) / mid if mid > 0 else 0.0
-            
-            # Calculate return
+                    return None
+
+            quote_time = _parse_snap_time(quote_timestamp)
+            trade_time = _parse_snap_time(trade_timestamp)
+
+            stale_max = getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
+            quote_stale_minutes = (decision_dt - quote_time).total_seconds() / 60.0 if quote_time else 999.0
+            trade_stale_minutes = (decision_dt - trade_time).total_seconds() / 60.0 if trade_time else 999.0
+            quote_fresh = quote_stale_minutes <= stale_max
+            trade_fresh = trade_stale_minutes <= stale_max
+
+            max_spread = getattr(config, "SIP_SNAPSHOT_MAX_SPREAD_PCT", 0.02)
+            midpoint = 0.0
+            spread_pct = None
+            midpoint_usable = False
+            if bid > 0 and ask > 0 and ask >= bid:
+                midpoint = (bid + ask) / 2.0
+                spread_pct = (ask - bid) / midpoint if midpoint > 0 else None
+                midpoint_usable = quote_fresh and spread_pct is not None and spread_pct <= max_spread
+
+            current_price = 0.0
+            source = ""
+            used_time = None
+            stale_minutes = 999.0
+
+            if midpoint_usable:
+                current_price = midpoint
+                source = "snapshot_mid"
+                used_time = quote_time
+                stale_minutes = quote_stale_minutes
+            elif last_trade_price > 0 and trade_fresh:
+                current_price = last_trade_price
+                source = "snapshot_last"
+                used_time = trade_time
+                stale_minutes = trade_stale_minutes
+            elif midpoint > 0 and quote_fresh:
+                # Quote exists but spread is too wide. Do not use it for actual
+                # pricing, but log why it was rejected.
+                logger.warning(
+                    "PREMARKET SNAPSHOT MID REJECTED: symbol=%s reason=wide_spread spread=%s bid=%.4f ask=%.4f max=%.2f%%",
+                    symbol,
+                    f"{spread_pct:.2%}" if spread_pct is not None else "None",
+                    bid,
+                    ask,
+                    max_spread * 100.0,
+                )
+
+            if current_price <= 0:
+                logger.warning(
+                    "PREMARKET SNAPSHOT REJECTED: symbol=%s reason=no_fresh_usable_price "
+                    "quote_fresh=%s trade_fresh=%s quote_stale=%.0fm trade_stale=%.0fm bid=%.4f ask=%.4f last=%.4f spread=%s",
+                    symbol,
+                    quote_fresh,
+                    trade_fresh,
+                    quote_stale_minutes,
+                    trade_stale_minutes,
+                    bid,
+                    ask,
+                    last_trade_price,
+                    f"{spread_pct:.2%}" if spread_pct is not None else "None",
+                )
+                return {
+                    "has_data": False,
+                    "reason": "snapshot_stale_or_no_fresh_data",
+                    "premarket_minutes": 0,
+                    "snapshot_bid": bid,
+                    "snapshot_ask": ask,
+                    "snapshot_spread_pct": spread_pct,
+                }
+
             current_return = current_price / buy_price - 1.0 if buy_price > 0 else 0.0
-            
-            # Log snapshot data for debugging
-            logger.warning(
-                f"PREMARKET DATA GAP: source=snapshot symbol={symbol} "
-                f"bid={bid:.2f} ask={ask:.2f} mid={(bid+ask)/2 if bid>0 and ask>0 else 0:.2f} "
-                f"last={current_price:.2f} entry={buy_price:.2f} ret={current_return:+.2%} "
-                f"spread={spread_pct:.2%} stale={stale_minutes:.0f}m"
+
+            logger.info(
+                "PREMARKET SNAPSHOT PRICE %s: source=%s bid=%.4f ask=%.4f mid=%.4f last=%.4f "
+                "used=%.4f entry=%.4f ret=%+.2f%% spread=%s stale=%.0fm",
+                symbol,
+                source,
+                bid,
+                ask,
+                midpoint,
+                last_trade_price,
+                current_price,
+                buy_price,
+                current_return * 100.0,
+                f"{spread_pct:.2%}" if spread_pct is not None else "None",
+                stale_minutes,
             )
-            
+
             return {
                 "has_data": True,
                 "reason": "snapshot_data",
-                "current_time": last_trade_time or decision_dt,
+                "price_source": source,
+                "current_time": used_time or decision_dt,
                 "current_price": current_price,
-                "premarket_minutes": 0,  # No bar count from snapshot
-                "premarket_volume": 0,  # No volume from snapshot
+                "premarket_high": current_price,
+                "premarket_low": current_price,
+                "premarket_minutes": 0,
+                "premarket_volume": 0,
                 "last_bar_age_minutes": stale_minutes,
                 "current_return": current_return,
-                "distance_from_high": 0.0,  # No high from snapshot
-                "return_from_low": 0.0,  # No low from snapshot
-                "trend_from_first_bar": 0.0,  # No first bar from snapshot
+                "distance_from_high": 0.0,
+                "return_from_low": 0.0,
+                "trend_from_first_bar": 0.0,
                 "snapshot_bid": bid,
                 "snapshot_ask": ask,
+                "snapshot_mid": midpoint,
+                "snapshot_last": last_trade_price,
                 "snapshot_spread_pct": spread_pct,
+                "snapshot_quote_stale_minutes": quote_stale_minutes,
+                "snapshot_trade_stale_minutes": trade_stale_minutes,
             }
         except Exception:
             logger.warning(f"PREMARKET SNAPSHOT FALLBACK FAILED for {symbol}", exc_info=True)
@@ -1884,6 +2054,7 @@ class CombinedOvernightReboundBot:
         is treated as a single price point without bar count requirements.
         """
         fallback_limit = getattr(config, "PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT", 0.05)
+        no_data_fallback_limit = getattr(config, "PREMARKET_DYNAMIC_NO_DATA_FALLBACK_LIMIT_PCT", 0.03)
         sparse_wide_limit = getattr(config, "PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT", 0.10)
         very_high = getattr(config, "PREMARKET_DYNAMIC_VERY_HIGH_RETURN_NO_CAP_PCT", 0.10)
         high = getattr(config, "PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT", 0.05)
@@ -1893,8 +2064,8 @@ class CombinedOvernightReboundBot:
         if not metrics.get("has_data"):
             return {
                 "action": "PLACE_LIMIT",
-                "limit_pct": fallback_limit,
-                "reason": metrics.get("reason", "no_iex_data_default_5pct"),
+                "limit_pct": no_data_fallback_limit,
+                "reason": metrics.get("reason", "no_bars_and_no_snapshot_default_3pct"),
             }
 
         bars = int(metrics.get("premarket_minutes", 0) or 0)
@@ -1961,17 +2132,37 @@ class CombinedOvernightReboundBot:
         minutes_traded: int,
         last_bar_age_minutes: float = 999,
         sleeve: str = "UNKNOWN",
+        data_source: str = "",
     ) -> tuple[bool, str]:
         """
         Decisive = act now.
         Not decisive = leave unresolved and check again in 15 minutes.
+        
+        Snapshot data is treated specially: no bar count requirements, only freshness and return thresholds.
+        Red/weak signals are decisive regardless of source to allow early lower-limit placement.
         """
         # Final checkpoint: no more waiting.
         if decision_time >= final_time:
             return True, "final_checkpoint"
 
         fresh = last_bar_age_minutes <= getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
+        is_snapshot = data_source == "snapshot_data"
+        
+        # Red/weak signal should be decisive even when source is IEX+SIP-resolved
+        # This allows red names to place lower limits earlier instead of waiting until 06:00
+        if fresh and current_return <= -0.01:
+            return True, "decisive_red_lower_limit"
+        
+        # Snapshot data: decisive based on return thresholds without bar count requirements
+        if is_snapshot and fresh:
+            if current_return >= 0.10:
+                return True, "decisive_snapshot_very_high_return"
+            if current_return >= 0.05:
+                return True, "decisive_snapshot_high_return"
+            if sleeve.upper() == "MR" and current_return >= 0.03:
+                return True, "decisive_snapshot_mr_harvest"
 
+        # Bar-based decisive logic: requires bar count confirmation
         # 1. Obvious monster runner.
         # Even sparse IEX is enough here.
         if current_return >= 0.10 and minutes_traded >= 1 and fresh:
@@ -2107,6 +2298,7 @@ class CombinedOvernightReboundBot:
                 minutes_traded=int(metrics.get("premarket_minutes", 0) or 0),
                 last_bar_age_minutes=float(metrics.get("last_bar_age_minutes", 999) or 999),
                 sleeve=sleeve,
+                data_source=metrics.get("reason", ""),
             )
 
             if not is_decisive:
@@ -2122,6 +2314,7 @@ class CombinedOvernightReboundBot:
             decision = self._classify_iex_premarket_limit(pos, metrics)
 
             log_metrics = (
+                f"source={metrics.get('reason')}, "
                 f"bars={metrics.get('premarket_minutes', 0)}, "
                 f"ret={metrics.get('current_return', 0.0):+.2%}, "
                 f"dist_high={metrics.get('distance_from_high', 0.0):+.2%}, "

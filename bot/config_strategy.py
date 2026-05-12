@@ -111,6 +111,28 @@ PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT = 0.05
 PREMARKET_DYNAMIC_MODERATE_RETURN_PCT = 0.02
 
 # ═══════════════════════════════════════════════════
+# SIP snapshot backup for premarket dynamic limits
+# ═══════════════════════════════════════════════════
+# When enabled, SIP snapshot data is used as a current-price cross-check even
+# when IEX bars exist. This protects the classifier from thin, stale, or
+# understated IEX premarket prints. If there are no usable IEX bars, the
+# same SIP snapshot path becomes the full fallback.
+USE_SIP_SNAPSHOT_PREMARKET_BACKUP = True
+
+# Maximum spread for SIP snapshot midpoint to be considered usable (2% default)
+SIP_SNAPSHOT_MAX_SPREAD_PCT = 0.02
+
+# Maximum difference between SIP and IEX prices to consider SIP as "confirming" IEX (0.75% default)
+SIP_IEX_CONFIRM_DIFF_PCT = 0.0075
+
+# Allow SIP to correct the premarket high upward if SIP shows a higher price (True default)
+SIP_ALLOW_HIGH_CORRECTION = True
+
+# Fallback limit when no bars AND no usable snapshot (3% default, more conservative than 5%)
+# This is used when both IEX bars and SIP snapshot are unavailable.
+PREMARKET_DYNAMIC_NO_DATA_FALLBACK_LIMIT_PCT = 0.03
+
+# ═══════════════════════════════════════════════════
 # Fast open market exit (streamlined 09:30 liquidation)
 # ═══════════════════════════════════════════════════
 # When enabled, at 09:30 the bot submits all market sells in batch using
