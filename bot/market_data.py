@@ -24,7 +24,7 @@ class AlpacaDataClient:
             "APCA-API-SECRET-KEY": self.secret_key,
         })
 
-    def get_snapshots(self, symbols: List[str], feed: Optional[str] = None) -> Dict[str, dict]:
+    def get_snapshots(self, symbols: List[str], feed: Optional[str] = None, fallback: bool = True) -> Dict[str, dict]:
         """
         Fetch IEX or SIP snapshots for given symbols.
         Max 1000 symbols per request (Alpaca limit).
@@ -32,6 +32,10 @@ class AlpacaDataClient:
         Args:
             symbols: List of symbols to fetch snapshots for
             feed: Override feed (e.g., "sip" for SIP, "iex" for IEX). If None, uses self.feed
+            fallback: If True and SIP fails with 401/403, automatically retry with IEX feed
+        
+        Returns:
+            Dict mapping symbol to snapshot data, or empty dict if all attempts fail
         """
         if not symbols:
             return {}
@@ -55,7 +59,7 @@ class AlpacaDataClient:
             try:
                 response = self.session.get(url, params=params, timeout=30)
                 response.raise_for_status()
-                data = data = response.json()
+                data = response.json()
                 
                 # Check if response is paginated (has 'NEXT' key) or direct snapshots
                 if "snapshots" in data:
@@ -77,7 +81,13 @@ class AlpacaDataClient:
                         logger.debug(f"Empty/invalid snapshot for {symbol}: {type(snapshot)}")
 
             except requests.exceptions.RequestException as e:
-                logger.error(f"Alpaca snapshot error for batch {i//batch_size + 1} (feed={use_feed}): {e}")
+                status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
+                logger.error(f"Alpaca snapshot error for batch {i//batch_size + 1} (feed={use_feed}, status={status_code}): {e}")
+                
+                # If SIP fails with 401/403 and fallback is enabled, retry with IEX
+                if fallback and use_feed == "sip" and status_code in (401, 403):
+                    logger.warning(f"SIP snapshot failed with {status_code}, falling back to IEX feed")
+                    return self.get_snapshots(symbols, feed="iex", fallback=False)
 
         logger.info(f"Alpaca snapshots (feed={use_feed}): {len(all_snapshots)} symbols")
         return all_snapshots

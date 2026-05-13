@@ -1797,7 +1797,7 @@ class CombinedOvernightReboundBot:
                     continue
         return None
 
-    def _compute_live_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
+    def _compute_live_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_snapshots: Optional[Dict[str, dict]] = None) -> Dict[str, Any]:
         """Compute premarket metrics with IEX bars + SIP snapshot backup.
 
         IEX bars remain the primary source for the premarket *shape*:
@@ -1833,7 +1833,7 @@ class CombinedOvernightReboundBot:
         use_sip_backup = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
         snapshot_metrics = {}
         if use_sip_backup:
-            snapshot_metrics = self._compute_snapshot_metrics(symbol, buy_price, decision_dt)
+            snapshot_metrics = self._compute_snapshot_metrics(symbol, buy_price, decision_dt, pre_fetched_snapshots=pre_fetched_snapshots)
 
         if normalized:
             first = normalized[0]
@@ -1946,14 +1946,15 @@ class CombinedOvernightReboundBot:
         if snapshot_metrics.get("has_data"):
             return snapshot_metrics
 
-        # Both failed - return true no data.
+        # Both failed - return true no data with current_return=None to distinguish from zero return
         return {
             "has_data": False,
             "reason": "no_bars_and_no_snapshot",
             "premarket_minutes": 0,
+            "current_return": None,
         }
 
-    def _compute_snapshot_metrics(self, symbol: str, buy_price: float, decision_dt: datetime) -> Dict[str, Any]:
+    def _compute_snapshot_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_snapshots: Optional[Dict[str, dict]] = None) -> Dict[str, Any]:
         """Compute premarket metrics from Alpaca SIP snapshot/quote data.
 
         This method is intentionally reusable in two modes:
@@ -1967,15 +1968,21 @@ class CombinedOvernightReboundBot:
         latest trade; the caller may still decide whether to use it.
         """
         try:
-            # Use SIP feed for snapshot backup when enabled
-            use_sip_feed = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
-            feed = "sip" if use_sip_feed else None
-            snapshots = self.alpaca.get_snapshots([symbol], feed=feed)
+            # Use pre-fetched snapshots if provided (batch mode), otherwise fetch individually
+            if pre_fetched_snapshots is not None:
+                snapshots = pre_fetched_snapshots
+            else:
+                # Use SIP feed for snapshot backup when enabled
+                use_sip_feed = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
+                feed = "sip" if use_sip_feed else None
+                snapshots = self.alpaca.get_snapshots([symbol], feed=feed)
+            
             if not snapshots or symbol not in snapshots:
                 return {
                     "has_data": False,
                     "reason": "snapshot_not_available",
                     "premarket_minutes": 0,
+                    "current_return": None,
                 }
 
             snap = snapshots[symbol]
@@ -1984,12 +1991,13 @@ class CombinedOvernightReboundBot:
                     "has_data": False,
                     "reason": "snapshot_empty",
                     "premarket_minutes": 0,
+                    "current_return": None,
                 }
 
             latest_trade = snap.get("latestTrade") or snap.get("last_trade") or snap.get("latest_trade") or {}
             latest_quote = snap.get("latestQuote") or snap.get("quote") or snap.get("latest_quote") or {}
 
-            def _snap_float(container: dict, *keys: str) -> float:
+            def _float_from(container: dict, *keys: str) -> float:
                 for key in keys:
                     try:
                         val = container.get(key)
@@ -1999,12 +2007,37 @@ class CombinedOvernightReboundBot:
                         continue
                 return 0.0
 
-            last_trade_price = _snap_float(latest_trade, "p", "price")
-            bid = _snap_float(latest_quote, "bp", "bid_price", "bid")
-            ask = _snap_float(latest_quote, "ap", "ask_price", "ask")
+            # Support both raw Alpaca nested snapshots and parsed/flattened snapshots
+            last_trade_price = (
+                _float_from(latest_trade, "p", "price")
+                or _float_from(snap, "last_price", "price", "current_price")
+            )
 
-            quote_timestamp = latest_quote.get("t") or latest_quote.get("timestamp") if latest_quote else None
-            trade_timestamp = latest_trade.get("t") or latest_trade.get("timestamp") if latest_trade else None
+            bid = (
+                _float_from(latest_quote, "bp", "bid_price", "bid")
+                or _float_from(snap, "bid")
+            )
+
+            ask = (
+                _float_from(latest_quote, "ap", "ask_price", "ask")
+                or _float_from(snap, "ask")
+            )
+
+            quote_timestamp = (
+                latest_quote.get("t")
+                or latest_quote.get("timestamp")
+                if latest_quote else None
+            )
+
+            trade_timestamp = (
+                latest_trade.get("t")
+                or latest_trade.get("timestamp")
+                if latest_trade else None
+            )
+
+            # Flattened parser stores the latest trade timestamp here
+            if not trade_timestamp:
+                trade_timestamp = snap.get("timestamp")
 
             def _parse_snap_time(raw) -> Optional[datetime]:
                 if not raw:
@@ -2130,8 +2163,9 @@ class CombinedOvernightReboundBot:
             logger.warning(f"PREMARKET SNAPSHOT FALLBACK FAILED for {symbol}", exc_info=True)
             return {
                 "has_data": False,
-                "reason": "snapshot_fetch_failed",
+                "reason": "snapshot_not_available",
                 "premarket_minutes": 0,
+                "current_return": None,
             }
 
     def _classify_iex_premarket_limit(self, pos: Position, metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -2154,6 +2188,15 @@ class CombinedOvernightReboundBot:
         stale_max = getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
 
         if not metrics.get("has_data"):
+            # Check if data is truly unavailable (current_return is None)
+            current_return = metrics.get("current_return")
+            if current_return is None:
+                return {
+                    "action": "NO_ACTION",
+                    "limit_pct": None,
+                    "reason": "data_unavailable",
+                }
+            # Data available but no bars/snapshot - use conservative fallback
             return {
                 "action": "PLACE_LIMIT",
                 "limit_pct": no_data_fallback_limit,
@@ -2162,7 +2205,17 @@ class CombinedOvernightReboundBot:
 
         bars = int(metrics.get("premarket_minutes", 0) or 0)
         stale = float(metrics.get("last_bar_age_minutes", 999) or 999)
-        current_return = float(metrics.get("current_return", 0.0) or 0.0)
+        current_return = metrics.get("current_return")
+        
+        # If current_return is None, data is unavailable - should have been caught above
+        if current_return is None:
+            return {
+                "action": "NO_ACTION",
+                "limit_pct": None,
+                "reason": "data_unavailable_in_classifier",
+            }
+        
+        current_return = float(current_return) if current_return is not None else 0.0
         distance_from_high = float(metrics.get("distance_from_high", 0.0) or 0.0)
         trend = float(metrics.get("trend_from_first_bar", 0.0) or 0.0)
         sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
@@ -2344,6 +2397,22 @@ class CombinedOvernightReboundBot:
 
         final_time_str = final_time.strftime("%H:%M")
 
+        # Batch fetch all snapshots and bars before looping through symbols
+        # This avoids making separate API calls per symbol and handles SIP fallback at the batch level
+        use_sip_feed = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
+        feed = "sip" if use_sip_feed else None
+        
+        # Batch fetch snapshots with automatic SIP->IEX fallback
+        all_snapshots = {}
+        try:
+            all_snapshots = self.alpaca.get_snapshots(symbols, feed=feed)
+            logger.info(f"PREMARKET LIMITS: batch snapshot fetch returned {len(all_snapshots)} symbols (feed={feed})")
+        except Exception as e:
+            logger.warning(f"PREMARKET LIMITS: batch snapshot fetch failed: {e}")
+        
+        # Batch fetch bars (can't easily batch bars due to per-symbol API, so we'll keep per-symbol for bars)
+        # But we've at least batched the snapshots which were the main 403 failure point
+        
         placed = 0
         no_cap = 0
         skipped = 0
@@ -2378,13 +2447,24 @@ class CombinedOvernightReboundBot:
 
             sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
 
-            metrics = self._compute_live_premarket_metrics(symbol, entry_price, decision_dt)
+            metrics = self._compute_live_premarket_metrics(symbol, entry_price, decision_dt, pre_fetched_snapshots=all_snapshots)
 
             # Check if signal is decisive (act now) or should wait
+            current_return = metrics.get("current_return")
+            
+            # If data is unavailable, skip this checkpoint
+            if current_return is None:
+                waited += 1
+                logger.warning(
+                    f"PREMARKET LIMIT {symbol}: DATA UNAVAILABLE at {decision_time_str} | "
+                    f"source={metrics.get('reason')}, will check again in 15 minutes"
+                )
+                continue
+            
             is_decisive, decisive_reason = self._is_decisive_premarket_signal(
                 decision_time=decision_time_str,
                 final_time=final_time_str,
-                current_return=metrics.get("current_return", 0.0),
+                current_return=current_return,
                 distance_from_high=metrics.get("distance_from_high", 0.0),
                 trend_from_first_bar=metrics.get("trend_from_first_bar", 0.0),
                 minutes_traded=int(metrics.get("premarket_minutes", 0) or 0),
@@ -2416,6 +2496,14 @@ class CombinedOvernightReboundBot:
 
             # Mark as decided so we don't reclassify in future checkpoints
             self.premarket_decided_symbols.add(symbol)
+
+            if decision["action"] == "NO_ACTION":
+                skipped += 1
+                logger.error(
+                    f"PREMARKET LIMIT {symbol} [{decision_time_str}]: NO ACTION (DATA UNAVAILABLE) | "
+                    f"entry={entry_price:.4f}, {log_metrics}, decisive={decisive_reason}, action={decision['reason']}"
+                )
+                continue
 
             if decision["action"] == "NO_CAP":
                 no_cap += 1
@@ -2457,6 +2545,19 @@ class CombinedOvernightReboundBot:
 
         # Check if we're at the final checkpoint
         is_final = decision_time_str >= final_time_str
+
+        # If final checkpoint and data was unavailable for any symbols, log severe warning
+        if is_final:
+            data_unavailable_count = sum(
+                1 for s in symbols
+                if s not in self.premarket_decided_symbols
+                and s not in self.premarket_limit_order_ids
+            )
+            if data_unavailable_count > 0:
+                logger.error(
+                    f"PREMARKET LIMITS FINAL CHECKPOINT: {data_unavailable_count} symbols had no data available "
+                    f"and were not classified. These will be handled by regular morning exit logic."
+                )
 
         logger.warning(
             f"PREMARKET LIMITS [{decision_time_str}] COMPLETE: placed={placed}, no_cap={no_cap}, "
