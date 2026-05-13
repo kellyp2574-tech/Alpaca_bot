@@ -117,7 +117,11 @@ PREMARKET_DYNAMIC_MODERATE_RETURN_PCT = 0.02
 # when IEX bars exist. This protects the classifier from thin, stale, or
 # understated IEX premarket prints. If there are no usable IEX bars, the
 # same SIP snapshot path becomes the full fallback.
-USE_SIP_SNAPSHOT_PREMARKET_BACKUP = True
+# DISABLED: SIP not currently available, using IEX only
+USE_SIP_SNAPSHOT_PREMARKET_BACKUP = False
+
+# Feed to use for premarket dynamic limit data (iex only, SIP disabled)
+PREMARKET_DYNAMIC_DATA_FEED = "iex"
 
 # Maximum spread for SIP snapshot midpoint to be considered usable (2% default)
 SIP_SNAPSHOT_MAX_SPREAD_PCT = 0.02
@@ -128,9 +132,9 @@ SIP_IEX_CONFIRM_DIFF_PCT = 0.0075
 # Allow SIP to correct the premarket high upward if SIP shows a higher price (True default)
 SIP_ALLOW_HIGH_CORRECTION = True
 
-# Fallback limit when no bars AND no usable snapshot (3% default, more conservative than 5%)
-# This is used when both IEX bars and SIP snapshot are unavailable.
-PREMARKET_DYNAMIC_NO_DATA_FALLBACK_LIMIT_PCT = 0.03
+# DEPRECATED: No-data fallback limit is no longer used.
+# New behavior: No data = no order. This config is kept for reference only.
+# PREMARKET_DYNAMIC_NO_DATA_FALLBACK_LIMIT_PCT = 0.03
 
 # ═══════════════════════════════════════════════════
 # Fast open market exit (streamlined 09:30 liquidation)
@@ -139,6 +143,17 @@ PREMARKET_DYNAMIC_NO_DATA_FALLBACK_LIMIT_PCT = 0.03
 # the frozen 09:25 broker-position plan. No green/red decisions, no trailing stops,
 # just simple market sell for everything. This is faster and more reliable.
 ENABLE_FAST_OPEN_MARKET_EXIT = True
+
+# ═══════════════════════════════════════════════════
+# MOO/Open-Auction exit mode (09:25 OPG orders)
+# ═══════════════════════════════════════════════════
+# When enabled, at 09:25 the bot submits MOO (market-on-open) orders using
+# time_in_force="opg" for all overnight positions. If orders are canceled/expired/rejected,
+# the bot immediately submits market sells for remaining shares. Fallback to market
+# sell at 09:30:30 for any remaining positions.
+ENABLE_OPEN_AUCTION_EXIT = True
+OPEN_AUCTION_FALLBACK_TIME = "09:30:30"
+OPEN_AUCTION_TIF = "opg"
 
 # ═══════════════════════════════════════════════════
 # Paper research exit: red-open trailing stop

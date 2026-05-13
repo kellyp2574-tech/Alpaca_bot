@@ -77,9 +77,9 @@ T+1 exit day:
                                   (each checkpoint runs once via dedup set)
   06:00  Final premarket classification for all unresolved symbols
   09:25  Cancel all open orders; freeze broker-position exit plan
-  09:30  Submit market sells in batch (ENABLE_FAST_OPEN_MARKET_EXIT=True).
-         The alternative red-trail mode is mutually exclusive and
-         currently disabled.
+         Submit MOO/OPG orders if ENABLE_OPEN_AUCTION_EXIT=True
+  09:30  Skip fast market exit if MOO mode active (wait for auction fills)
+  09:30:30  Fallback: market-sell any remaining positions after auction
   09:45  V2 failsafe: force-flatten any stragglers with multi-layer retry
          (market → limit −3% → limit −5% half-then-rest)
   16:00  Day complete; restart cycle next afternoon at 15:30
@@ -102,11 +102,13 @@ Adaptive main-loop sleep: 1s during hot windows (05:00–06:02, 09:24–10:05,
 ## Failsafe Layers
 
 1. **09:25 cancel-all** — every open order is canceled before exit logic.
-2. **09:30 batch sells** — broker positions, frozen at 09:25, sold market.
-3. **Red-trail (off in production)** — `ENABLE_RED_OPEN_TRAIL_EXIT=False`.
+2. **MOO/Open-Auction (if enabled)** — submit OPG orders at 09:25, rescue failed orders
+   immediately, fallback to market sell at 09:30:30.
+3. **Fast market exit (if MOO disabled)** — 09:30 batch sells of frozen 09:25 positions.
+4. **Red-trail (off in production)** — `ENABLE_RED_OPEN_TRAIL_EXIT=False`.
    Mutually exclusive with fast-exit; `_validate_config` raises if both are
    accidentally enabled together.
-4. **09:45 V2 failsafe** — `force_flatten_broker_positions` retries
+5. **09:45 V2 failsafe** — `force_flatten_broker_positions` retries
    market → limit −3% → limit −5% half-then-rest, falls back to broker
    `current_price` / `lastday_price` / `avg_entry_price` if the live
    snapshot is unavailable, escalates to a market sell if no reference

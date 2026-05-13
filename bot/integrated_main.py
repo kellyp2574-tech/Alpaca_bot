@@ -18,9 +18,9 @@ MORNING (T+1 exits — positions from yesterday's 15:50 entries):
   06:00  Final premarket classification for all unresolved symbols (runs once,
          within the 06:00–06:02 cutoff window)
   09:25  Cancel any remaining premarket limits, freeze broker exit plan
-  09:30  Submit batched market sells against the frozen plan
-         (ENABLE_FAST_OPEN_MARKET_EXIT=True; the alternative red-trail mode
-         is mutually exclusive and currently disabled)
+         Submit MOO/OPG orders if ENABLE_OPEN_AUCTION_EXIT=True
+  09:30  Skip fast market exit if MOO mode active (wait for auction fills)
+  09:30:30  Fallback: market-sell any remaining positions after auction
   09:45  V2 failsafe — verify broker is flat or force-flatten any stragglers
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
@@ -32,6 +32,7 @@ AFTERNOON (T-1 entries — new positions for tomorrow's exits):
 import logging
 import math
 import os
+import requests
 import sys
 import time
 from datetime import datetime, time as dt_time, date
@@ -92,7 +93,7 @@ def _parse_config_time(time_str: str) -> dt_time:
 # budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
 _HOT_WINDOWS_HHMM = (
     (5, 0, 6, 2),     # Premarket dynamic-limit checkpoints (incl. final 06:00 trip)
-    (9, 24, 10, 5),   # Order cancel, 09:30 batch sells, fills, failsafe
+    (9, 24, 9, 36),   # MOO/OPG orders, auction fills, 09:30:30 fallback
     (15, 29, 16, 1),  # Universe build, scoring, entries, EOD
 )
 
@@ -141,6 +142,14 @@ class CombinedOvernightReboundBot:
         self.premarket_limit_order_ids: Dict[str, str] = {}
         self.premarket_decided_symbols: set = set()  # Track symbols already decided in rolling checks
         self.premarket_checkpoints_done: set = set()  # Per-checkpoint completion guard (HH:MM strings)
+        
+        # MOO/Open-Auction exit mode state
+        self.open_auction_exit_submitted = False
+        self.open_auction_order_ids: Dict[str, str] = {}  # symbol -> order_id
+        self.open_auction_orders: Dict[str, Dict[str, Any]] = {}  # order_id -> order details
+        self.open_auction_submit_failed_symbols: set = set()  # symbols that failed OPG submit
+        self.open_auction_rescue_done = False
+        
         self.end_of_day_reports_done = False
 
         # Failsafe
@@ -347,6 +356,33 @@ class CombinedOvernightReboundBot:
                     self.morning_open_orders_cancelled = True
                     self._build_open_exit_plan_from_broker(reason="09:25 post-cancel broker snapshot")
                     self._save_state()
+                    
+                    # MOO/Open-Auction exit mode: submit OPG orders at 09:25
+                    if getattr(config, "ENABLE_OPEN_AUCTION_EXIT", False):
+                        self._submit_open_auction_orders()
+                    
+                    self._save_state()
+                
+                # Check OPG order status and rescue if needed (09:25-09:30 window)
+                if (self.open_auction_exit_submitted 
+                        and not self.open_auction_rescue_done
+                        and current_time >= t_cancel_orders):
+                    self._check_and_rescue_open_auction_orders()
+                
+                # MOO/Open-Auction fallback: market sell remaining positions at 09:30:30
+                fallback_time_str = getattr(config, "OPEN_AUCTION_FALLBACK_TIME", "09:30:30")
+                try:
+                    fallback_time_dt = datetime.strptime(fallback_time_str, "%H:%M:%S").time()
+                except ValueError:
+                    fallback_time_dt = datetime.strptime(fallback_time_str, "%H:%M").time()
+                
+                if (self.open_auction_exit_submitted 
+                        and not self.open_auction_rescue_done
+                        and current_time >= fallback_time_dt):
+                    logger.warning(f"MOO/Open-Auction fallback at {fallback_time_str}: market selling remaining positions")
+                    self._rescue_remaining_open_auction_positions()
+                    self.open_auction_rescue_done = True
+                    self._save_state()
 
                 has_positions = self.position_mgr.get_position_count() > 0
 
@@ -368,16 +404,35 @@ class CombinedOvernightReboundBot:
                     # 09:30 — fast open liquidation. Use the frozen 09:25 broker-position
                     # plan and submit every market sell before monitoring fills.
                     if not self.gdp_exits_done and current_time >= t_exit_all:
-                        if getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", True):
+                        # Check if MOO/Open-Auction mode is active - if so, skip fast market exit
+                        open_auction_active = (
+                            getattr(config, "ENABLE_OPEN_AUCTION_EXIT", False)
+                            and self.open_auction_exit_submitted
+                            and not self.open_auction_rescue_done
+                        )
+                        
+                        if open_auction_active:
+                            logger.info(
+                                "OPEN_EXIT: MOO/Open-Auction mode active; skipping 09:30 fast market exit "
+                                "until open-auction fallback/reconciliation"
+                            )
+                            # Do NOT mark exits done here - will be marked after 09:30:30 fallback
+                        elif getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", True):
                             self._submit_open_exit_market_sells()
+                            self.gdp_exits_done = True
+                            self.mr_exits_done = True
+                            self._save_state()
                         elif getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
                             self._submit_red_open_trail_or_sell_green()
+                            self.gdp_exits_done = True
+                            self.mr_exits_done = True
+                            self._save_state()
                         else:
                             self._exit_sleeve_positions("GDP", "09:30 all positions (GDP)")
                             self._exit_sleeve_positions("MR", "09:30 all positions (MR)")
-                        self.gdp_exits_done = True
-                        self.mr_exits_done = True
-                        self._save_state()
+                            self.gdp_exits_done = True
+                            self.mr_exits_done = True
+                            self._save_state()
 
                     # Failsafe: 10:00 if red-open trail is enabled, otherwise V2_FAILSAFE_TIME.
                     if (self.gdp_exits_done and self.mr_exits_done
@@ -2180,7 +2235,6 @@ class CombinedOvernightReboundBot:
         is treated as a single price point without bar count requirements.
         """
         fallback_limit = getattr(config, "PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT", 0.05)
-        no_data_fallback_limit = getattr(config, "PREMARKET_DYNAMIC_NO_DATA_FALLBACK_LIMIT_PCT", 0.03)
         sparse_wide_limit = getattr(config, "PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT", 0.10)
         very_high = getattr(config, "PREMARKET_DYNAMIC_VERY_HIGH_RETURN_NO_CAP_PCT", 0.10)
         high = getattr(config, "PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT", 0.05)
@@ -2188,19 +2242,11 @@ class CombinedOvernightReboundBot:
         stale_max = getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
 
         if not metrics.get("has_data"):
-            # Check if data is truly unavailable (current_return is None)
-            current_return = metrics.get("current_return")
-            if current_return is None:
-                return {
-                    "action": "NO_ACTION",
-                    "limit_pct": None,
-                    "reason": "data_unavailable",
-                }
-            # Data available but no bars/snapshot - use conservative fallback
+            # No data available - no order placed
             return {
-                "action": "PLACE_LIMIT",
-                "limit_pct": no_data_fallback_limit,
-                "reason": metrics.get("reason", "no_bars_and_no_snapshot_default_3pct"),
+                "action": "NO_ACTION",
+                "limit_pct": None,
+                "reason": "data_unavailable",
             }
 
         bars = int(metrics.get("premarket_minutes", 0) or 0)
@@ -2454,11 +2500,18 @@ class CombinedOvernightReboundBot:
             
             # If data is unavailable, skip this checkpoint
             if current_return is None:
-                waited += 1
-                logger.warning(
-                    f"PREMARKET LIMIT {symbol}: DATA UNAVAILABLE at {decision_time_str} | "
-                    f"source={metrics.get('reason')}, will check again in 15 minutes"
-                )
+                if decision_time_str >= final_time_str:
+                    skipped += 1
+                    logger.error(
+                        f"PREMARKET LIMIT {symbol}: DATA UNAVAILABLE at FINAL {decision_time_str}; "
+                        f"no premarket limit placed; regular 09:30/MOO exit will handle it"
+                    )
+                else:
+                    waited += 1
+                    logger.warning(
+                        f"PREMARKET LIMIT {symbol}: DATA UNAVAILABLE at {decision_time_str}; "
+                        f"will check again in 15 minutes"
+                    )
                 continue
             
             is_decisive, decisive_reason = self._is_decisive_premarket_signal(
@@ -2572,6 +2625,292 @@ class CombinedOvernightReboundBot:
             # Save state after each checkpoint to track decided symbols
             self._save_state()
 
+    def _submit_open_auction_orders(self):
+        """Submit MOO (market-on-open) orders using OPG time-in-force at 09:25.
+        
+        This submits market orders with time_in_force='opg' for all overnight positions.
+        If orders are canceled/expired/rejected, the bot immediately submits market sells
+        for remaining shares. Fallback to market sell at 09:30:30 for any remaining positions.
+        """
+        if self.open_auction_exit_submitted:
+            logger.info("MOO/Open-Auction exit already submitted; skipping duplicate")
+            return
+        
+        self.position_mgr.reconcile_local_positions_from_broker()
+        symbols = list(self.position_mgr.positions.keys())
+        
+        if not symbols:
+            logger.info("MOO/Open-Auction exit: no overnight positions to sell")
+            self.open_auction_exit_submitted = True
+            self._save_state()
+            return
+        
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("MOO/Open-Auction exit: broker position read failed; skipping")
+            return
+        
+        broker_by_symbol = {
+            str(p.get("symbol", "")).upper(): p
+            for p in broker_positions
+            if p.get("symbol")
+        }
+        
+        opg_tif = getattr(config, "OPEN_AUCTION_TIF", "opg")
+        submitted_count = 0
+        failed_count = 0
+        
+        for symbol in symbols:
+            pos = self.position_mgr.positions.get(symbol)
+            broker_pos = broker_by_symbol.get(symbol.upper())
+            
+            if not pos or not broker_pos:
+                logger.warning(f"MOO/Open-Auction exit {symbol}: missing local/broker position; skipping")
+                failed_count += 1
+                continue
+            
+            try:
+                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
+            except (TypeError, ValueError):
+                qty = int(pos.quantity or 0)
+            
+            if qty <= 0:
+                logger.warning(f"MOO/Open-Auction exit {symbol}: qty <= 0; skipping")
+                failed_count += 1
+                continue
+            
+            # Submit OPG market order
+            resp = self.position_mgr._submit_sell_order(
+                symbol=symbol,
+                qty=qty,
+                order_type="market",
+                time_in_force=opg_tif,
+                extended_hours=False,
+            )
+            
+            if resp and resp.get("id"):
+                order_id = resp["id"]
+                self.open_auction_order_ids[symbol] = order_id
+                self.open_auction_orders[order_id] = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "filled_qty": 0,
+                    "status": "submitted",
+                }
+                submitted_count += 1
+                logger.info(
+                    f"MOO/Open-Auction exit {symbol}: submitted OPG market order qty={qty}, "
+                    f"order_id={order_id}"
+                )
+                # Persist state immediately after each order submit
+                self._save_state()
+            else:
+                failed_count += 1
+                self.open_auction_submit_failed_symbols.add(symbol)
+                logger.error(
+                    f"MOO/Open-Auction exit {symbol}: OPG submit failed; "
+                    f"will sell via fallback market order after open"
+                )
+        
+        self.open_auction_exit_submitted = True
+        logger.warning(
+            f"MOO/Open-Auction exit complete: submitted={submitted_count}, failed={failed_count}"
+        )
+        self._save_state()
+
+    def _rescue_open_auction_order(self, order_id: str, status: str):
+        """Rescue a failed OPG order by immediately submitting a market sell.
+        
+        Called when an OPG order is canceled, expired, or rejected.
+        """
+        if order_id not in self.open_auction_orders:
+            return
+        
+        order_info = self.open_auction_orders[order_id]
+        symbol = order_info["symbol"]
+        original_qty = order_info["qty"]
+        filled_qty = order_info.get("filled_qty", 0)
+        remaining_qty = original_qty - filled_qty
+        
+        if remaining_qty <= 0:
+            logger.info(f"MOO/Open-Auction rescue {symbol}: order fully filled, no rescue needed")
+            return
+        
+        logger.warning(
+            f"MOO/Open-Auction rescue {symbol}: OPG order {order_id} {status}, "
+            f"submitting immediate market sell for {remaining_qty} remaining shares"
+        )
+        
+        # Submit immediate market sell for remaining shares
+        resp = self.position_mgr._submit_sell_order(
+            symbol=symbol,
+            qty=remaining_qty,
+            order_type="market",
+            time_in_force="day",
+            extended_hours=False,
+        )
+        
+        if resp and resp.get("id"):
+            rescue_order_id = resp["id"]
+            logger.info(
+                f"MOO/Open-Auction rescue {symbol}: submitted rescue market order qty={remaining_qty}, "
+                f"rescue_order_id={rescue_order_id}"
+            )
+        else:
+            logger.error(f"MOO/Open-Auction rescue {symbol}: rescue market sell failed")
+        
+        # Update order status
+        order_info["status"] = f"rescued_{status}"
+        self._save_state()
+
+    def _check_and_rescue_open_auction_orders(self):
+        """Check status of OPG orders and rescue if canceled/expired/rejected.
+        
+        This polls order status periodically between 09:25 and 09:30 (not event-driven via websocket).
+        Rescue behavior:
+        - Before 09:30: only rescue rejected orders (immediate failure)
+        - At/after 09:30: rescue canceled/expired/rejected orders (auction-related failures)
+        """
+        if not self.open_auction_orders:
+            return
+        
+        market_open = _parse_config_time(getattr(config, "MARKET_OPEN_TIME", "09:30"))
+        current_time = datetime.now(_ET).time()
+        
+        # Check each OPG order status
+        for order_id, order_info in list(self.open_auction_orders.items()):
+            if order_info["status"].startswith("rescued"):
+                continue  # Already rescued
+            
+            try:
+                # Get order status from Alpaca
+                base_url = getattr(config, "ALPACA_BASE_URL", "https://api.alpaca.markets").rstrip("/")
+                url = f"{base_url}/v2/orders/{order_id}"
+                response = self.position_mgr.session.get(url, timeout=10)
+                response.raise_for_status()
+                order_data = response.json()
+                
+                status = order_data.get("status", "").lower()
+                filled_qty = float(order_data.get("filled_qty", 0))
+                
+                # Update filled_qty in our tracking
+                order_info["filled_qty"] = filled_qty
+                
+                # Check if order is in a terminal state that needs rescue
+                # Before market open: only rescue rejected orders (immediate failure)
+                # At/after market open: rescue canceled/expired/rejected (auction-related failures)
+                if status == "rejected":
+                    logger.warning(
+                        f"MOO/Open-Auction check: order {order_id} rejected, filled={filled_qty}, "
+                        f"triggering rescue"
+                    )
+                    self._rescue_open_auction_order(order_id, status)
+                elif current_time >= market_open and status in ("canceled", "expired"):
+                    logger.warning(
+                        f"MOO/Open-Auction check: order {order_id} {status} after open, filled={filled_qty}, "
+                        f"triggering rescue"
+                    )
+                    self._rescue_open_auction_order(order_id, status)
+                elif status == "filled":
+                    logger.info(f"MOO/Open-Auction check: order {order_id} fully filled")
+                    order_info["status"] = "filled"
+                elif status == "partially_filled":
+                    logger.info(f"MOO/Open-Auction check: order {order_id} partially filled {filled_qty}")
+            
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"MOO/Open-Auction check: failed to get order {order_id} status: {e}")
+            except Exception as e:
+                logger.warning(f"MOO/Open-Auction check: error checking order {order_id}: {e}")
+        
+        self._save_state()
+
+    def _rescue_remaining_open_auction_positions(self):
+        """Market sell any remaining positions at 09:30:30 fallback.
+        
+        This is the final fallback for the MOO/Open-Auction exit mode.
+        After this, any remaining positions will be handled by the regular
+        morning exit logic.
+        """
+        self.position_mgr.reconcile_local_positions_from_broker()
+        symbols = list(self.position_mgr.positions.keys())
+        
+        if not symbols:
+            logger.info("MOO/Open-Auction fallback: no positions to sell")
+            self.gdp_exits_done = True
+            self.mr_exits_done = True
+            self.open_auction_rescue_done = True
+            self._save_state()
+            return
+        
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("MOO/Open-Auction fallback: broker position read failed; skipping")
+            return
+        
+        if not broker_positions:
+            logger.info("MOO/Open-Auction fallback: broker confirmed flat")
+            self.gdp_exits_done = True
+            self.mr_exits_done = True
+            self.open_auction_rescue_done = True
+            self._save_state()
+            return
+        
+        broker_by_symbol = {
+            str(p.get("symbol", "")).upper(): p
+            for p in broker_positions
+            if p.get("symbol")
+        }
+        
+        rescued_count = 0
+        failed_count = 0
+        
+        for symbol in symbols:
+            pos = self.position_mgr.positions.get(symbol)
+            broker_pos = broker_by_symbol.get(symbol.upper())
+            
+            if not pos or not broker_pos:
+                logger.warning(f"MOO/Open-Auction fallback {symbol}: missing local/broker position; skipping")
+                failed_count += 1
+                continue
+            
+            try:
+                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
+            except (TypeError, ValueError):
+                qty = int(pos.quantity or 0)
+            
+            if qty <= 0:
+                logger.warning(f"MOO/Open-Auction fallback {symbol}: qty <= 0; skipping")
+                failed_count += 1
+                continue
+            
+            # Submit immediate market sell
+            resp = self.position_mgr._submit_sell_order(
+                symbol=symbol,
+                qty=qty,
+                order_type="market",
+                time_in_force="day",
+                extended_hours=False,
+            )
+            
+            if resp and resp.get("id"):
+                rescued_count += 1
+                logger.info(
+                    f"MOO/Open-Auction fallback {symbol}: submitted market sell qty={qty}, "
+                    f"order_id={resp['id']}"
+                )
+            else:
+                failed_count += 1
+                logger.error(f"MOO/Open-Auction fallback {symbol}: market sell failed")
+        
+        logger.warning(
+            f"MOO/Open-Auction fallback complete: rescued={rescued_count}, failed={failed_count}"
+        )
+        # Mark exits as done after fallback
+        self.gdp_exits_done = True
+        self.mr_exits_done = True
+        self.open_auction_rescue_done = True
+        self._save_state()
+
     def _save_end_of_day_reports(self):
         """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
         try:
@@ -2678,6 +3017,11 @@ class CombinedOvernightReboundBot:
                 "premarket_limit_order_ids": self.premarket_limit_order_ids,
                 "premarket_decided_symbols": list(self.premarket_decided_symbols),
                 "premarket_checkpoints_done": list(self.premarket_checkpoints_done),
+                "open_auction_exit_submitted": self.open_auction_exit_submitted,
+                "open_auction_order_ids": self.open_auction_order_ids,
+                "open_auction_orders": self.open_auction_orders,
+                "open_auction_submit_failed_symbols": list(self.open_auction_submit_failed_symbols),
+                "open_auction_rescue_done": self.open_auction_rescue_done,
                 "end_of_day_reports_done": self.end_of_day_reports_done,
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
@@ -2729,6 +3073,14 @@ class CombinedOvernightReboundBot:
         self.premarket_limit_order_ids = bot_state.get("premarket_limit_order_ids", {})
         self.premarket_decided_symbols = set(bot_state.get("premarket_decided_symbols", []))
         self.premarket_checkpoints_done = set(bot_state.get("premarket_checkpoints_done", []))
+        
+        # MOO/Open-Auction state
+        self.open_auction_exit_submitted = bot_state.get("open_auction_exit_submitted", False)
+        self.open_auction_order_ids = bot_state.get("open_auction_order_ids", {})
+        self.open_auction_orders = bot_state.get("open_auction_orders", {})
+        self.open_auction_submit_failed_symbols = set(bot_state.get("open_auction_submit_failed_symbols", []))
+        self.open_auction_rescue_done = bot_state.get("open_auction_rescue_done", False)
+        
         self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
 
         # Load positions
