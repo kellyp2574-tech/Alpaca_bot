@@ -18,9 +18,8 @@ MORNING (T+1 exits — positions from yesterday's 15:50 entries):
   06:00  Final premarket classification for all unresolved symbols (runs once,
          within the 06:00–06:02 cutoff window)
   09:25  Cancel any remaining premarket limits, freeze broker exit plan
-         Submit MOO/OPG orders if ENABLE_OPEN_AUCTION_EXIT=True
-  09:30  Skip fast market exit if MOO mode active (wait for auction fills)
-  09:30:30  Fallback: market-sell any remaining positions after auction
+  09:30  Submit batched market sells for all remaining broker positions
+  09:31  Broker-native rescue pass for any remaining positions
   09:45  V2 failsafe — verify broker is flat or force-flatten any stragglers
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
@@ -35,7 +34,7 @@ import os
 import requests
 import sys
 import time
-from datetime import datetime, time as dt_time, date
+from datetime import datetime, time as dt_time, date, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
 
@@ -93,7 +92,7 @@ def _parse_config_time(time_str: str) -> dt_time:
 # budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
 _HOT_WINDOWS_HHMM = (
     (5, 0, 6, 2),     # Premarket dynamic-limit checkpoints (incl. final 06:00 trip)
-    (9, 24, 9, 36),   # MOO/OPG orders, auction fills, 09:30:30 fallback
+    (9, 24, 9, 36),   # Order cancel, 09:30 batch sells, 09:31 rescue
     (15, 29, 16, 1),  # Universe build, scoring, entries, EOD
 )
 
@@ -143,12 +142,8 @@ class CombinedOvernightReboundBot:
         self.premarket_decided_symbols: set = set()  # Track symbols already decided in rolling checks
         self.premarket_checkpoints_done: set = set()  # Per-checkpoint completion guard (HH:MM strings)
         
-        # MOO/Open-Auction exit mode state
-        self.open_auction_exit_submitted = False
-        self.open_auction_order_ids: Dict[str, str] = {}  # symbol -> order_id
-        self.open_auction_orders: Dict[str, Dict[str, Any]] = {}  # order_id -> order details
-        self.open_auction_submit_failed_symbols: set = set()  # symbols that failed OPG submit
-        self.open_auction_rescue_done = False
+        # Open market exit state
+        self.open_market_rescue_done = False
         
         self.end_of_day_reports_done = False
 
@@ -356,33 +351,6 @@ class CombinedOvernightReboundBot:
                     self.morning_open_orders_cancelled = True
                     self._build_open_exit_plan_from_broker(reason="09:25 post-cancel broker snapshot")
                     self._save_state()
-                    
-                    # MOO/Open-Auction exit mode: submit OPG orders at 09:25
-                    if getattr(config, "ENABLE_OPEN_AUCTION_EXIT", False):
-                        self._submit_open_auction_orders()
-                    
-                    self._save_state()
-                
-                # Check OPG order status and rescue if needed (09:25-09:30 window)
-                if (self.open_auction_exit_submitted 
-                        and not self.open_auction_rescue_done
-                        and current_time >= t_cancel_orders):
-                    self._check_and_rescue_open_auction_orders()
-                
-                # MOO/Open-Auction fallback: market sell remaining positions at 09:30:30
-                fallback_time_str = getattr(config, "OPEN_AUCTION_FALLBACK_TIME", "09:30:30")
-                try:
-                    fallback_time_dt = datetime.strptime(fallback_time_str, "%H:%M:%S").time()
-                except ValueError:
-                    fallback_time_dt = datetime.strptime(fallback_time_str, "%H:%M").time()
-                
-                if (self.open_auction_exit_submitted 
-                        and not self.open_auction_rescue_done
-                        and current_time >= fallback_time_dt):
-                    logger.warning(f"MOO/Open-Auction fallback at {fallback_time_str}: market selling remaining positions")
-                    self._rescue_remaining_open_auction_positions()
-                    self.open_auction_rescue_done = True
-                    self._save_state()
 
                 has_positions = self.position_mgr.get_position_count() > 0
 
@@ -404,20 +372,7 @@ class CombinedOvernightReboundBot:
                     # 09:30 — fast open liquidation. Use the frozen 09:25 broker-position
                     # plan and submit every market sell before monitoring fills.
                     if not self.gdp_exits_done and current_time >= t_exit_all:
-                        # Check if MOO/Open-Auction mode is active - if so, skip fast market exit
-                        open_auction_active = (
-                            getattr(config, "ENABLE_OPEN_AUCTION_EXIT", False)
-                            and self.open_auction_exit_submitted
-                            and not self.open_auction_rescue_done
-                        )
-                        
-                        if open_auction_active:
-                            logger.info(
-                                "OPEN_EXIT: MOO/Open-Auction mode active; skipping 09:30 fast market exit "
-                                "until open-auction fallback/reconciliation"
-                            )
-                            # Do NOT mark exits done here - will be marked after 09:30:30 fallback
-                        elif getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", True):
+                        if getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", True):
                             self._submit_open_exit_market_sells()
                             self.gdp_exits_done = True
                             self.mr_exits_done = True
@@ -433,6 +388,20 @@ class CombinedOvernightReboundBot:
                             self.gdp_exits_done = True
                             self.mr_exits_done = True
                             self._save_state()
+
+                    # 09:31 — broker-native rescue pass for any remaining positions
+                    t_rescue = dt_time(t_exit_all.hour, t_exit_all.minute + 1)
+                    if (self.gdp_exits_done and self.mr_exits_done
+                            and not self.open_market_rescue_done
+                            and current_time >= t_rescue):
+                        bc = self.position_mgr.broker_position_count()
+                        if bc > 0:
+                            logger.warning(f"09:31 rescue: broker still has {bc} positions, running broker-native rescue")
+                            self._run_broker_native_rescue()
+                        elif bc == 0:
+                            logger.info("09:31 rescue: broker confirmed flat")
+                        self.open_market_rescue_done = True
+                        self._save_state()
 
                     # Failsafe: 10:00 if red-open trail is enabled, otherwise V2_FAILSAFE_TIME.
                     if (self.gdp_exits_done and self.mr_exits_done
@@ -454,13 +423,17 @@ class CombinedOvernightReboundBot:
                         self._save_state()
 
                     # Early completion: only allowed before failsafe when no trailing orders are active.
+                    # Requires broker confirmation (not local position count) to ensure rescue runs.
                     if (not getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False)
-                            and self.gdp_exits_done and self.mr_exits_done
-                            and self.position_mgr.get_position_count() == 0
+                            and self.gdp_exits_done
+                            and self.mr_exits_done
                             and not self.morning_exits_done):
-                        logger.info("All exits complete — no positions remaining")
-                        self.morning_exits_done = True
-                        self._save_state()
+                        bc = self.position_mgr.broker_position_count()
+                        if bc == 0:
+                            logger.info("All exits complete — broker confirmed flat")
+                            self.position_mgr.positions.clear()
+                            self.morning_exits_done = True
+                            self._save_state()
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions
@@ -810,6 +783,65 @@ class CombinedOvernightReboundBot:
             logger.warning("OPEN_EXIT: broker still shows %d positions after batch submit; failsafe will retry", remaining)
         else:
             logger.error("OPEN_EXIT: broker position count unavailable after batch submit")
+
+    def _run_broker_native_rescue(self):
+        """Broker-native rescue pass at 09:31 for any remaining positions.
+        
+        This fetches broker positions directly and market-sells whatever remains.
+        Submits all orders first, then reconciles with a small sleep for Alpaca to update state.
+        Only marks exits complete after broker confirms flat.
+        """
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is None:
+            logger.error("09:31 rescue: broker position read failed; skipping")
+            return
+        
+        if not broker_positions:
+            logger.info("09:31 rescue: broker confirmed flat")
+            return
+        
+        logger.warning(f"09:31 rescue: broker has {len(broker_positions)} positions, selling all")
+        
+        submitted = []
+        
+        for broker_pos in broker_positions:
+            symbol = str(broker_pos.get("symbol", "")).upper()
+            try:
+                qty = abs(int(float(broker_pos.get("qty", 0))))
+            except (TypeError, ValueError):
+                logger.warning(f"09:31 rescue: bad qty for {symbol}: {broker_pos.get('qty')}")
+                continue
+            
+            if qty <= 0:
+                continue
+            
+            logger.info(f"09:31 rescue: selling {symbol} x{qty}")
+            resp = self.position_mgr._submit_sell_order(
+                symbol=symbol,
+                qty=qty,
+                order_type="market",
+                time_in_force="day",
+                extended_hours=False,
+            )
+            
+            if resp and resp.get("id"):
+                submitted.append((symbol, qty, resp["id"]))
+                logger.info(f"09:31 rescue: submitted market sell for {symbol} x{qty}, order_id={resp['id']}")
+            else:
+                logger.error(f"09:31 rescue: failed to submit market sell for {symbol} x{qty}")
+        
+        logger.warning(f"09:31 rescue: submitted={len(submitted)}")
+        
+        # Small sleep to allow Alpaca to update position state
+        time.sleep(3)
+        
+        # Reconcile after rescue
+        self.position_mgr.reconcile_local_positions_from_broker()
+        remaining = self.position_mgr.broker_position_count()
+        if remaining == 0:
+            logger.info("09:31 rescue: broker confirmed flat after rescue")
+        else:
+            logger.warning(f"09:31 rescue: broker still has {remaining} positions after rescue")
 
     # ════════════════════════════════════════════════════════════
     # AFTERNOON DATA & SCORING METHODS
@@ -1796,36 +1828,49 @@ class CombinedOvernightReboundBot:
 
         self._save_state()
 
-    def _fetch_live_premarket_bars(self, symbol: str, decision_dt: datetime) -> List[dict]:
-        """Fetch today's live IEX 1-minute bars from 04:00 through the decision time.
-
-        This intentionally uses the Alpaca data API directly so the 06:00 live
-        decision does not depend on historical cache files. With IEX, premarket
-        bars can be sparse; the classifier treats sparse bars as usable signal
-        rather than requiring dense coverage.
+    def _fetch_delayed_sip_premarket_bars(self, symbols: List[str], decision_dt: datetime) -> Dict[str, List[dict]]:
+        """Fetch delayed SIP 1-minute bars from 04:00 through decision_dt - 16 minutes.
+        
+        This uses the historical bars endpoint with feed=sip and a deliberately delayed
+        end parameter to work around the 15-minute SIP delay. For delayed SIP without
+        a live SIP subscription, the end parameter must be at least 15 minutes old.
+        
+        Returns a dict mapping symbol -> list of bars.
         """
+        delay_minutes = getattr(config, "PREMARKET_SIP_DELAY_MINUTES", 16)
         start_dt = datetime.combine(decision_dt.date(), dt_time(4, 0), tzinfo=_ET)
-        end_dt = decision_dt
+        end_dt = decision_dt - timedelta(minutes=delay_minutes)
+        
         data_url = getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-        feed = getattr(config, "PREMARKET_DYNAMIC_DATA_FEED", getattr(config, "DATA_FEED", "iex"))
-        url = f"{data_url}/v2/stocks/{symbol}/bars"
+        url = f"{data_url}/v2/stocks/bars"
+        
         params = {
+            "symbols": ",".join(symbols),
             "timeframe": "1Min",
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
             "adjustment": "raw",
-            "feed": feed,
-            "limit": 1000,
+            "feed": "sip",
+            "limit": 10000,
         }
+        
         try:
-            resp = self.position_mgr.session.get(url, params=params, timeout=15)
+            resp = self.position_mgr.session.get(url, params=params, timeout=30)
             resp.raise_for_status()
             payload = resp.json()
-            bars = payload.get("bars", [])
-            return bars if isinstance(bars, list) else []
-        except Exception:
-            logger.warning(f"06:00 LIMIT {symbol}: failed to fetch live premarket bars", exc_info=True)
-            return []
+            
+            # Parse the multi-symbol response into a dict
+            bars_by_symbol = {}
+            for symbol, bars_data in payload.get("bars", {}).items():
+                bars = bars_data if isinstance(bars_data, list) else []
+                bars_by_symbol[symbol] = bars
+            
+            logger.info(f"Delayed SIP premarket bars: fetched {len(bars_by_symbol)} symbols, end={end_dt.strftime('%H:%M')}")
+            return bars_by_symbol
+            
+        except Exception as e:
+            logger.warning(f"Delayed SIP premarket bars: failed to fetch for {len(symbols)} symbols: {e}", exc_info=True)
+            return {}
 
     @staticmethod
     def _bar_dt(bar: dict) -> Optional[datetime]:
@@ -1852,18 +1897,20 @@ class CombinedOvernightReboundBot:
                     continue
         return None
 
-    def _compute_live_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_snapshots: Optional[Dict[str, dict]] = None) -> Dict[str, Any]:
-        """Compute premarket metrics with IEX bars + SIP snapshot backup.
-
-        IEX bars remain the primary source for the premarket *shape*:
-        first print, high/low, volume, distance from high, and trend.
-
-        SIP snapshot data is used as a current-price cross-check even when IEX
-        bars exist. This protects the 05:00-06:00 limit classifier from thin,
-        stale, or understated IEX premarket prints. If there are no usable IEX
-        bars, the same SIP snapshot path becomes the full fallback.
+    def _compute_delayed_sip_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_bars: Optional[Dict[str, List[dict]]] = None) -> Dict[str, Any]:
+        """Compute premarket metrics from delayed SIP historical bars.
+        
+        This uses delayed SIP 1-minute bars ending at decision_dt - 16 minutes.
+        No SIP snapshot backup - we rely entirely on delayed SIP historical bars.
         """
-        bars_raw = self._fetch_live_premarket_bars(symbol, decision_dt)
+        # Use pre-fetched bars if provided (batch mode), otherwise fetch individually
+        if pre_fetched_bars is not None:
+            bars_raw = pre_fetched_bars.get(symbol, [])
+        else:
+            # Fallback: fetch individually if not batched
+            bars_by_symbol = self._fetch_delayed_sip_premarket_bars([symbol], decision_dt)
+            bars_raw = bars_by_symbol.get(symbol, [])
+        
         normalized = []
         for bar in bars_raw:
             dt_val = self._bar_dt(bar)
@@ -1882,131 +1929,64 @@ class CombinedOvernightReboundBot:
 
         normalized.sort(key=lambda b: b["dt"])
 
-        # Always try the SIP snapshot when enabled. If bars exist, this is a
-        # cross-check/current-price correction. If bars are missing, this is the
-        # full fallback.
-        use_sip_backup = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
-        snapshot_metrics = {}
-        if use_sip_backup:
-            snapshot_metrics = self._compute_snapshot_metrics(symbol, buy_price, decision_dt, pre_fetched_snapshots=pre_fetched_snapshots)
-
-        if normalized:
-            first = normalized[0]
-            last = normalized[-1]
-            iex_stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
-            iex_high = max(b["high"] for b in normalized)
-            iex_low = min(b["low"] for b in normalized)
-            premarket_volume = sum(b["volume"] for b in normalized)
-            iex_current = last["close"]
-            first_price = first["close"]
-
-            resolved_current = iex_current
-            resolved_source = "iex_only"
-            resolved_stale_minutes = iex_stale_minutes
-            effective_high = iex_high
-            sip_current = None
-            sip_spread_pct = None
-            sip_stale_minutes = None
-            sip_reason = snapshot_metrics.get("reason") if snapshot_metrics else None
-
-            if snapshot_metrics.get("has_data"):
-                sip_current = float(snapshot_metrics.get("current_price", 0.0) or 0.0)
-                sip_spread_pct = snapshot_metrics.get("snapshot_spread_pct")
-                sip_stale_minutes = float(snapshot_metrics.get("last_bar_age_minutes", 999) or 999)
-                max_spread = getattr(config, "SIP_SNAPSHOT_MAX_SPREAD_PCT", 0.02)
-                confirm_diff = getattr(config, "SIP_IEX_CONFIRM_DIFF_PCT", 0.0075)
-
-                spread_ok = (
-                    sip_spread_pct is None
-                    or sip_spread_pct <= 0
-                    or float(sip_spread_pct) <= max_spread
-                )
-
-                if sip_current > 0 and spread_ok and iex_current > 0:
-                    diff_pct = abs(sip_current - iex_current) / iex_current
-                    if diff_pct <= confirm_diff:
-                        resolved_current = sip_current
-                        resolved_source = "sip_confirmed"
-                        resolved_stale_minutes = sip_stale_minutes
-                    elif sip_current > iex_current:
-                        resolved_current = sip_current
-                        resolved_source = "sip_higher_than_iex"
-                        resolved_stale_minutes = sip_stale_minutes
-                    else:
-                        # SIP lower than IEX: use the lower/conservative mark.
-                        resolved_current = min(iex_current, sip_current)
-                        resolved_source = "conservative_min_iex_sip"
-                        resolved_stale_minutes = min(iex_stale_minutes, sip_stale_minutes)
-                elif sip_current > 0 and not spread_ok:
-                    resolved_source = "iex_only_sip_wide_spread"
-
-                if (
-                    getattr(config, "SIP_ALLOW_HIGH_CORRECTION", True)
-                    and sip_current
-                    and sip_current > effective_high
-                    and (sip_spread_pct is None or sip_spread_pct <= 0 or sip_spread_pct <= getattr(config, "SIP_SNAPSHOT_MAX_SPREAD_PCT", 0.02))
-                ):
-                    effective_high = sip_current
-
-            current_return = resolved_current / buy_price - 1.0 if buy_price > 0 else 0.0
-            distance_from_high = resolved_current / effective_high - 1.0 if effective_high > 0 else 0.0
-            return_from_low = resolved_current / iex_low - 1.0 if iex_low > 0 else 0.0
-            trend_from_first_bar = resolved_current / first_price - 1.0 if first_price > 0 else 0.0
-
-            logger.info(
-                "PREMARKET PRICE RESOLVE %s: entry=%.4f iex_latest=%.4f sip_price=%s "
-                "sip_spread=%s resolved=%.4f source=%s ret=%+.2f%% iex_high=%.4f effective_high=%.4f "
-                "iex_stale=%.0fm resolved_stale=%.0fm sip_reason=%s",
-                symbol,
-                buy_price,
-                iex_current,
-                f"{sip_current:.4f}" if sip_current else "None",
-                f"{sip_spread_pct:.2%}" if sip_spread_pct is not None else "None",
-                resolved_current,
-                resolved_source,
-                current_return * 100.0,
-                iex_high,
-                effective_high,
-                iex_stale_minutes,
-                resolved_stale_minutes,
-                sip_reason,
-            )
-
+        if not normalized:
             return {
-                "has_data": True,
-                "reason": "iex_premarket_data",
-                "price_source": resolved_source,
-                "first_premarket_time": first["dt"],
-                "first_premarket_price": first_price,
-                "current_time": last["dt"],
-                "current_price": resolved_current,
-                "iex_current_price": iex_current,
-                "sip_current_price": sip_current,
-                "sip_snapshot_reason": sip_reason,
-                "premarket_high": effective_high,
-                "iex_premarket_high": iex_high,
-                "premarket_low": iex_low,
-                "premarket_minutes": len(normalized),
-                "premarket_volume": premarket_volume,
-                "last_bar_age_minutes": resolved_stale_minutes,
-                "iex_last_bar_age_minutes": iex_stale_minutes,
-                "snapshot_spread_pct": sip_spread_pct,
-                "current_return": current_return,
-                "distance_from_high": distance_from_high,
-                "return_from_low": return_from_low,
-                "trend_from_first_bar": trend_from_first_bar,
+                "has_data": False,
+                "reason": "no_delayed_sip_bars",
+                "premarket_minutes": 0,
+                "current_return": None,
             }
 
-        # No bars - use snapshot fallback if available.
-        if snapshot_metrics.get("has_data"):
-            return snapshot_metrics
+        first = normalized[0]
+        last = normalized[-1]
+        sip_stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
+        sip_high = max(b["high"] for b in normalized)
+        sip_low = min(b["low"] for b in normalized)
+        premarket_volume = sum(b["volume"] for b in normalized)
+        sip_current = last["close"]
+        first_price = first["close"]
 
-        # Both failed - return true no data with current_return=None to distinguish from zero return
+        current_return = sip_current / buy_price - 1.0 if buy_price > 0 else 0.0
+        distance_from_high = sip_current / sip_high - 1.0 if sip_high > 0 else 0.0
+        return_from_low = sip_current / sip_low - 1.0 if sip_low > 0 else 0.0
+        trend_from_first_bar = sip_current / first_price - 1.0 if first_price > 0 else 0.0
+
+        logger.info(
+            "PREMARKET DELAYED SIP %s: entry=%.4f current=%.4f ret=%+.2f%% "
+            "high=%.4f low=%.4f bars=%d stale=%.0fm",
+            symbol,
+            buy_price,
+            sip_current,
+            current_return * 100.0,
+            sip_high,
+            sip_low,
+            len(normalized),
+            sip_stale_minutes,
+        )
+
         return {
-            "has_data": False,
-            "reason": "no_bars_and_no_snapshot",
-            "premarket_minutes": 0,
-            "current_return": None,
+            "has_data": True,
+            "reason": "delayed_sip_bars",
+            "price_source": "delayed_sip",
+            "first_premarket_time": first["dt"],
+            "first_premarket_price": first_price,
+            "current_time": last["dt"],
+            "current_price": sip_current,
+            "iex_current_price": None,
+            "sip_current_price": sip_current,
+            "sip_snapshot_reason": None,
+            "premarket_high": sip_high,
+            "iex_premarket_high": sip_high,
+            "premarket_low": sip_low,
+            "premarket_minutes": len(normalized),
+            "premarket_volume": premarket_volume,
+            "last_bar_age_minutes": sip_stale_minutes,
+            "iex_last_bar_age_minutes": sip_stale_minutes,
+            "snapshot_spread_pct": None,
+            "current_return": current_return,
+            "distance_from_high": distance_from_high,
+            "return_from_low": return_from_low,
+            "trend_from_first_bar": trend_from_first_bar,
         }
 
     def _compute_snapshot_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_snapshots: Optional[Dict[str, dict]] = None) -> Dict[str, Any]:
@@ -2223,16 +2203,12 @@ class CombinedOvernightReboundBot:
                 "current_return": None,
             }
 
-    def _classify_iex_premarket_limit(self, pos: Position, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """Lenient IEX-aware dynamic limit decision.
+    def _classify_premarket_limit(self, pos: Position, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Lenient delayed SIP-aware dynamic limit decision.
 
-        Absence of IEX prints is not treated as proof there is no market-wide
-        premarket activity, but it does make it less likely that this is one of
-        the true runners we are trying not to cap. Therefore the fallback is a
-        normal 5% harvest limit rather than no decision.
-        
-        Now includes snapshot fallback when bars are unavailable. Snapshot data
-        is treated as a single price point without bar count requirements.
+        Uses delayed SIP historical bars ending at decision_dt - 16 minutes.
+        Sparse bars are treated as usable signal rather than requiring dense coverage.
+        The fallback for unclear signals is a normal 5% harvest limit rather than no decision.
         """
         fallback_limit = getattr(config, "PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT", 0.05)
         sparse_wide_limit = getattr(config, "PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT", 0.10)
@@ -2286,32 +2262,32 @@ class CombinedOvernightReboundBot:
             else:
                 return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "snapshot_negative_pop_harvest_3pct"}
 
-        # Bar-based decision: original logic with bar count requirements
-        # True runner: even sparse IEX activity is enough not to choke it.
+        # Bar-based decision: delayed SIP bars with bar count requirements
+        # True runner: even sparse SIP activity is enough not to choke it.
         if current_return >= very_high and bars >= 1 and fresh_enough:
-            return {"action": "NO_CAP", "limit_pct": None, "reason": "iex_very_high_return_no_cap"}
+            return {"action": "NO_CAP", "limit_pct": None, "reason": "sip_very_high_return_no_cap"}
 
-        # Strong runner: needs at least a little IEX confirmation, but not dense tape.
+        # Strong runner: needs at least a little SIP confirmation, but not dense tape.
         if current_return >= high:
             if bars >= 2 and fresh_enough:
                 # MR can still harvest below +10%; continuation/unknown stays uncapped.
                 if sleeve == "MR" and current_return < very_high:
-                    return {"action": "PLACE_LIMIT", "limit_pct": fallback_limit, "reason": "iex_high_return_mr_harvest_5pct"}
-                return {"action": "NO_CAP", "limit_pct": None, "reason": "iex_high_return_no_cap"}
-            return {"action": "PLACE_LIMIT", "limit_pct": sparse_wide_limit, "reason": "iex_high_return_sparse_wide_10pct"}
+                    return {"action": "PLACE_LIMIT", "limit_pct": fallback_limit, "reason": "sip_high_return_mr_harvest_5pct"}
+                return {"action": "NO_CAP", "limit_pct": None, "reason": "sip_high_return_no_cap"}
+            return {"action": "PLACE_LIMIT", "limit_pct": sparse_wide_limit, "reason": "sip_high_return_sparse_wide_10pct"}
 
         # Moderate winner: if it is building and near highs, give it more room.
         if current_return >= moderate:
             if distance_from_high > -0.01 and trend > 0 and fresh_enough:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.07, "reason": "iex_moderate_near_high_7pct"}
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.07, "reason": "sip_moderate_near_high_7pct"}
             if distance_from_high < -0.03 or trend < 0:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.05, "reason": "iex_moderate_fading_5pct"}
-            return {"action": "PLACE_LIMIT", "limit_pct": 0.06, "reason": "iex_moderate_default_6pct"}
+                return {"action": "PLACE_LIMIT", "limit_pct": 0.05, "reason": "sip_moderate_fading_5pct"}
+            return {"action": "PLACE_LIMIT", "limit_pct": 0.06, "reason": "sip_moderate_default_6pct"}
 
         if current_return >= 0:
-            return {"action": "PLACE_LIMIT", "limit_pct": 0.04, "reason": "iex_small_winner_4pct"}
+            return {"action": "PLACE_LIMIT", "limit_pct": 0.04, "reason": "sip_small_winner_4pct"}
 
-        return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "iex_negative_pop_harvest_3pct"}
+        return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "sip_negative_pop_harvest_3pct"}
 
     def _is_decisive_premarket_signal(
         self,
@@ -2443,21 +2419,10 @@ class CombinedOvernightReboundBot:
 
         final_time_str = final_time.strftime("%H:%M")
 
-        # Batch fetch all snapshots and bars before looping through symbols
-        # This avoids making separate API calls per symbol and handles SIP fallback at the batch level
-        use_sip_feed = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
-        feed = "sip" if use_sip_feed else None
-        
-        # Batch fetch snapshots with automatic SIP->IEX fallback
-        all_snapshots = {}
-        try:
-            all_snapshots = self.alpaca.get_snapshots(symbols, feed=feed)
-            logger.info(f"PREMARKET LIMITS: batch snapshot fetch returned {len(all_snapshots)} symbols (feed={feed})")
-        except Exception as e:
-            logger.warning(f"PREMARKET LIMITS: batch snapshot fetch failed: {e}")
-        
-        # Batch fetch bars (can't easily batch bars due to per-symbol API, so we'll keep per-symbol for bars)
-        # But we've at least batched the snapshots which were the main 403 failure point
+        # Batch fetch delayed SIP bars for all symbols before looping
+        # This uses the historical bars endpoint with feed=sip and end=decision_dt - 16 minutes
+        all_bars = self._fetch_delayed_sip_premarket_bars(symbols, decision_dt)
+        logger.info(f"PREMARKET LIMITS: batch delayed SIP bars fetched {len(all_bars)} symbols")
         
         placed = 0
         no_cap = 0
@@ -2493,7 +2458,7 @@ class CombinedOvernightReboundBot:
 
             sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
 
-            metrics = self._compute_live_premarket_metrics(symbol, entry_price, decision_dt, pre_fetched_snapshots=all_snapshots)
+            metrics = self._compute_delayed_sip_premarket_metrics(symbol, entry_price, decision_dt, pre_fetched_bars=all_bars)
 
             # Check if signal is decisive (act now) or should wait
             current_return = metrics.get("current_return")
@@ -2536,7 +2501,7 @@ class CombinedOvernightReboundBot:
                 continue
 
             # Symbol is decisive - classify and act
-            decision = self._classify_iex_premarket_limit(pos, metrics)
+            decision = self._classify_premarket_limit(pos, metrics)
 
             log_metrics = (
                 f"source={metrics.get('reason')}, "
@@ -2624,292 +2589,6 @@ class CombinedOvernightReboundBot:
         else:
             # Save state after each checkpoint to track decided symbols
             self._save_state()
-
-    def _submit_open_auction_orders(self):
-        """Submit MOO (market-on-open) orders using OPG time-in-force at 09:25.
-        
-        This submits market orders with time_in_force='opg' for all overnight positions.
-        If orders are canceled/expired/rejected, the bot immediately submits market sells
-        for remaining shares. Fallback to market sell at 09:30:30 for any remaining positions.
-        """
-        if self.open_auction_exit_submitted:
-            logger.info("MOO/Open-Auction exit already submitted; skipping duplicate")
-            return
-        
-        self.position_mgr.reconcile_local_positions_from_broker()
-        symbols = list(self.position_mgr.positions.keys())
-        
-        if not symbols:
-            logger.info("MOO/Open-Auction exit: no overnight positions to sell")
-            self.open_auction_exit_submitted = True
-            self._save_state()
-            return
-        
-        broker_positions = self.position_mgr.get_broker_positions()
-        if broker_positions is None:
-            logger.error("MOO/Open-Auction exit: broker position read failed; skipping")
-            return
-        
-        broker_by_symbol = {
-            str(p.get("symbol", "")).upper(): p
-            for p in broker_positions
-            if p.get("symbol")
-        }
-        
-        opg_tif = getattr(config, "OPEN_AUCTION_TIF", "opg")
-        submitted_count = 0
-        failed_count = 0
-        
-        for symbol in symbols:
-            pos = self.position_mgr.positions.get(symbol)
-            broker_pos = broker_by_symbol.get(symbol.upper())
-            
-            if not pos or not broker_pos:
-                logger.warning(f"MOO/Open-Auction exit {symbol}: missing local/broker position; skipping")
-                failed_count += 1
-                continue
-            
-            try:
-                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
-            except (TypeError, ValueError):
-                qty = int(pos.quantity or 0)
-            
-            if qty <= 0:
-                logger.warning(f"MOO/Open-Auction exit {symbol}: qty <= 0; skipping")
-                failed_count += 1
-                continue
-            
-            # Submit OPG market order
-            resp = self.position_mgr._submit_sell_order(
-                symbol=symbol,
-                qty=qty,
-                order_type="market",
-                time_in_force=opg_tif,
-                extended_hours=False,
-            )
-            
-            if resp and resp.get("id"):
-                order_id = resp["id"]
-                self.open_auction_order_ids[symbol] = order_id
-                self.open_auction_orders[order_id] = {
-                    "symbol": symbol,
-                    "qty": qty,
-                    "filled_qty": 0,
-                    "status": "submitted",
-                }
-                submitted_count += 1
-                logger.info(
-                    f"MOO/Open-Auction exit {symbol}: submitted OPG market order qty={qty}, "
-                    f"order_id={order_id}"
-                )
-                # Persist state immediately after each order submit
-                self._save_state()
-            else:
-                failed_count += 1
-                self.open_auction_submit_failed_symbols.add(symbol)
-                logger.error(
-                    f"MOO/Open-Auction exit {symbol}: OPG submit failed; "
-                    f"will sell via fallback market order after open"
-                )
-        
-        self.open_auction_exit_submitted = True
-        logger.warning(
-            f"MOO/Open-Auction exit complete: submitted={submitted_count}, failed={failed_count}"
-        )
-        self._save_state()
-
-    def _rescue_open_auction_order(self, order_id: str, status: str):
-        """Rescue a failed OPG order by immediately submitting a market sell.
-        
-        Called when an OPG order is canceled, expired, or rejected.
-        """
-        if order_id not in self.open_auction_orders:
-            return
-        
-        order_info = self.open_auction_orders[order_id]
-        symbol = order_info["symbol"]
-        original_qty = order_info["qty"]
-        filled_qty = order_info.get("filled_qty", 0)
-        remaining_qty = original_qty - filled_qty
-        
-        if remaining_qty <= 0:
-            logger.info(f"MOO/Open-Auction rescue {symbol}: order fully filled, no rescue needed")
-            return
-        
-        logger.warning(
-            f"MOO/Open-Auction rescue {symbol}: OPG order {order_id} {status}, "
-            f"submitting immediate market sell for {remaining_qty} remaining shares"
-        )
-        
-        # Submit immediate market sell for remaining shares
-        resp = self.position_mgr._submit_sell_order(
-            symbol=symbol,
-            qty=remaining_qty,
-            order_type="market",
-            time_in_force="day",
-            extended_hours=False,
-        )
-        
-        if resp and resp.get("id"):
-            rescue_order_id = resp["id"]
-            logger.info(
-                f"MOO/Open-Auction rescue {symbol}: submitted rescue market order qty={remaining_qty}, "
-                f"rescue_order_id={rescue_order_id}"
-            )
-        else:
-            logger.error(f"MOO/Open-Auction rescue {symbol}: rescue market sell failed")
-        
-        # Update order status
-        order_info["status"] = f"rescued_{status}"
-        self._save_state()
-
-    def _check_and_rescue_open_auction_orders(self):
-        """Check status of OPG orders and rescue if canceled/expired/rejected.
-        
-        This polls order status periodically between 09:25 and 09:30 (not event-driven via websocket).
-        Rescue behavior:
-        - Before 09:30: only rescue rejected orders (immediate failure)
-        - At/after 09:30: rescue canceled/expired/rejected orders (auction-related failures)
-        """
-        if not self.open_auction_orders:
-            return
-        
-        market_open = _parse_config_time(getattr(config, "MARKET_OPEN_TIME", "09:30"))
-        current_time = datetime.now(_ET).time()
-        
-        # Check each OPG order status
-        for order_id, order_info in list(self.open_auction_orders.items()):
-            if order_info["status"].startswith("rescued"):
-                continue  # Already rescued
-            
-            try:
-                # Get order status from Alpaca
-                base_url = getattr(config, "ALPACA_BASE_URL", "https://api.alpaca.markets").rstrip("/")
-                url = f"{base_url}/v2/orders/{order_id}"
-                response = self.position_mgr.session.get(url, timeout=10)
-                response.raise_for_status()
-                order_data = response.json()
-                
-                status = order_data.get("status", "").lower()
-                filled_qty = float(order_data.get("filled_qty", 0))
-                
-                # Update filled_qty in our tracking
-                order_info["filled_qty"] = filled_qty
-                
-                # Check if order is in a terminal state that needs rescue
-                # Before market open: only rescue rejected orders (immediate failure)
-                # At/after market open: rescue canceled/expired/rejected (auction-related failures)
-                if status == "rejected":
-                    logger.warning(
-                        f"MOO/Open-Auction check: order {order_id} rejected, filled={filled_qty}, "
-                        f"triggering rescue"
-                    )
-                    self._rescue_open_auction_order(order_id, status)
-                elif current_time >= market_open and status in ("canceled", "expired"):
-                    logger.warning(
-                        f"MOO/Open-Auction check: order {order_id} {status} after open, filled={filled_qty}, "
-                        f"triggering rescue"
-                    )
-                    self._rescue_open_auction_order(order_id, status)
-                elif status == "filled":
-                    logger.info(f"MOO/Open-Auction check: order {order_id} fully filled")
-                    order_info["status"] = "filled"
-                elif status == "partially_filled":
-                    logger.info(f"MOO/Open-Auction check: order {order_id} partially filled {filled_qty}")
-            
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"MOO/Open-Auction check: failed to get order {order_id} status: {e}")
-            except Exception as e:
-                logger.warning(f"MOO/Open-Auction check: error checking order {order_id}: {e}")
-        
-        self._save_state()
-
-    def _rescue_remaining_open_auction_positions(self):
-        """Market sell any remaining positions at 09:30:30 fallback.
-        
-        This is the final fallback for the MOO/Open-Auction exit mode.
-        After this, any remaining positions will be handled by the regular
-        morning exit logic.
-        """
-        self.position_mgr.reconcile_local_positions_from_broker()
-        symbols = list(self.position_mgr.positions.keys())
-        
-        if not symbols:
-            logger.info("MOO/Open-Auction fallback: no positions to sell")
-            self.gdp_exits_done = True
-            self.mr_exits_done = True
-            self.open_auction_rescue_done = True
-            self._save_state()
-            return
-        
-        broker_positions = self.position_mgr.get_broker_positions()
-        if broker_positions is None:
-            logger.error("MOO/Open-Auction fallback: broker position read failed; skipping")
-            return
-        
-        if not broker_positions:
-            logger.info("MOO/Open-Auction fallback: broker confirmed flat")
-            self.gdp_exits_done = True
-            self.mr_exits_done = True
-            self.open_auction_rescue_done = True
-            self._save_state()
-            return
-        
-        broker_by_symbol = {
-            str(p.get("symbol", "")).upper(): p
-            for p in broker_positions
-            if p.get("symbol")
-        }
-        
-        rescued_count = 0
-        failed_count = 0
-        
-        for symbol in symbols:
-            pos = self.position_mgr.positions.get(symbol)
-            broker_pos = broker_by_symbol.get(symbol.upper())
-            
-            if not pos or not broker_pos:
-                logger.warning(f"MOO/Open-Auction fallback {symbol}: missing local/broker position; skipping")
-                failed_count += 1
-                continue
-            
-            try:
-                qty = min(int(pos.quantity), abs(int(float(broker_pos.get("qty", 0)))))
-            except (TypeError, ValueError):
-                qty = int(pos.quantity or 0)
-            
-            if qty <= 0:
-                logger.warning(f"MOO/Open-Auction fallback {symbol}: qty <= 0; skipping")
-                failed_count += 1
-                continue
-            
-            # Submit immediate market sell
-            resp = self.position_mgr._submit_sell_order(
-                symbol=symbol,
-                qty=qty,
-                order_type="market",
-                time_in_force="day",
-                extended_hours=False,
-            )
-            
-            if resp and resp.get("id"):
-                rescued_count += 1
-                logger.info(
-                    f"MOO/Open-Auction fallback {symbol}: submitted market sell qty={qty}, "
-                    f"order_id={resp['id']}"
-                )
-            else:
-                failed_count += 1
-                logger.error(f"MOO/Open-Auction fallback {symbol}: market sell failed")
-        
-        logger.warning(
-            f"MOO/Open-Auction fallback complete: rescued={rescued_count}, failed={failed_count}"
-        )
-        # Mark exits as done after fallback
-        self.gdp_exits_done = True
-        self.mr_exits_done = True
-        self.open_auction_rescue_done = True
-        self._save_state()
 
     def _save_end_of_day_reports(self):
         """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
@@ -3017,11 +2696,7 @@ class CombinedOvernightReboundBot:
                 "premarket_limit_order_ids": self.premarket_limit_order_ids,
                 "premarket_decided_symbols": list(self.premarket_decided_symbols),
                 "premarket_checkpoints_done": list(self.premarket_checkpoints_done),
-                "open_auction_exit_submitted": self.open_auction_exit_submitted,
-                "open_auction_order_ids": self.open_auction_order_ids,
-                "open_auction_orders": self.open_auction_orders,
-                "open_auction_submit_failed_symbols": list(self.open_auction_submit_failed_symbols),
-                "open_auction_rescue_done": self.open_auction_rescue_done,
+                "open_market_rescue_done": self.open_market_rescue_done,
                 "end_of_day_reports_done": self.end_of_day_reports_done,
                 "post_exit_failsafe_done": self.post_exit_failsafe_done,
                 "data_collected": self.data_collected,
@@ -3074,12 +2749,8 @@ class CombinedOvernightReboundBot:
         self.premarket_decided_symbols = set(bot_state.get("premarket_decided_symbols", []))
         self.premarket_checkpoints_done = set(bot_state.get("premarket_checkpoints_done", []))
         
-        # MOO/Open-Auction state
-        self.open_auction_exit_submitted = bot_state.get("open_auction_exit_submitted", False)
-        self.open_auction_order_ids = bot_state.get("open_auction_order_ids", {})
-        self.open_auction_orders = bot_state.get("open_auction_orders", {})
-        self.open_auction_submit_failed_symbols = set(bot_state.get("open_auction_submit_failed_symbols", []))
-        self.open_auction_rescue_done = bot_state.get("open_auction_rescue_done", False)
+        # Open market exit state
+        self.open_market_rescue_done = bot_state.get("open_market_rescue_done", False)
         
         self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
 

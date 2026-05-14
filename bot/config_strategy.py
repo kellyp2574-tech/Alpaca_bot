@@ -90,13 +90,15 @@ MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
 # Rolling premarket dynamic limit management (05:00 → 06:00)
 # ═══════════════════════════════════════════════════
 # At 15-minute checkpoints, only "decisive" symbols are acted on; unclear
-# symbols wait for the final 06:00 checkpoint. Any remaining limits are
-# canceled at MORNING_CANCEL_OPEN_ORDERS_TIME before the 09:30 exit path.
-ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS = True
+# ═══════════════════════════════════════════════════
+# Premarket dynamic limit classification
+# ═══════════════════════════════════════════════════
+# Rolling checkpoints at 05:00, 05:15, 05:30, 05:45, and final at 06:00.
+# Uses delayed SIP historical bars ending at decision_dt - 16 minutes.
 PREMARKET_DYNAMIC_START_TIME = "05:00"
 PREMARKET_DYNAMIC_FINAL_TIME = "06:00"
 PREMARKET_DYNAMIC_CHECK_INTERVAL_MINUTES = 15
-PREMARKET_DYNAMIC_DATA_FEED = "iex"
+PREMARKET_SIP_DELAY_MINUTES = 16  # Delay minutes for SIP historical bars (must be >= 15)
 PREMARKET_DYNAMIC_LIMIT_TIME_IN_FORCE = "day"
 PREMARKET_DYNAMIC_LIMIT_EXTENDED_HOURS = True
 PREMARKET_DYNAMIC_MAX_STALE_MINUTES = 60
@@ -145,13 +147,14 @@ SIP_ALLOW_HIGH_CORRECTION = True
 ENABLE_FAST_OPEN_MARKET_EXIT = True
 
 # ═══════════════════════════════════════════════════
-# MOO/Open-Auction exit mode (09:25 OPG orders)
+# MOO/Open-Auction exit mode (09:25 OPG orders) - DISABLED
 # ═══════════════════════════════════════════════════
+# DISABLED: MOO/Open-Auction proved unreliable. Using batched open market exits instead.
 # When enabled, at 09:25 the bot submits MOO (market-on-open) orders using
 # time_in_force="opg" for all overnight positions. If orders are canceled/expired/rejected,
 # the bot immediately submits market sells for remaining shares. Fallback to market
 # sell at 09:30:30 for any remaining positions.
-ENABLE_OPEN_AUCTION_EXIT = True
+ENABLE_OPEN_AUCTION_EXIT = False
 OPEN_AUCTION_FALLBACK_TIME = "09:30:30"
 OPEN_AUCTION_TIF = "opg"
 

@@ -77,9 +77,8 @@ T+1 exit day:
                                   (each checkpoint runs once via dedup set)
   06:00  Final premarket classification for all unresolved symbols
   09:25  Cancel all open orders; freeze broker-position exit plan
-         Submit MOO/OPG orders if ENABLE_OPEN_AUCTION_EXIT=True
-  09:30  Skip fast market exit if MOO mode active (wait for auction fills)
-  09:30:30  Fallback: market-sell any remaining positions after auction
+  09:30  Submit batched market sells for all remaining broker positions
+  09:31  Broker-native rescue pass for any remaining positions
   09:45  V2 failsafe: force-flatten any stragglers with multi-layer retry
          (market → limit −3% → limit −5% half-then-rest)
   16:00  Day complete; restart cycle next afternoon at 15:30
@@ -102,9 +101,8 @@ Adaptive main-loop sleep: 1s during hot windows (05:00–06:02, 09:24–10:05,
 ## Failsafe Layers
 
 1. **09:25 cancel-all** — every open order is canceled before exit logic.
-2. **MOO/Open-Auction (if enabled)** — submit OPG orders at 09:25, rescue failed orders
-   immediately, fallback to market sell at 09:30:30.
-3. **Fast market exit (if MOO disabled)** — 09:30 batch sells of frozen 09:25 positions.
+2. **Batched open market exit** — 09:30 batch sells of frozen 09:25 positions.
+3. **09:31 broker-native rescue** — direct broker position fetch and market sell for any remaining.
 4. **Red-trail (off in production)** — `ENABLE_RED_OPEN_TRAIL_EXIT=False`.
    Mutually exclusive with fast-exit; `_validate_config` raises if both are
    accidentally enabled together.
