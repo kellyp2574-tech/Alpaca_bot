@@ -45,6 +45,14 @@ MIN_SHARES = 25                  # Minimum share count per position
 MAX_POSITION_DOLLARS = 50_000    # Absolute dollar cap per position (legacy)
 
 # ═══════════════════════════════════════════════════
+# Entry execution (concurrent submission with client_order_id)
+# ═══════════════════════════════════════════════════
+ENTRY_SUBMIT_TIMEOUT_SECONDS = 2       # Timeout per order submission (short to avoid blocking)
+ENTRY_RECONCILE_TIMEOUT_SECONDS = 3    # Timeout for client_order_id reconciliation
+ENTRY_SUBMIT_MAX_WORKERS = 8           # Max concurrent workers for buy submission
+ENTRY_BP_BUFFER_PCT = 0.98             # 2% buying power buffer
+
+# ═══════════════════════════════════════════════════
 # Sleeve 1: Mean Reversion — MR_WIDE
 # ═══════════════════════════════════════════════════
 MR_MIN_PRICE = 1.00

@@ -34,6 +34,7 @@ import os
 import requests
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dt_time, date, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
@@ -1432,12 +1433,10 @@ class CombinedOvernightReboundBot:
                 f"Execution pool metrics: pool_size={len(candidate_symbols)}, "
                 f"orderable={len(orderable_set)}, rejected_spread={len(exec_rejected)}"
             )
-            # Submit market buy orders
+            # Submit market buy orders concurrently with short timeout.
             total_deployed = 0.0
 
-            # Track buying power locally to avoid hitting /v2/account once per
-            # symbol. Decremented after each submission by the planned notional;
-            # reconciles with broker on submit failure (one fresh fetch then).
+            # Track buying power locally to avoid hitting /v2/account once per symbol
             bp_remaining = buying_power
 
             def _adaptive_qty(alloc: SleeveAllocation, bp_avail: float,
@@ -1455,8 +1454,10 @@ class CombinedOvernightReboundBot:
             # Hard cutoff for new buy submissions (don't chase too close to close)
             entry_cutoff = dt_time(15, 58, 30)
 
-            # Pass 1: submit all buy orders
-            submitted_orders = []  # List of (order_id, alloc, qty, candidate)
+            # Create deterministic client_order_id for each allocation
+            # Format: BOT-YYYYMMDD-HHMMSS-SYMBOL
+            timestamp = datetime.now(_ET).strftime("%Y%m%d-%H%M%S")
+            submission_plans = []  # List of (alloc, qty, client_order_id, price_ref)
 
             for alloc in allocations:
                 # Check cutoff before processing
@@ -1472,14 +1473,6 @@ class CombinedOvernightReboundBot:
                 price_ref = candidate.signal_price
                 qty = _adaptive_qty(alloc, bp_remaining)
 
-                # Pre-submit logging
-                planned_notional = qty * price_ref
-                logger.info(
-                    f"ENTRY PLANNED {symbol}: qty={qty}, price_ref={price_ref:.4f}, "
-                    f"notional={planned_notional:,.2f}, bp_remaining={bp_remaining:,.2f}, "
-                    f"sleeve={alloc.sleeve}, rank={alloc.rank}"
-                )
-
                 if qty < config.MIN_SHARES:
                     logger.warning(
                         f"ENTRY SKIP {symbol}: adaptive qty {qty} < {config.MIN_SHARES} min shares "
@@ -1488,41 +1481,185 @@ class CombinedOvernightReboundBot:
                     exec_diag.failed_submissions[symbol] = "bp_resize_below_min"
                     continue
 
-                buy_resp = self.position_mgr.submit_buy_order(symbol, qty)
-                if not buy_resp:
-                    # Submit failed — refresh BP from broker once and retry smaller.
-                    fresh_bp = self.position_mgr.get_total_capital()
-                    if fresh_bp and fresh_bp > 0 and price_ref > 0:
-                        bp_remaining = fresh_bp  # resync local tracker
-                        retry_qty = math.floor((fresh_bp * config.ENTRY_BP_BUFFER_PCT) / price_ref)
-                        if retry_qty >= config.MIN_SHARES and retry_qty < qty:
-                            logger.warning(
-                                f"ENTRY RETRY {symbol}: resizing {qty} -> {retry_qty} "
-                                f"after submit failure (fresh_bp=${fresh_bp:,.2f})"
-                            )
-                            buy_resp = self.position_mgr.submit_buy_order(symbol, retry_qty)
-                            if buy_resp:
-                                qty = retry_qty
+                # Create deterministic client_order_id
+                client_order_id = f"BOT-{timestamp}-{symbol}"
+                planned_notional = qty * price_ref
+                
+                logger.info(
+                    f"ENTRY PLAN {symbol}: qty={qty}, price_ref={price_ref:.4f}, "
+                    f"notional={planned_notional:,.2f}, bp_remaining={bp_remaining:,.2f}, "
+                    f"sleeve={alloc.sleeve}, rank={alloc.rank}, client_id={client_order_id}"
+                )
 
-                if not buy_resp:
-                    logger.error(f"Failed to submit buy for {symbol} x{qty}")
-                    exec_diag.failed_submissions[symbol] = "submit_failed"
-                    continue
+                submission_plans.append((alloc, qty, client_order_id, price_ref))
+                # Decrement local BP tracker by the planned notional
+                bp_remaining = max(0.0, bp_remaining - planned_notional)
 
-                order_id = buy_resp.get("id")
-                if not order_id:
-                    exec_diag.failed_submissions[symbol] = "no_order_id"
-                    continue
+            # Batch submit all orders concurrently with short timeout.
+            submitted_orders = []      # List of (order_id, alloc, qty, candidate, client_order_id)
+            submission_timeouts = []   # List of (alloc, qty, client_order_id, price_ref)
 
-                # Decrement local BP tracker by the submitted notional.
-                bp_remaining = max(0.0, bp_remaining - qty * price_ref)
-                exec_diag.submitted_symbols.append(symbol)
-                submitted_orders.append((order_id, alloc, qty, candidate))
-
-            # Pass 2: monitor fills for all submitted orders
-            for order_id, alloc, qty, candidate in submitted_orders:
+            def _submit_entry_order(plan):
+                """Submit one buy order. Runs inside ThreadPoolExecutor."""
+                alloc, qty, client_order_id, price_ref = plan
                 symbol = alloc.symbol
-                fill = self.position_mgr.get_order_fill(order_id, max_wait=10)
+                submit_start = datetime.now(_ET)
+                t0 = time.perf_counter()
+
+                try:
+                    buy_resp, error_type = self.position_mgr.submit_buy_order(
+                        symbol,
+                        qty,
+                        client_order_id=client_order_id,
+                        timeout=getattr(config, "ENTRY_SUBMIT_TIMEOUT_SECONDS", 2),
+                    )
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+                    return {
+                        "symbol": symbol,
+                        "alloc": alloc,
+                        "qty": qty,
+                        "client_order_id": client_order_id,
+                        "price_ref": price_ref,
+                        "buy_resp": buy_resp,
+                        "error_type": error_type,
+                        "elapsed_ms": elapsed_ms,
+                        "submit_start": submit_start,
+                        "exception": None,
+                    }
+
+                except Exception as e:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    return {
+                        "symbol": symbol,
+                        "alloc": alloc,
+                        "qty": qty,
+                        "client_order_id": client_order_id,
+                        "price_ref": price_ref,
+                        "buy_resp": None,
+                        "error_type": "exception",
+                        "elapsed_ms": elapsed_ms,
+                        "submit_start": submit_start,
+                        "exception": e,
+                    }
+
+            max_workers = min(
+                len(submission_plans),
+                int(getattr(config, "ENTRY_SUBMIT_MAX_WORKERS", 8)),
+            )
+
+            logger.warning(
+                "ENTRY CONCURRENT SUBMIT START: orders=%d workers=%d timeout=%ss",
+                len(submission_plans),
+                max_workers,
+                getattr(config, "ENTRY_SUBMIT_TIMEOUT_SECONDS", 2),
+            )
+
+            if max_workers <= 0:
+                logger.warning("ENTRY CONCURRENT SUBMIT: no submission plans")
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(_submit_entry_order, plan): plan
+                        for plan in submission_plans
+                    }
+
+                    for future in as_completed(futures):
+                        result = future.result()
+
+                        symbol = result["symbol"]
+                        alloc = result["alloc"]
+                        qty = result["qty"]
+                        client_order_id = result["client_order_id"]
+                        price_ref = result["price_ref"]
+                        buy_resp = result["buy_resp"]
+                        error_type = result["error_type"]
+                        elapsed_ms = result["elapsed_ms"]
+
+                        if buy_resp and buy_resp.get("id"):
+                            order_id = buy_resp["id"]
+                            submitted_orders.append((order_id, alloc, qty, alloc.candidate, client_order_id))
+                            exec_diag.submitted_symbols.append(symbol)
+                            logger.info(
+                                "ENTRY SUBMITTED %s: order_id=%s client_id=%s elapsed_ms=%.1f",
+                                symbol,
+                                order_id,
+                                client_order_id,
+                                elapsed_ms,
+                            )
+
+                        elif error_type in ("timeout", "network_error", "exception"):
+                            submission_timeouts.append((alloc, qty, client_order_id, price_ref))
+                            logger.warning(
+                                "ENTRY TIMEOUT/NETWORK %s: error=%s elapsed_ms=%.1f; will reconcile client_id=%s",
+                                symbol,
+                                error_type,
+                                elapsed_ms,
+                                client_order_id,
+                            )
+
+                        else:
+                            exec_diag.failed_submissions[symbol] = f"submit_failed_{error_type}"
+                            logger.error(
+                                "ENTRY REJECTED %s: error=%s elapsed_ms=%.1f; no reconciliation",
+                                symbol,
+                                error_type,
+                                elapsed_ms,
+                            )
+
+            logger.info(
+                "ENTRY SUBMISSION SUMMARY: %d immediate success, %d timeout/error needing reconciliation",
+                len(submitted_orders),
+                len(submission_timeouts),
+            )
+
+            # Reconcile timeouts by querying orders by client_order_id
+            if submission_timeouts:
+                logger.info(f"ENTRY RECONCILING {len(submission_timeouts)} timeout/error submissions...")
+                # Give Alpaca a moment to process orders
+                time.sleep(1.0)
+                
+                for alloc, qty, client_order_id, price_ref in submission_timeouts:
+                    symbol = alloc.symbol
+                    try:
+                        # Query orders by client_order_id using the correct endpoint
+                        base_url = getattr(config, "ALPACA_BASE_URL", "https://api.alpaca.markets").rstrip("/")
+                        url = f"{base_url}/v2/orders:by_client_order_id"
+                        params = {"client_order_id": client_order_id}
+                        resp = self.position_mgr.session.get(
+                            url,
+                            params=params,
+                            timeout=getattr(config, "ENTRY_RECONCILE_TIMEOUT_SECONDS", 3),
+                        )
+                        resp.raise_for_status()
+                        order_data = resp.json()  # Returns a single order object, not a list
+                        
+                        if order_data and order_data.get("id"):
+                            # Order exists - add to submitted list
+                            order_id = order_data.get("id")
+                            submitted_orders.append((order_id, alloc, qty, alloc.candidate, client_order_id))
+                            exec_diag.submitted_symbols.append(symbol)
+                            logger.info(f"ENTRY RECONCILED {symbol}: order_id={order_id}, client_id={client_order_id}")
+                        else:
+                            # Order does not exist - treat as failed
+                            exec_diag.failed_submissions[symbol] = "reconciliation_no_order"
+                            logger.warning(f"ENTRY RECONCILE FAILED {symbol}: no order found for client_id={client_order_id}")
+                    except requests.exceptions.HTTPError as e:
+                        # 404 means order doesn't exist - treat as failed
+                        if e.response and e.response.status_code == 404:
+                            exec_diag.failed_submissions[symbol] = "reconciliation_no_order"
+                            logger.warning(f"ENTRY RECONCILE FAILED {symbol}: 404 no order for client_id={client_order_id}")
+                        else:
+                            exec_diag.failed_submissions[symbol] = f"reconciliation_http_{e.response.status_code if e.response else 'unknown'}"
+                            logger.error(f"ENTRY RECONCILE ERROR {symbol}: HTTP {e}")
+                    except Exception as e:
+                        exec_diag.failed_submissions[symbol] = f"reconciliation_error: {str(e)}"
+                        logger.error(f"ENTRY RECONCILE ERROR {symbol}: {e}")
+            
+            # Pass 2: monitor fills for all submitted orders (with longer wait)
+            for order_id, alloc, qty, candidate, client_order_id in submitted_orders:
+                symbol = alloc.symbol
+                fill = self.position_mgr.get_order_fill(order_id, max_wait=30)  # Increased wait for reconciliation
                 if fill and int(fill["filled_qty"]) > 0:
                     filled_qty = int(fill["filled_qty"])
                     fill_price = fill["filled_avg_price"]
@@ -1550,11 +1687,15 @@ class CombinedOvernightReboundBot:
                     logger.info(
                         f"ENTRY FILLED {symbol}: sleeve={alloc.sleeve}, "
                         f"qty={filled_qty}, avg={fill_price:.4f}, "
-                        f"score={candidate.selection_score:.3f}"
+                        f"score={candidate.selection_score:.3f}, client_id={client_order_id}"
                     )
                 else:
-                    self.position_mgr._cancel_order(order_id)
-                    logger.warning(f"No fill for {symbol} buy order (order canceled)")
+                    # Cancel unfilled orders
+                    try:
+                        self.position_mgr._cancel_order(order_id)
+                        logger.warning(f"ENTRY NO FILL {symbol}: order canceled (order_id={order_id}, client_id={client_order_id})")
+                    except Exception as e:
+                        logger.error(f"ENTRY CANCEL ERROR {symbol}: {e}")
                     exec_diag.failed_submissions[symbol] = "no_fill"
 
             # Mop-up disabled (ENTRY_MOPUP_MAX_POSITIONS = 0)

@@ -5,7 +5,7 @@ Legacy gap-strategy / VIX-exit code lives in position_manager_legacy.py.
 """
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 import requests
@@ -137,11 +137,19 @@ class PositionManager:
     # Order submission
     # ────────────────────────────────────────────────────────
 
-    def submit_buy_order(self, symbol: str, qty: int) -> Optional[dict]:
+    def submit_buy_order(self, symbol: str, qty: int, client_order_id: Optional[str] = None, timeout: int = 10) -> Tuple[Optional[dict], Optional[str]]:
         """Submit a market buy order via POST /v2/orders.
 
         Used for overnight momentum entries at 3:50 PM.
-        Returns the order response dict or None on failure.
+        Returns (order_response, error_type) tuple.
+        - order_response: dict with order data if successful, None otherwise
+        - error_type: None if successful, string describing error otherwise
+        
+        Args:
+            symbol: Stock symbol
+            qty: Number of shares to buy
+            client_order_id: Optional client-side order ID for idempotent reconciliation
+            timeout: Request timeout in seconds (default 10, use 2-3 for batch entry)
         """
         url = f"{self.base_url}/v2/orders"
         order_data = {
@@ -151,14 +159,17 @@ class PositionManager:
             "type": "market",
             "time_in_force": "day",
         }
+        
+        if client_order_id:
+            order_data["client_order_id"] = client_order_id
 
         try:
-            response = self.session.post(url, json=order_data, timeout=10)
+            response = self.session.post(url, json=order_data, timeout=timeout)
             response.raise_for_status()
             data = response.json()
             order_id = data.get("id")
             logger.info(f"Buy order submitted: {symbol} x{qty} (ID: {order_id})")
-            return data
+            return data, None
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else "N/A"
             body = ""
@@ -170,10 +181,13 @@ class PositionManager:
                 f"Buy order FAILED | symbol={symbol} | qty={qty} | "
                 f"status={status_code} | body={body}"
             )
-            return None
+            return None, f"http_{status_code}"
+        except requests.exceptions.Timeout:
+            logger.error(f"Buy order TIMEOUT | symbol={symbol} | qty={qty}")
+            return None, "timeout"
         except requests.exceptions.RequestException as e:
             logger.error(f"Buy order FAILED (network) | symbol={symbol} | qty={qty} | error={e}")
-            return None
+            return None, "network_error"
 
     def _submit_sell_order(self, symbol: str, qty: int, order_type: str = "market",
                            limit_price: Optional[float] = None,
