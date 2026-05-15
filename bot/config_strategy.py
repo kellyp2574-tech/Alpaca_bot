@@ -7,6 +7,17 @@ Production default from combined-cache research:
 - Max single-name exposure: 10% of equity
 """
 
+import os
+
+# ═══════════════════════════════════════════════════
+# Logging
+# ═══════════════════════════════════════════════════
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "combined_overnight_bot.log")
+LOG_LEVEL = "INFO"
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
 # ═══════════════════════════════════════════════════
 # Combined sleeve mode
 # ═══════════════════════════════════════════════════
@@ -90,6 +101,9 @@ MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
 # Rolling premarket dynamic limit management (05:00 → 06:00)
 # ═══════════════════════════════════════════════════
 # At 15-minute checkpoints, only "decisive" symbols are acted on; unclear
+# symbols wait for the next checkpoint.
+ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS = True
+
 # ═══════════════════════════════════════════════════
 # Premarket dynamic limit classification
 # ═══════════════════════════════════════════════════

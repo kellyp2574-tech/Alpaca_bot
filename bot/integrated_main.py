@@ -66,15 +66,26 @@ from bot.universe_builder import (
     ExecutionDiagnostics,
 )
 
-# Setup logging
-os.makedirs(config.LOG_DIR, exist_ok=True)
+# Setup logging with safe fallbacks
+_default_log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+LOG_DIR = getattr(config, "LOG_DIR", _default_log_dir)
+LOG_FILE = getattr(config, "LOG_FILE", os.path.join(LOG_DIR, "combined_overnight_bot.log"))
+LOG_LEVEL = getattr(config, "LOG_LEVEL", "INFO")
+LOG_FORMAT = getattr(
+    config,
+    "LOG_FORMAT",
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format=config.LOG_FORMAT,
+    level=getattr(logging, LOG_LEVEL),
+    format=LOG_FORMAT,
     handlers=[
-        logging.FileHandler(config.LOG_FILE),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(sys.stdout)
-    ]
+    ],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
