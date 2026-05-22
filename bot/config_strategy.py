@@ -1,10 +1,13 @@
-"""Strategy configuration — static 70/30 combined overnight sleeves.
+"""Strategy configuration — paper test: clean overnight MR sleeve.
 
-Production default from combined-cache research:
-- Entry/signal: 15:50
+Current paper-test candidate from the clean no-lookahead cache research:
+- Entry/signal: 15:45
 - Exit: 09:30
-- Static weights: 70% MR / 30% momentum pullback (GDP)
-- Max single-name exposure: 10% of equity
+- Sleeve: MR only, cheap late-day washout
+- Filters: entry price $1-$2, return vs prior close <= -5%, close-location <= 0.25, ADV >= $1M
+- Rank: lowest close-location first
+- Max positions: 3
+- Regime sizing: full size when 3-ETF basket is red before 15:45, half size when positive
 """
 
 import os
@@ -23,16 +26,15 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 # ═══════════════════════════════════════════════════
 ENABLE_COMBINED_SLEEVES = True
 
-# Static production allocation from robustness sweep.
-# Note: live "GDP" sleeve is the momentum-pullback sleeve from the backtests.
-MR_WEIGHT = 0.70
-MOM_WEIGHT = 0.30
+# Paper test: MR-only. GDP/MOM is disabled until the next sleeve is tested.
+MR_WEIGHT = 1.00
+MOM_WEIGHT = 0.00
 
 # Backward-compatible names used by the live allocator.
 MR_ALLOCATION_PCT = MR_WEIGHT
 GDP_ALLOCATION_PCT = MOM_WEIGHT
 
-COMBINED_MAX_POSITIONS = 20  # Hard cap across both sleeves
+COMBINED_MAX_POSITIONS = 3   # Paper MR test: top 3 only
 
 # ═══════════════════════════════════════════════════
 # Position sizing (waterfall allocation)
@@ -51,18 +53,23 @@ ENTRY_SUBMIT_TIMEOUT_SECONDS = 2       # Timeout per order submission (short to 
 ENTRY_RECONCILE_TIMEOUT_SECONDS = 3    # Timeout for client_order_id reconciliation
 ENTRY_SUBMIT_MAX_WORKERS = 8           # Max concurrent workers for buy submission
 ENTRY_BP_BUFFER_PCT = 0.98             # 2% buying power buffer
+ENTRY_MAX_SPREAD_PCT = 0.05            # Max spread for entry execution gate
 
 # ═══════════════════════════════════════════════════
 # Sleeve 1: Mean Reversion — MR_WIDE
 # ═══════════════════════════════════════════════════
 MR_MIN_PRICE = 1.00
-MR_MAX_PRICE = 5.00
-MR_DAY_RET_MAX = -0.03          # day return <= -3%
-MR_VOLUME_RATIO_MIN = 1.5       # today volume / expected volume >= 1.5x
-MR_CLOSE_POSITION_MAX = 0.20    # close in bottom 20% of day range
-MR_LATE_DROP_MAX = None         # optional: set -0.01 for stricter late-drop filter
+MR_MAX_PRICE = 2.00
+MR_DAY_RET_MAX = -0.05          # clean-cache candidate: return vs prior/entry-day signal <= -5%
+MR_VOLUME_RATIO_MIN = 0.0       # no relative-volume requirement in finalist test
+MR_CLOSE_POSITION_MAX = 0.25    # close in bottom 25% of day range
+MR_LATE_DROP_MAX = None         # optional, off
+MR_MIN_AVG_DOLLAR_VOLUME = 1_000_000
 
-MR_MAX_POSITIONS = 12           # max MR slots; dollar budget is controlled by MR_ALLOCATION_PCT
+# Finalist rank is close_location ascending, top 3.
+MR_RANK_BY_CLOSE_LOCATION_ONLY = True
+MR_MIN_CANDIDATES = 2
+MR_MAX_POSITIONS = 3            # top 3 only
 
 # ═══════════════════════════════════════════════════
 # Sleeve 2: Green-Day Pullback — GDP_BASE
@@ -75,12 +82,15 @@ GDP_REQUIRE_BELOW_VWAP = True   # price must be below intraday VWAP
 GDP_LATE_MOM_MAX = 0.0          # late momentum 15:30->signal must be <= 0 (decelerating)
 GDP_MAX_CLOSE_POSITION = None   # optional: limit close_position (None = no limit)
 
-GDP_MAX_POSITIONS = 8           # max GDP/MOM slots; dollar budget is controlled by GDP_ALLOCATION_PCT
+GDP_MAX_POSITIONS = 0           # GDP disabled for this paper MR test
 
 # ═══════════════════════════════════════════════════
-# Execution safety — buying power buffer
+# MR regime sizing for this paper test
 # ═══════════════════════════════════════════════════
-ENTRY_BP_BUFFER_PCT = 0.98       # Size each order to 98% of reported buying power
+ENABLE_MR_ETF_REGIME_SIZING = True
+MR_ETF_REGIME_SYMBOLS = ["SPY", "IWM", "QQQ"]
+MR_ETF_NEGATIVE_SIZE_MULT = 1.0
+MR_ETF_POSITIVE_SIZE_MULT = 0.5
 
 # Daily loss circuit breaker — abort 15:50 entries if today's drawdown
 # (equity vs yesterday's close equity) is worse than this threshold.
@@ -91,8 +101,8 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 # Afternoon timeline (T-1 entry day)
 # ═══════════════════════════════════════════════════
 DATA_COLLECTION_TIME = "15:30"   # Begin universe pipeline
-SCORING_TIME = "15:50"           # Score using 9:30-15:50 bars
-ENTRY_TIME = "15:50"             # Execute immediately after scoring
+SCORING_TIME = "15:45"           # Score late-day MR sleeve
+ENTRY_TIME = "15:45"             # Execute immediately after scoring
 
 # ═══════════════════════════════════════════════════
 # Morning timeline (T+1 exit day)

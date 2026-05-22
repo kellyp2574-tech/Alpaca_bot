@@ -1,18 +1,16 @@
 """Combined Overnight Rebound Bot — Main Orchestrator
 
-Sleeve 1: MR_WIDE (Mean Reversion)
-  - Buy 15:50, $1–5, day_ret <= -3%, vol_ratio >= 1.5x, close_position <= 0.20
+Paper test sleeve: CLEAN_OVERNIGHT_MR
+  - Buy 15:45, $1–$2, day_ret <= -5%, close_position <= 0.25, ADV >= $1M
+  - Rank by lowest close_position, top 3, min 2 candidates
+  - ETF regime sizing: full size when SPY/IWM/QQQ avg is red before 15:45, half size otherwise
   - Exit 09:30
 
-Sleeve 2: GDP_BASE / MOM_CLEAN (Green-Day Pullback)
-  - Buy 15:50, $1–10, day_ret +1% to +10%, below VWAP, late_mom <= 0
-  - Exit 09:30
-
-Production allocation: static 70/30 MR/GDP, 10% max single-name cap.
+GDP/MOM is disabled for this paper test; the 09:30 batched sell/failsafe stack is unchanged.
 
 Daily Schedule (ET) — morning bot starts around 05:00 AM:
 
-MORNING (T+1 exits — positions from yesterday's 15:50 entries):
+MORNING (T+1 exits — positions from yesterday's 15:45 entries):
   05:00  Start, detect overnight positions from broker
   05:00, 05:15, 05:30, 05:45  Rolling premarket dynamic limit classification (decisive symbols only)
   06:00  Final premarket classification for all unresolved symbols (runs once,
@@ -24,8 +22,8 @@ MORNING (T+1 exits — positions from yesterday's 15:50 entries):
 
 AFTERNOON (T-1 entries — new positions for tomorrow's exits):
   15:30  Build universe (Massive + Alpaca, $1–10, ADV sizing cap protects)
-  15:50  Fetch latest 9:30-15:50 minute bars, build both MR and GDP candidates
-  15:50  Daily-loss circuit breaker check, then execute entries
+  15:45  Fetch latest 9:30-15:45 minute bars, build both MR and GDP candidates
+  15:45  Daily-loss circuit breaker check, then execute entries
   16:00  Confirm positions held overnight, save state, done
 """
 import logging
@@ -933,6 +931,25 @@ class CombinedOvernightReboundBot:
                 self._adv_cache,
             )
             filtered_mr = filter_mean_reversion_candidates(raw_mr)
+
+            # Paper-test: enforce min ADV filter explicitly (config may not be wired into scorer)
+            min_adv = getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 0)
+            if min_adv > 0:
+                filtered_mr = [
+                    c for c in filtered_mr
+                    if getattr(c, "adv_dollars", 0.0) >= min_adv
+                ]
+
+            # Paper-test: rank by lowest close_position when configured
+            if getattr(config, "MR_RANK_BY_CLOSE_LOCATION_ONLY", False):
+                filtered_mr = sorted(
+                    filtered_mr,
+                    key=lambda c: (
+                        getattr(c, "close_position", 999.0),
+                        getattr(c, "day_return", 0.0),
+                    )
+                )
+
             self.mr_candidates = filtered_mr  # Keep ALL passed candidates for allocator
 
             # CRITICAL DIAGNOSTIC: MR pipeline counts
@@ -1041,10 +1058,82 @@ class CombinedOvernightReboundBot:
             logger.exception(f"Error in scoring: {e}")
             self.scoring_done = True
 
+    def _compute_mr_etf_regime_size_multiplier(self) -> tuple[float, dict]:
+        """Return MR size multiplier from SPY/IWM/QQQ avg return vs open.
+
+        Uses the same late-day timing as the paper-test signal. If ETF data is
+        unavailable, fail open at full size but log the reason so the paper test
+        does not silently skip otherwise valid MR candidates.
+        """
+        if not getattr(config, "ENABLE_MR_ETF_REGIME_SIZING", False):
+            return 1.0, {"enabled": False, "reason": "disabled"}
+
+        symbols = list(getattr(config, "MR_ETF_REGIME_SYMBOLS", ["SPY", "IWM", "QQQ"]))
+        today = date.today().isoformat()
+        end_time = getattr(config, "ENTRY_TIME", "15:45")
+
+        try:
+            bars_by_symbol = self.alpaca.get_intraday_bars_for_signal(
+                symbols, today, start="09:30", end=end_time,
+            )
+        except Exception:
+            logger.warning("MR ETF regime sizing: failed to fetch ETF bars; using full size", exc_info=True)
+            return 1.0, {"enabled": True, "reason": "fetch_failed"}
+
+        returns = {}
+
+        def _bar_val(bar: dict, *keys: str) -> Optional[float]:
+            for key in keys:
+                try:
+                    val = bar.get(key)
+                    if val is not None:
+                        return float(val)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            return None
+
+        for sym in symbols:
+            bars = bars_by_symbol.get(sym, []) if bars_by_symbol else []
+            if not bars:
+                continue
+            first = bars[0]
+            last = bars[-1]
+            open_px = _bar_val(first, "o", "open")
+            close_px = _bar_val(last, "c", "close")
+            if open_px and close_px and open_px > 0:
+                returns[sym] = close_px / open_px - 1.0
+
+        if not returns:
+            logger.warning("MR ETF regime sizing: no usable ETF bars; using full size")
+            return 1.0, {"enabled": True, "reason": "no_usable_bars"}
+
+        avg_ret = sum(returns.values()) / len(returns)
+        is_negative = avg_ret < 0
+        mult = (
+            float(getattr(config, "MR_ETF_NEGATIVE_SIZE_MULT", 1.0))
+            if is_negative
+            else float(getattr(config, "MR_ETF_POSITIVE_SIZE_MULT", 0.5))
+        )
+        info = {
+            "enabled": True,
+            "reason": "ok",
+            "avg_return": avg_ret,
+            "is_negative": is_negative,
+            "returns": returns,
+            "multiplier": mult,
+        }
+        logger.warning(
+            "MR ETF REGIME SIZE: avg=%+.2f%% multiplier=%.2f returns=%s",
+            avg_ret * 100.0,
+            mult,
+            {k: f"{v:+.2%}" for k, v in returns.items()},
+        )
+        return mult, info
+
     def _step_execute_entries(self):
-        """3:50 PM: Dual-sleeve allocation (70/30 MR/GDP budget) -> execution-gate -> market buys."""
+        """15:45: clean MR-only paper allocation -> execution-gate -> market buys."""
         logger.info("=" * 50)
-        logger.info("ENTRY EXECUTION: Dual-sleeve market buy orders")
+        logger.info("ENTRY EXECUTION: Clean MR paper-test market buy orders")
         logger.info("=" * 50)
 
         exec_diag = ExecutionDiagnostics()
@@ -1250,12 +1339,18 @@ class CombinedOvernightReboundBot:
                         f"same-day re-entry candidates (equity ${equity:,.0f} < $50k)"
                     )
 
-            # Calculate sleeve budgets and target slots
-            mr_budget = deployable * config.MR_ALLOCATION_PCT
+            # ETF-regime sizing from the clean-cache finalist:
+            # full size when 3-ETF avg is negative before entry, half size otherwise.
+            mr_size_mult, mr_regime_info = self._compute_mr_etf_regime_size_multiplier()
+
+            # Calculate sleeve budgets and target slots. GDP/MOM is intentionally zero for this paper test.
+            mr_budget = deployable * config.MR_ALLOCATION_PCT * mr_size_mult
             gdp_budget = deployable * config.GDP_ALLOCATION_PCT
             logger.info(
-                f"Sleeve budgets: MR ${mr_budget:,.2f} ({config.MR_ALLOCATION_PCT:.0%}) | "
-                f"GDP ${gdp_budget:,.2f} ({config.GDP_ALLOCATION_PCT:.0%})"
+                f"Sleeve budgets: MR ${mr_budget:,.2f} "
+                f"({config.MR_ALLOCATION_PCT:.0%} * regime_mult={mr_size_mult:.2f}) | "
+                f"GDP ${gdp_budget:,.2f} ({config.GDP_ALLOCATION_PCT:.0%}) | "
+                f"regime={mr_regime_info}"
             )
 
             # Execution eligibility gate FIRST (before allocation)
@@ -1268,7 +1363,7 @@ class CombinedOvernightReboundBot:
             fresh_snaps = self.alpaca.get_snapshots(candidate_symbols)
             orderable, exec_rejected = filter_execution_ready(
                 candidate_symbols, fresh_snaps,
-                max_spread_pct=0.05, require_quote=True,
+                max_spread_pct=getattr(config, "ENTRY_MAX_SPREAD_PCT", 0.05), require_quote=True,
             )
             orderable_set = set(orderable)
 
@@ -1284,6 +1379,17 @@ class CombinedOvernightReboundBot:
                 f"Post-spread-filter: MR {len(self.mr_candidates)} -> {len(mr_orderable)} orderable, "
                 f"GDP {len(self.gdp_candidates)} -> {len(gdp_orderable)} orderable"
             )
+
+            # Paper-test guard: require min candidates AFTER execution gate (spread/quote check)
+            mr_min_candidates = int(getattr(config, "MR_MIN_CANDIDATES", 1) or 1)
+            if len(mr_orderable) < mr_min_candidates:
+                logger.warning(
+                    "MR paper test: only %d orderable candidates after execution gate, below min_candidates=%d — skipping entries",
+                    len(mr_orderable),
+                    mr_min_candidates,
+                )
+                self.entries_done = True
+                return
 
             # Allocate ONLY from orderable candidates (budget flows to clean names)
             mr_results = allocate_waterfall(
@@ -1310,9 +1416,16 @@ class CombinedOvernightReboundBot:
                 f"positions={len(gdp_results)}"
             )
 
-            # Global leftover redeployment pass
-            # Fallback order: MR leftover → GDP candidates → all remaining orderable candidates
-            if total_leftover > config.MIN_POSITION_DOLLARS:
+            # MR-only paper test: no fallback/redeployment. Leftover stays as cash.
+            # This ensures selection remains exactly the researched top-N close-location sleeve.
+            if getattr(config, "GDP_MAX_POSITIONS", 0) <= 0 or getattr(config, "GDP_ALLOCATION_PCT", 0.0) <= 0:
+                if total_leftover > config.MIN_POSITION_DOLLARS:
+                    logger.info(
+                        "MR-only paper test: skipping global leftover redeployment. "
+                        "Leftover $%.2f remains as cash.",
+                        total_leftover,
+                    )
+            elif total_leftover > config.MIN_POSITION_DOLLARS:
                 # Build set of already allocated symbols
                 allocated_symbols = {r["symbol"] for r in mr_results + gdp_results}
 
