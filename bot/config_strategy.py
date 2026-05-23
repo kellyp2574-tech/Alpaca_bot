@@ -22,6 +22,20 @@ LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # ═══════════════════════════════════════════════════
+# ETF Router Configuration (9:30-10:00 AM)
+# ═══════════════════════════════════════════════════
+# Master switches
+ETF_ROUTER_ENABLED = True
+MR_OVERNIGHT_ENABLED = True
+MR_PERMISSION_MODE = "skip_if_router_traded"  # "skip_if_router_traded" or "all_regimes"
+
+# ETF symbols for tape measurement
+ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"]
+
+# Capital allocation for ETF router (separate from MR capital)
+ETF_ROUTER_CAPITAL_PCT = 0.30  # 30% of available capital for ETF router
+
+# ═══════════════════════════════════════════════════
 # Combined sleeve mode
 # ═══════════════════════════════════════════════════
 ENABLE_COMBINED_SLEEVES = True
@@ -114,6 +128,18 @@ V2_FAILSAFE_TIME = "09:45"       # Post-exit failsafe verification
 
 # Cancel any resting overnight limits before the 09:30 market exit logic.
 MORNING_CANCEL_OPEN_ORDERS_TIME = "09:25"
+
+# ═══════════════════════════════════════════════════
+# ETF Router timeline (09:00 - 16:00)
+# ═══════════════════════════════════════════════════
+BOT_START_TIME = "09:00"           # Bot startup/pre-market prep
+ROUTER_DECISION_TIME = "10:00"     # 10:00 AM ETF router decision
+ROUTER_ENTRY_AFTER = "10:00"       # Enter ETF strictly after 10:00
+
+# ETF exit checkpoints (branch-specific)
+UVXY_EXIT_TIME = "11:00"           # UVXY crash branch exit
+SQQQ_EXIT_TIME = "14:00"           # SQQQ Goldilocks exit
+TQQQ_EXIT_TIME = "15:00"           # All TQQQ branches exit
 
 # ═══════════════════════════════════════════════════
 # Rolling premarket dynamic limit management (05:00 → 06:00)

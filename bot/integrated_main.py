@@ -50,6 +50,7 @@ from bot.green_day_pullback_scorer import (
     build_green_day_pullback_candidates,
     filter_green_day_pullback_candidates,
 )
+from bot.etf_router import ETFRouter, RouterDecision, parse_router_decision_from_dict
 from bot.position_manager_overnight import PositionManager, Position
 from bot.rate_limiter import get_api_call_count
 from bot.state_manager import StateManager
@@ -102,7 +103,10 @@ def _parse_config_time(time_str: str) -> dt_time:
 # budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
 _HOT_WINDOWS_HHMM = (
     (5, 0, 6, 2),     # Premarket dynamic-limit checkpoints (incl. final 06:00 trip)
-    (9, 24, 9, 36),   # Order cancel, 09:30 batch sells, 09:31 rescue
+    (9, 24, 10, 2),   # Order cancel, 09:30 batch sells, 09:31 rescue + ETF router
+    (10, 59, 11, 2),  # UVXY exit
+    (13, 59, 14, 2),  # SQQQ exit
+    (14, 59, 15, 2),  # TQQQ exit
     (15, 29, 16, 1),  # Universe build, scoring, entries, EOD
 )
 
@@ -124,6 +128,7 @@ class CombinedOvernightReboundBot:
         self.alpaca = AlpacaDataClient()
         self.position_mgr = PositionManager()
         self.state_mgr = StateManager()
+        self.etf_router = ETFRouter(config)
 
         # Universe & candidates
         self.universe: List[str] = []
@@ -131,7 +136,19 @@ class CombinedOvernightReboundBot:
         self.gdp_candidates: List[GreenDayPullbackCandidate] = []
         self._universe_diag: Optional[UniverseDiagnostics] = None
 
+        # ETF Router state
+        self.router_decision: Optional[RouterDecision] = None
+        self.router_traded_today = False
+        self.router_branch: Optional[str] = None
+        self.mr_blocked_today = False
+        self.etf_position: Optional[Dict[str, Any]] = None  # Current ETF position if any
+        self.etf_opens_930: Dict[str, float] = {}  # 9:30 opens for tape
+        self.tape_recording_active = False
+
         # Stage flags
+        self.startup_done = False         # 9:00-9:25 startup phase
+        self.tape_initialized = False     # 9:30 opens recorded
+        self.router_decision_made = False  # 10:00 decision complete
         self.morning_exits_done = False   # All overnight positions exited
         self.data_collected = False       # Universe + daily bars ready
         self.scoring_done = False         # 3:50 PM scoring complete
@@ -444,6 +461,67 @@ class CombinedOvernightReboundBot:
                             self.position_mgr.positions.clear()
                             self.morning_exits_done = True
                             self._save_state()
+
+            # ════════════════════════════════════════════
+            # INTRADAY ETF ROUTER (9:00 - 15:45)
+            # ════════════════════════════════════════════
+
+            if getattr(config, "ETF_ROUTER_ENABLED", False):
+                t_startup = _parse_config_time(getattr(config, "BOT_START_TIME", "09:00"))
+                t_market_open = _parse_config_time(getattr(config, "MARKET_OPEN_TIME", "09:30"))
+                t_router_decision = _parse_config_time(getattr(config, "ROUTER_DECISION_TIME", "10:00"))
+                t_uvxy_exit = _parse_config_time(getattr(config, "UVXY_EXIT_TIME", "11:00"))
+                t_sqqq_exit = _parse_config_time(getattr(config, "SQQQ_EXIT_TIME", "14:00"))
+                t_tqqq_exit = _parse_config_time(getattr(config, "TQQQ_EXIT_TIME", "15:00"))
+
+                # 09:00 startup - pre-market prep (allow up to 10:00 for late starts)
+                if (not self.startup_done
+                        and current_time >= t_startup
+                        and current_time < t_router_decision):
+                    self._run_startup_phase()
+
+                # 09:30 initialize ETF tape (once market opens)
+                if (self.startup_done
+                        and not self.tape_initialized
+                        and not self.router_decision_made
+                        and current_time >= t_market_open
+                        and current_time < t_router_decision):
+                    # Guard: if starting after 09:31, tape will be incomplete (missing 09:30-09:xx data)
+                    # For safety, disable router on late starts until backfill is implemented
+                    if current_time > dt_time(9, 31):
+                        logger.warning(f"ETF router late-start at {current_time.strftime('%H:%M')} without 09:30 tape; disabling router for today")
+                        logger.warning("Router disabled to prevent false signals from incomplete range calculations")
+                        self.router_decision_made = True
+                        self.router_traded_today = False
+                        self.mr_blocked_today = False
+                        self.router_branch = "Late start - router disabled"
+                        self._save_state()
+                    else:
+                        self._initialize_tape_recording()
+
+                # 09:30-10:00 update tape with prices
+                if (self.tape_initialized
+                        and not self.router_decision_made
+                        and current_time >= t_market_open
+                        and current_time < t_router_decision):
+                    self._update_tape()
+
+                # 10:00 make router decision
+                if (self.tape_initialized
+                        and not self.router_decision_made
+                        and current_time >= t_router_decision):
+                    self._update_tape()  # Final tape update
+                    self._make_router_decision()
+
+                # ETF exit checkpoints (11:00 UVXY, 14:00 SQQQ, 15:00 TQQQ)
+                if self.router_traded_today and self.etf_position:
+                    symbol = self.etf_position.get("symbol")
+                    if symbol == "UVXY" and current_time >= t_uvxy_exit:
+                        self._check_etf_exits(current_time)
+                    elif symbol == "SQQQ" and current_time >= t_sqqq_exit:
+                        self._check_etf_exits(current_time)
+                    elif symbol == "TQQQ" and current_time >= t_tqqq_exit:
+                        self._check_etf_exits(current_time)
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions
@@ -1135,6 +1213,23 @@ class CombinedOvernightReboundBot:
         logger.info("=" * 50)
         logger.info("ENTRY EXECUTION: Clean MR paper-test market buy orders")
         logger.info("=" * 50)
+
+        # Check MR permission - blocked if ETF router signal fired today
+        # Note: MR is blocked even if ETF entry failed (regime protection)
+        if self.mr_blocked_today or self.router_traded_today:
+            branch = self.router_branch or "unknown"
+            has_etf_position = self.etf_position is not None
+            logger.info("MR entries BLOCKED - ETF router signal fired today (branch=%s, has_position=%s)", branch, has_etf_position)
+            logger.info("MR blocked because router signal fired; ETF position may or may not have filled")
+            logger.info("Skipping MR candidate scan and entry")
+            self.entries_done = True
+            return
+
+        # Check if MR is enabled in config
+        if not getattr(config, "MR_OVERNIGHT_ENABLED", True):
+            logger.info("MR entries DISABLED in config - skipping")
+            self.entries_done = True
+            return
 
         exec_diag = ExecutionDiagnostics()
         self._exec_diag = exec_diag
@@ -2968,6 +3063,15 @@ class CombinedOvernightReboundBot:
                 "scoring_done": self.scoring_done,
                 "entries_done": self.entries_done,
                 "sold_today": list(self.sold_today),
+                # ETF Router state
+                "router_decision": self.router_decision.to_dict() if self.router_decision else None,
+                "router_traded_today": self.router_traded_today,
+                "router_branch": self.router_branch,
+                "mr_blocked_today": self.mr_blocked_today,
+                "etf_position": self.etf_position,
+                "startup_done": self.startup_done,
+                "tape_initialized": self.tape_initialized,
+                "router_decision_made": self.router_decision_made,
             }
             self.state_mgr.save_bot_state(bot_state)
         except Exception as e:
@@ -2980,6 +3084,17 @@ class CombinedOvernightReboundBot:
 
         if not bot_state or bot_state.get("date") != today:
             logger.info("No same-day state to restore — fresh start")
+            # Reset ETF router state for new day
+            self.etf_router.reset()
+            self.router_decision = None
+            self.router_traded_today = False
+            self.router_branch = None
+            self.mr_blocked_today = False
+            self.etf_position = None
+            self.startup_done = False
+            self.tape_initialized = False
+            self.router_decision_made = False
+            logger.info("ETF router state reset for new trading day")
             # Load positions from file (may have overnight holds from yesterday's entries)
             saved = self.state_mgr.load_positions()
             if saved:
@@ -3019,11 +3134,370 @@ class CombinedOvernightReboundBot:
         
         self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
 
+        # ETF Router state
+        self.router_decision = parse_router_decision_from_dict(bot_state.get("router_decision"))
+        self.router_traded_today = bot_state.get("router_traded_today", False)
+        self.router_branch = bot_state.get("router_branch", None)
+        self.mr_blocked_today = bot_state.get("mr_blocked_today", False)
+        self.etf_position = bot_state.get("etf_position", None)
+        self.startup_done = bot_state.get("startup_done", False)
+        self.tape_initialized = bot_state.get("tape_initialized", False)
+        self.router_decision_made = bot_state.get("router_decision_made", False)
+
         # Load positions
         saved = self.state_mgr.load_positions()
         if saved:
             self.position_mgr.load_positions(saved)
             logger.info(f"Loaded {len(saved)} saved positions")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ETF Router Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _run_startup_phase(self):
+        """9:00-9:25 AM: Startup and pre-market preparation."""
+        logger.info("=" * 60)
+        logger.info("STARTUP PHASE (9:00-9:25)")
+        logger.info("=" * 60)
+
+        # Load and log config
+        logger.info(f"ETF Router enabled: {getattr(config, 'ETF_ROUTER_ENABLED', False)}")
+        logger.info(f"MR Overnight enabled: {getattr(config, 'MR_OVERNIGHT_ENABLED', True)}")
+        logger.info(f"MR Permission mode: {getattr(config, 'MR_PERMISSION_MODE', 'skip_if_router_traded')}")
+
+        # Reconcile account state
+        try:
+            account = self.position_mgr.get_account()
+            if account:
+                cash = float(account.get("cash", 0))
+                buying_power = float(account.get("buying_power", 0))
+                logger.info(f"Account state - Cash: ${cash:,.2f}, BP: ${buying_power:,.2f}")
+            else:
+                logger.warning("Could not fetch account state")
+        except Exception as e:
+            logger.error(f"Error fetching account: {e}")
+
+        # Check broker positions
+        broker_positions = self.position_mgr.get_broker_positions()
+        if broker_positions is not None:
+            logger.info(f"Broker positions: {len(broker_positions)}")
+            for pos in broker_positions:
+                logger.info(f"  - {pos.get('symbol')}: {pos.get('qty')} shares")
+        else:
+            logger.warning("Could not fetch broker positions")
+
+        # Cancel stale orders (ETF router symbols)
+        self._cancel_stale_etf_orders()
+
+        self.startup_done = True
+        self._save_state()
+        logger.info("Startup phase complete")
+
+    def _cancel_stale_etf_orders(self):
+        """Cancel any stale ETF router orders from previous day."""
+        etf_symbols = getattr(config, "ETF_ROUTER_SYMBOLS", ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"])
+        logger.info(f"Cancelling any stale orders for: {etf_symbols}")
+        try:
+            # Cancel all open orders to ensure clean slate
+            # (ETF router uses same symbols as momentum, so clear everything)
+            self.position_mgr.cancel_all_open_orders()
+            logger.info("Stale order cleanup complete")
+        except Exception as e:
+            logger.error(f"Error cancelling stale orders: {e}")
+
+    def _initialize_tape_recording(self):
+        """9:30 AM: Record opens and start tape recording."""
+        logger.info("=" * 60)
+        logger.info("TAPE INITIALIZATION (9:30)")
+        logger.info("=" * 60)
+
+        etf_symbols = getattr(config, "ETF_ROUTER_SYMBOLS", ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"])
+        now = datetime.now(_ET)
+
+        # Get opens
+        try:
+            snapshots = self.alpaca.get_snapshots(etf_symbols)
+            opens = {}
+            sources = {}  # Track source of each open for diagnostics
+
+            for symbol in etf_symbols:
+                snap = snapshots.get(symbol, {})
+
+                # Try daily bar open first (most accurate for 9:30)
+                daily_bar = snap.get("daily_bar") or {}
+                open_price = daily_bar.get("o") if daily_bar else None
+                source = "daily_bar"
+
+                if not open_price:
+                    # Fallback to last trade
+                    last_trade = snap.get("last_trade", {})
+                    open_price = last_trade.get("p") if last_trade else None
+                    source = "last_trade"
+
+                if open_price:
+                    open_price = float(open_price)
+                    opens[symbol] = open_price
+                    self.etf_opens_930[symbol] = open_price
+                    sources[symbol] = source
+
+                    # Log each symbol individually for debugging
+                    latest = snap.get("last_trade", {}).get("p", "N/A")
+                    logger.info(f"ETF open {symbol}: ${open_price:.2f} (source={source}, latest={latest}, ts={now.strftime('%H:%M:%S')})")
+                else:
+                    logger.error(f"Could not get 9:30 open for {symbol} - no daily_bar or last_trade")
+
+            logger.info(f"9:30 Opens summary: {opens}")
+            logger.info(f"Open sources: {sources}")
+
+            # Start tape recording
+            self.etf_router.start_recording(opens, datetime.now(_ET))
+            self.tape_recording_active = True
+            self.tape_initialized = True
+            self._save_state()
+
+        except Exception as e:
+            logger.error(f"Error initializing tape: {e}", exc_info=True)
+
+    def _update_tape(self):
+        """Update tape with latest prices during 9:30-10:00 window."""
+        if not self.tape_recording_active:
+            return
+
+        etf_symbols = getattr(config, "ETF_ROUTER_SYMBOLS", ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"])
+
+        try:
+            snapshots = self.alpaca.get_snapshots(etf_symbols)
+            now = datetime.now(_ET)
+
+            for symbol in etf_symbols:
+                snap = snapshots.get(symbol, {})
+                last_trade = snap.get("last_trade", {})
+                price = last_trade.get("p")
+
+                if price:
+                    self.etf_router.update_tape(symbol, float(price), now)
+
+        except Exception as e:
+            logger.error(f"Error updating tape: {e}")
+
+    def _make_router_decision(self):
+        """10:00 AM: Make ETF router decision."""
+        logger.info("=" * 60)
+        logger.info("ROUTER DECISION (10:00)")
+        logger.info("=" * 60)
+
+        self.tape_recording_active = False
+        now = datetime.now(_ET)
+
+        # Make decision
+        decision = self.etf_router.make_decision(now)
+        self.router_decision = decision
+        self.router_decision_made = True
+
+        # Update state
+        self.router_branch = decision.branch.value
+        self.router_traded_today = decision.mr_blocked()
+        self.mr_blocked_today = decision.mr_blocked()
+
+        logger.info(f"Router decision: {decision.branch.value}")
+        logger.info(f"MR blocked today: {self.mr_blocked_today}")
+
+        if decision.symbol:
+            logger.info(f"Selected ETF: {decision.symbol}")
+            logger.info(f"Entry: {decision.entry_time}, Exit: {decision.exit_time}")
+            # Execute ETF entry
+            self._execute_etf_entry(decision)
+        else:
+            logger.info("No ETF trade - MR allowed at 15:45")
+
+        self._save_state()
+
+    def _execute_etf_entry(self, decision: RouterDecision):
+        """Execute ETF entry after 10:00 decision."""
+        if not decision.symbol:
+            return
+
+        symbol = decision.symbol
+        logger.info(f"Executing ETF entry: {symbol}")
+
+        try:
+            # Calculate position size
+            account = self.position_mgr.get_account()
+            if not account:
+                logger.error("Cannot fetch account for ETF sizing")
+                return
+
+            equity = float(account.get("equity", 0))
+            etf_capital_pct = getattr(config, "ETF_ROUTER_CAPITAL_PCT", 0.30)
+            etf_budget = equity * etf_capital_pct
+
+            # Get current price
+            snapshots = self.alpaca.get_snapshots([symbol])
+            snap = snapshots.get(symbol, {})
+            last_trade = snap.get("last_trade", {})
+            price = last_trade.get("p")
+
+            if not price:
+                logger.error(f"Cannot get price for {symbol}")
+                return
+
+            price = float(price)
+            qty = int(etf_budget / price)
+
+            if qty <= 0:
+                logger.warning(f"ETF qty <= 0, skipping entry: budget=${etf_budget:.2f}, price=${price:.2f}")
+                return
+
+            # Submit buy order
+            logger.info(f"Buying {qty} shares of {symbol} at ~${price:.2f}")
+            order, error_type = self.position_mgr.submit_buy_order(symbol, qty)
+
+            if order and order.get("id"):
+                # Wait for fill confirmation (max 10 seconds for liquid ETFs)
+                fill = self.position_mgr.get_order_fill(order["id"], max_wait=10)
+                if fill and int(fill.get("filled_qty", 0)) > 0:
+                    filled_qty = int(fill["filled_qty"])
+                    fill_price = float(fill.get("filled_avg_price", price))
+                    self.etf_position = {
+                        "symbol": symbol,
+                        "qty": filled_qty,
+                        "entry_price": fill_price,
+                        "entry_time": datetime.now(_ET).isoformat(),
+                        "branch": decision.branch.value,
+                        "planned_exit_time": decision.exit_time.isoformat() if decision.exit_time else None,
+                        "order_id": order.get("id"),
+                    }
+                    logger.info(f"ETF position opened: {symbol} {filled_qty} shares @ ${fill_price:.2f}")
+                else:
+                    logger.warning(f"ETF entry not filled for {symbol}; canceling and leaving flat")
+                    self.position_mgr._cancel_order(order["id"])
+            else:
+                logger.error(f"Failed to submit ETF buy order for {symbol}: {error_type}")
+
+        except Exception as e:
+            logger.error(f"Error executing ETF entry: {e}", exc_info=True)
+
+    def _check_etf_exits(self, current_time: dt_time):
+        """Check ETF exit checkpoints at 11:00, 14:00, 15:00."""
+        if not self.etf_position:
+            return
+
+        symbol = self.etf_position.get("symbol")
+        planned_exit = self.etf_position.get("planned_exit_time")
+
+        if not planned_exit:
+            return
+
+        # Parse planned exit time
+        try:
+            if isinstance(planned_exit, str):
+                # Handle HH:MM:SS format
+                parts = planned_exit.split(":")
+                exit_h, exit_m = int(parts[0]), int(parts[1])
+            else:
+                exit_h, exit_m = planned_exit.hour, planned_exit.minute
+        except Exception:
+            return
+
+        exit_time = dt_time(exit_h, exit_m)
+
+        # Check if it's time to exit
+        if current_time >= exit_time:
+            logger.info(f"ETF exit time reached: {symbol} at {current_time}")
+            self._execute_etf_exit()
+
+    def _execute_etf_exit(self):
+        """Execute ETF exit order with fill confirmation and duplicate guard."""
+        if not self.etf_position:
+            return
+
+        symbol = self.etf_position.get("symbol")
+        qty = self.etf_position.get("qty", 0)
+
+        # Check if exit order already submitted (duplicate guard)
+        existing_exit_id = self.etf_position.get("exit_order_id")
+        exit_submitted_at = self.etf_position.get("exit_submitted_at")
+
+        if existing_exit_id:
+            logger.info(f"ETF exit order already exists for {symbol}; checking fill status")
+            fill = self.position_mgr.get_order_fill(existing_exit_id, max_wait=2)
+
+            if fill and int(fill.get("filled_qty", 0)) > 0:
+                filled_qty = int(fill["filled_qty"])
+                if filled_qty >= qty:
+                    logger.info(f"ETF exit filled: {symbol} {filled_qty} shares")
+                    self.etf_position = None
+                    self._save_state()
+                else:
+                    remaining = qty - filled_qty
+                    self.etf_position["qty"] = remaining
+                    self.etf_position["exit_order_id"] = None  # Clear to allow retry
+                    logger.warning(f"ETF exit partial fill: {symbol} {filled_qty}/{qty}, {remaining} remaining")
+                    self._save_state()
+                return
+
+            # If exit has been pending too long, cancel and retry once
+            if exit_submitted_at:
+                submitted_dt = datetime.fromisoformat(exit_submitted_at)
+                age_seconds = (datetime.now(_ET) - submitted_dt).total_seconds()
+
+                if age_seconds > 60:
+                    logger.warning(
+                        f"ETF exit order {existing_exit_id} pending {age_seconds:.0f}s; canceling and retrying"
+                    )
+                    try:
+                        self.position_mgr._cancel_order(existing_exit_id)
+                    except Exception:
+                        logger.warning("ETF exit cancel failed", exc_info=True)
+
+                    self.etf_position["exit_order_id"] = None
+                    self.etf_position["exit_submitted_at"] = None
+                    self._save_state()
+                    return
+
+            logger.info(f"ETF exit order {existing_exit_id} still pending; waiting for fill")
+            return
+
+        logger.info(f"Executing ETF exit: {symbol} {qty} shares")
+
+        try:
+            # Submit sell order
+            order = self.position_mgr._submit_sell_order(
+                symbol,
+                qty,
+                order_type="market",
+                time_in_force="day",
+                extended_hours=False,
+            )
+
+            if order and order.get("id"):
+                # Record exit order id for duplicate guard
+                self.etf_position["exit_order_id"] = order.get("id")
+                self.etf_position["exit_submitted_at"] = datetime.now(_ET).isoformat()
+                self._save_state()
+
+                # Wait for fill confirmation
+                fill = self.position_mgr.get_order_fill(order["id"], max_wait=10)
+                if fill and int(fill.get("filled_qty", 0)) > 0:
+                    filled_qty = int(fill["filled_qty"])
+                    if filled_qty >= qty:
+                        logger.info(f"ETF exit filled: {symbol} {filled_qty} shares")
+                        self.etf_position = None
+                        self._save_state()
+                    else:
+                        # Partial fill - update remaining qty
+                        remaining = qty - filled_qty
+                        self.etf_position["qty"] = remaining
+                        self.etf_position["exit_order_id"] = None
+                        logger.warning(f"ETF exit partial fill: {symbol} {filled_qty}/{qty}, {remaining} remaining")
+                        self._save_state()
+                else:
+                    logger.warning(f"ETF exit submitted but not filled yet for {symbol}; will retry on next tick")
+            else:
+                logger.error(f"Failed to submit ETF sell order for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error executing ETF exit: {e}", exc_info=True)
 
 
 def main():
