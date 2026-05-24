@@ -137,29 +137,50 @@ class PositionManager:
     # Order submission
     # ────────────────────────────────────────────────────────
 
-    def submit_buy_order(self, symbol: str, qty: int, client_order_id: Optional[str] = None, timeout: int = 10) -> Tuple[Optional[dict], Optional[str]]:
-        """Submit a market buy order via POST /v2/orders.
+    def submit_buy_order(
+        self,
+        symbol: str,
+        qty: int,
+        client_order_id: Optional[str] = None,
+        timeout: int = 10,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
+    ) -> Tuple[Optional[dict], Optional[str]]:
+        """Submit a buy order via POST /v2/orders.
 
-        Used for overnight momentum entries at 3:50 PM.
-        Returns (order_response, error_type) tuple.
-        - order_response: dict with order data if successful, None otherwise
-        - error_type: None if successful, string describing error otherwise
-        
+        Used for overnight momentum entries at 3:50 PM and for the ETF
+        router 10:00 entry.
+
         Args:
-            symbol: Stock symbol
+            symbol: Stock / ETF symbol
             qty: Number of shares to buy
             client_order_id: Optional client-side order ID for idempotent reconciliation
             timeout: Request timeout in seconds (default 10, use 2-3 for batch entry)
+            order_type: "market" (default) or "limit". Use "limit" with a
+                marketable ``limit_price`` to bound execution slippage when
+                the spread is wide.
+            limit_price: Required when ``order_type="limit"``. Rounded to a
+                valid Alpaca tick.
+
+        Returns (order_response, error_type) tuple.
         """
+        if order_type == "limit" and (limit_price is None or limit_price <= 0):
+            return None, "invalid_limit_price"
+
         url = f"{self.base_url}/v2/orders"
         order_data = {
             "symbol": symbol,
             "qty": str(qty),
             "side": "buy",
-            "type": "market",
+            "type": order_type,
             "time_in_force": "day",
         }
-        
+
+        if order_type == "limit":
+            lp = self.round_limit_price(float(limit_price))
+            decimals = 2 if lp >= 1.0 else 4
+            order_data["limit_price"] = f"{lp:.{decimals}f}"
+
         if client_order_id:
             order_data["client_order_id"] = client_order_id
 
@@ -168,7 +189,8 @@ class PositionManager:
             response.raise_for_status()
             data = response.json()
             order_id = data.get("id")
-            logger.info(f"Buy order submitted: {symbol} x{qty} (ID: {order_id})")
+            limit_info = f" @ {order_data['limit_price']}" if order_type == "limit" else ""
+            logger.info(f"Buy order submitted: {symbol} {order_type} x{qty}{limit_info} (ID: {order_id})")
             return data, None
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else "N/A"
@@ -178,7 +200,7 @@ class PositionManager:
             except Exception:
                 body = "<unreadable>"
             logger.error(
-                f"Buy order FAILED | symbol={symbol} | qty={qty} | "
+                f"Buy order FAILED | symbol={symbol} | type={order_type} | qty={qty} | "
                 f"status={status_code} | body={body}"
             )
             return None, f"http_{status_code}"
@@ -732,6 +754,59 @@ class PositionManager:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error canceling all open orders: {e}")
             return False
+
+    def list_open_orders(self, symbols: Optional[List[str]] = None) -> List[dict]:
+        """Return all currently-open orders, optionally filtered by symbol set.
+
+        Uses GET /v2/orders?status=open. Returns [] on error (caller-safe).
+        """
+        url = f"{self.base_url}/v2/orders"
+        params = {"status": "open", "limit": 500, "nested": "false"}
+        try:
+            response = self.session.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list):
+                return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error listing open orders: {e}")
+            return []
+
+        if symbols is None:
+            return data
+        symbol_set = {s.upper() for s in symbols}
+        return [o for o in data if str(o.get("symbol", "")).upper() in symbol_set]
+
+    def cancel_orders_for_symbols(self, symbols: List[str]) -> int:
+        """Cancel only open orders whose symbol is in the given list.
+
+        Safer alternative to ``cancel_all_open_orders`` when callers want to
+        clean up a specific subset (e.g. ETF router symbols) without
+        clobbering unrelated resting orders such as overnight premarket
+        limit sells on equity positions.
+
+        Returns the number of orders successfully canceled.
+        """
+        if not symbols:
+            return 0
+        open_orders = self.list_open_orders(symbols=symbols)
+        if not open_orders:
+            logger.info(f"cancel_orders_for_symbols: no open orders found for {symbols}")
+            return 0
+
+        cancelled = 0
+        for order in open_orders:
+            order_id = order.get("id")
+            symbol = order.get("symbol")
+            if not order_id:
+                continue
+            if self._cancel_order(order_id):
+                cancelled += 1
+                logger.info(f"cancel_orders_for_symbols: cancelled {symbol} order {order_id}")
+        logger.warning(
+            f"cancel_orders_for_symbols: cancelled {cancelled}/{len(open_orders)} orders for {symbols}"
+        )
+        return cancelled
 
     # ────────────────────────────────────────────────────────
     # Broker interaction

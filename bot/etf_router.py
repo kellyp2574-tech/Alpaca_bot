@@ -42,21 +42,27 @@ class ETFTapeSnapshot:
     price_0945: Optional[float] = None  # Price at 09:45 for continuation check
     
     def update(self, price: float, timestamp: datetime):
-        """Update snapshot with new price data."""
-        if self.latest_price is None:
-            # First update
+        """Update snapshot with new price data.
+
+        ``open_930`` is treated as immutable after the first seed (normally
+        from ``ETFRouter.start_recording``). This guarantees a later tape
+        print can never silently overwrite the recorded 9:30 open even if a
+        future refactor forgets to pre-populate ``latest_price``.
+        """
+        # Seed open_930 only if it has never been set. Do NOT use latest_price
+        # as the seed gate — it's a separate field with a separate purpose.
+        if self.open_930 is None:
             self.open_930 = price
-            self.high = price
-            self.low = price
-        else:
-            self.high = max(self.high, price) if self.high else price
-            self.low = min(self.low, price) if self.low else price
-        
+
+        # high/low always track the realized 9:30-10:00 range.
+        self.high = price if self.high is None else max(self.high, price)
+        self.low = price if self.low is None else min(self.low, price)
+
         # Capture 09:45 price for continuation check
         ts_time = timestamp.time() if isinstance(timestamp, datetime) else timestamp
         if ts_time >= time(9, 45) and self.price_0945 is None:
             self.price_0945 = price
-        
+
         self.latest_price = price
         self.latest_time = timestamp
     

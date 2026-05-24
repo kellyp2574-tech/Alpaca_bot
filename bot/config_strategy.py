@@ -35,6 +35,13 @@ ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"]
 # Capital allocation for ETF router (separate from MR capital)
 ETF_ROUTER_CAPITAL_PCT = 0.30  # 30% of available capital for ETF router
 
+# Tape recording cadence. The main loop ticks every 1 s during the
+# 09:24-10:02 hot window; calling get_snapshots on 8 ETFs every tick is
+# ~2,400 API calls per session for no benefit (the router decision only
+# cares about returns vs 09:30 open and the 09:45 continuation marker,
+# not sub-second granularity). Throttle to once every N seconds.
+ETF_TAPE_UPDATE_INTERVAL_SECONDS = 5
+
 # ═══════════════════════════════════════════════════
 # Combined sleeve mode
 # ═══════════════════════════════════════════════════
@@ -68,6 +75,19 @@ ENTRY_RECONCILE_TIMEOUT_SECONDS = 3    # Timeout for client_order_id reconciliat
 ENTRY_SUBMIT_MAX_WORKERS = 8           # Max concurrent workers for buy submission
 ENTRY_BP_BUFFER_PCT = 0.98             # 2% buying power buffer
 ENTRY_MAX_SPREAD_PCT = 0.05            # Max spread for entry execution gate
+
+# Marketable-limit entry slippage cap. The 15:45 MR entries submit
+# limit buys at ``ask * (1 + ENTRY_MAX_SLIPPAGE_PCT)`` instead of pure
+# market orders, so a sudden quote dislocation cannot pay more than this
+# fraction above the prevailing ask. Falls back to a market order when
+# the ask is missing.
+ENTRY_MAX_SLIPPAGE_PCT = 0.02          # 2% above ask for low-priced MR names
+
+# ETF router 10:00 entry uses tighter caps because the universe is
+# highly liquid (SPY/QQQ/IWM/TQQQ/SQQQ/UVXY/VXX/XLK).
+ETF_ENTRY_MAX_SPREAD_PCT = 0.005       # 0.5% spread gate for ETF entry
+ETF_ENTRY_MAX_SLIPPAGE_PCT = 0.005     # 0.5% above ask for ETF marketable limit
+ETF_ENTRY_MAX_STALE_SECONDS = 10.0     # Quote freshness gate for ETF entry
 
 # ═══════════════════════════════════════════════════
 # Sleeve 1: Mean Reversion — MR_WIDE

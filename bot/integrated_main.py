@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import requests
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,6 +39,8 @@ from typing import List, Optional, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
 
 from bot import config
+from bot import premarket_classifier
+from bot import state_io
 from bot.massive_client import MassiveClient
 from bot.market_data import AlpacaDataClient
 from bot.mean_reversion_scorer import (
@@ -50,9 +53,8 @@ from bot.green_day_pullback_scorer import (
     build_green_day_pullback_candidates,
     filter_green_day_pullback_candidates,
 )
-from bot.etf_router import ETFRouter, RouterDecision, parse_router_decision_from_dict
+from bot.etf_router import ETFRouter, RouterDecision
 from bot.position_manager_overnight import PositionManager, Position
-from bot.rate_limiter import get_api_call_count
 from bot.state_manager import StateManager
 from bot.universe_builder import (
     build_universe,
@@ -60,8 +62,6 @@ from bot.universe_builder import (
     filter_execution_ready,
     save_universe_audit,
     save_candidates_audit,
-    save_run_health,
-    save_execution_audit,
     UniverseDiagnostics,
     ExecutionDiagnostics,
 )
@@ -144,6 +144,9 @@ class CombinedOvernightReboundBot:
         self.etf_position: Optional[Dict[str, Any]] = None  # Current ETF position if any
         self.etf_opens_930: Dict[str, float] = {}  # 9:30 opens for tape
         self.tape_recording_active = False
+        # Throttle for _update_tape (API efficiency #1). Monotonic seconds
+        # of the last snapshot fetch; 0.0 means "never run yet".
+        self._tape_last_update_monotonic: float = 0.0
 
         # Stage flags
         self.startup_done = False         # 9:00-9:25 startup phase
@@ -179,6 +182,20 @@ class CombinedOvernightReboundBot:
 
         # PDT guard: symbols sold today (no same-day re-entry when equity < $50k)
         self.sold_today: set = set()
+
+        # Daily-loss kill switch: when tripped, blocks BOTH the 10:00 ETF
+        # router entry and the 15:45 MR entries for the rest of the session.
+        # Persisted in state so a mid-day restart respects yesterday-was-bad
+        # is irrelevant (state is reset across dates) but a same-day restart
+        # after a crash still honors the breaker.
+        self.kill_switch_tripped: bool = False
+        self.kill_switch_reason: Optional[str] = None
+
+        # Graceful shutdown flag set by SIGINT/SIGTERM handlers installed in
+        # main(). The main loop polls this between ticks and exits cleanly:
+        # save state + stop fill stream. NEVER bypass exits-in-progress.
+        self._shutdown_requested: bool = False
+        self._shutdown_signal: Optional[str] = None
 
         # Data collection results (stored between steps)
         self._minute_bars: Dict[str, List[dict]] = {}
@@ -416,10 +433,15 @@ class CombinedOvernightReboundBot:
                             self.mr_exits_done = True
                             self._save_state()
 
-                    # 09:31 — broker-native rescue pass for any remaining positions
+                    # 09:31 — broker-native rescue pass for any remaining positions.
+                    # Issue #7: this used to require gdp_exits_done AND mr_exits_done
+                    # to flip True at 09:30 — but if the 09:30 submit block raised
+                    # mid-way (e.g. broker outage), the flags never flipped and the
+                    # rescue+failsafe were silently skipped while positions remained
+                    # open. Gate on TIME ALONE; the position-count check inside is
+                    # what decides whether to act.
                     t_rescue = dt_time(t_exit_all.hour, t_exit_all.minute + 1)
-                    if (self.gdp_exits_done and self.mr_exits_done
-                            and not self.open_market_rescue_done
+                    if (not self.open_market_rescue_done
                             and current_time >= t_rescue):
                         bc = self.position_mgr.broker_position_count()
                         if bc > 0:
@@ -430,9 +452,12 @@ class CombinedOvernightReboundBot:
                         self.open_market_rescue_done = True
                         self._save_state()
 
-                    # Failsafe: 10:00 if red-open trail is enabled, otherwise V2_FAILSAFE_TIME.
-                    if (self.gdp_exits_done and self.mr_exits_done
-                            and not self.post_exit_failsafe_done and current_time >= t_failsafe):
+                    # Failsafe at V2_FAILSAFE_TIME (or RED_OPEN_TRAIL_FAILSAFE_TIME).
+                    # Same hardening as the rescue: time + broker-not-flat is the
+                    # only requirement so a partial-failure 09:30 path still gets
+                    # the safety net.
+                    if (not self.post_exit_failsafe_done
+                            and current_time >= t_failsafe):
                         bc = self.position_mgr.broker_position_count()
                         if bc > 0:
                             logger.warning(f"Post-exit failsafe: broker still has {bc} positions")
@@ -449,11 +474,11 @@ class CombinedOvernightReboundBot:
                         self.morning_exits_done = True
                         self._save_state()
 
-                    # Early completion: only allowed before failsafe when no trailing orders are active.
-                    # Requires broker confirmation (not local position count) to ensure rescue runs.
+                    # Early completion: allowed after the 09:30 submit time when no
+                    # trailing orders are active and the broker is confirmed flat.
+                    # No longer requires gdp_exits_done/mr_exits_done flags.
                     if (not getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False)
-                            and self.gdp_exits_done
-                            and self.mr_exits_done
+                            and current_time >= t_exit_all
                             and not self.morning_exits_done):
                         bc = self.position_mgr.broker_position_count()
                         if bc == 0:
@@ -510,7 +535,7 @@ class CombinedOvernightReboundBot:
                 if (self.tape_initialized
                         and not self.router_decision_made
                         and current_time >= t_router_decision):
-                    self._update_tape()  # Final tape update
+                    self._update_tape(force=True)  # Final tape update bypasses throttle
                     self._make_router_decision()
 
                 # ETF exit checkpoints (11:00 UVXY, 14:00 SQQQ, 15:00 TQQQ)
@@ -566,11 +591,30 @@ class CombinedOvernightReboundBot:
                     self._save_state()
                 break
 
+            # Graceful shutdown check (SIGINT / SIGTERM).
+            if self._shutdown_requested:
+                logger.warning(
+                    f"Shutdown requested ({self._shutdown_signal}); saving state and exiting loop"
+                )
+                try:
+                    self._save_state()
+                except Exception:
+                    logger.warning("Shutdown: state save failed", exc_info=True)
+                break
+
             # Adaptive sleep: 1s during hot windows (open, close, premarket
             # checkpoints) so transitions are prompt; 30s otherwise so the bot
             # spends ~1500 ticks/day instead of ~36000 — drastically lower CPU
-            # and shared rate-limit pressure.
-            time.sleep(1 if _is_hot_window(current_time) else 30)
+            # and shared rate-limit pressure. The sleep is broken into 1s
+            # chunks so a SIGINT during a 30s idle is honored within ~1s
+            # instead of waiting out the full interval.
+            sleep_total = 1 if _is_hot_window(current_time) else 30
+            slept = 0
+            while slept < sleep_total:
+                if self._shutdown_requested:
+                    break
+                time.sleep(1)
+                slept += 1
 
     # ════════════════════════════════════════════════════════════
     # MORNING EXIT METHODS
@@ -973,10 +1017,26 @@ class CombinedOvernightReboundBot:
             today = date.today().isoformat()
             signal_end = config.ENTRY_TIME  # 15:50
 
-            # 1. Fetch 9:30-15:50 minute bars for the full base universe
-            logger.info(f"Fetching 9:30-{signal_end} minute bars for {len(self.universe)} symbols...")
+            # 1. Fetch 9:30-15:50 minute bars for the full base universe AND
+            # the MR ETF regime symbols in a single batched request (API #2:
+            # avoids a separate get_intraday_bars_for_signal call inside
+            # _compute_mr_etf_regime_size_multiplier).
+            regime_symbols = []
+            if getattr(config, "ENABLE_MR_ETF_REGIME_SIZING", False):
+                regime_symbols = list(
+                    getattr(config, "MR_ETF_REGIME_SYMBOLS", ["SPY", "IWM", "QQQ"])
+                )
+            fetch_symbols = list(self.universe)
+            for s in regime_symbols:
+                if s not in fetch_symbols:
+                    fetch_symbols.append(s)
+
+            logger.info(
+                f"Fetching 9:30-{signal_end} minute bars for {len(fetch_symbols)} symbols "
+                f"({len(self.universe)} universe + {len(regime_symbols)} regime ETFs)..."
+            )
             self._minute_bars = self.alpaca.get_intraday_bars_for_signal(
-                self.universe, today, start="09:30", end=signal_end,
+                fetch_symbols, today, start="09:30", end=signal_end,
             )
 
             # Log signal bar timestamps to verify data recency in live trading
@@ -1136,6 +1196,64 @@ class CombinedOvernightReboundBot:
             logger.exception(f"Error in scoring: {e}")
             self.scoring_done = True
 
+    def _check_daily_loss_kill_switch(self, account: Optional[dict] = None) -> bool:
+        """Evaluate the global daily-loss kill switch.
+
+        Trips ``self.kill_switch_tripped`` (and persists state) when
+        ``(equity - last_equity) / last_equity <= -DAILY_LOSS_LIMIT_PCT``.
+        Once tripped, the flag remains True for the rest of the session and
+        blocks both the 10:00 ETF router entry and the 15:45 MR entries.
+
+        Args:
+            account: Optional pre-fetched account dict (avoids redundant
+                API calls when the caller already has one).
+
+        Returns:
+            True if the kill switch is tripped (either previously or just
+            now), False otherwise.
+        """
+        if self.kill_switch_tripped:
+            return True
+
+        loss_limit = float(getattr(config, "DAILY_LOSS_LIMIT_PCT", 0.0) or 0.0)
+        if loss_limit <= 0:
+            return False
+
+        try:
+            acct = account if account is not None else self.position_mgr.get_account()
+        except Exception:
+            logger.warning("kill-switch: account fetch failed; cannot evaluate", exc_info=True)
+            return False
+        if not acct:
+            return False
+
+        try:
+            equity = float(acct.get("equity") or 0.0)
+            last_equity = float(acct.get("last_equity") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if equity <= 0 or last_equity <= 0:
+            return False
+
+        day_ret = (equity - last_equity) / last_equity
+        if day_ret <= -loss_limit:
+            self.kill_switch_tripped = True
+            self.kill_switch_reason = (
+                f"day_ret={day_ret:+.2%} <= -{loss_limit:.0%} "
+                f"(equity=${equity:,.2f} vs last_equity=${last_equity:,.2f})"
+            )
+            logger.critical(
+                f"DAILY LOSS KILL SWITCH TRIPPED — {self.kill_switch_reason}. "
+                f"All new entries (ETF router + MR) BLOCKED for the rest of the session."
+            )
+            try:
+                self._save_state()
+            except Exception:
+                logger.warning("kill-switch: state save failed", exc_info=True)
+            return True
+
+        return False
+
     def _compute_mr_etf_regime_size_multiplier(self) -> tuple[float, dict]:
         """Return MR size multiplier from SPY/IWM/QQQ avg return vs open.
 
@@ -1150,13 +1268,29 @@ class CombinedOvernightReboundBot:
         today = date.today().isoformat()
         end_time = getattr(config, "ENTRY_TIME", "15:45")
 
-        try:
-            bars_by_symbol = self.alpaca.get_intraday_bars_for_signal(
-                symbols, today, start="09:30", end=end_time,
+        # Reuse the minute bars already fetched for the universe at 15:45
+        # (API #2). _step_score_and_rank now prepends the regime ETFs to the
+        # batched fetch, so SPY/IWM/QQQ should already be in self._minute_bars.
+        # Fall back to a separate fetch only if the cache is missing data
+        # (e.g. _step_score_and_rank was skipped or returned early).
+        cached = self._minute_bars or {}
+        missing = [s for s in symbols if not cached.get(s)]
+        if missing:
+            logger.info(
+                f"MR ETF regime sizing: {len(symbols) - len(missing)} cached, "
+                f"fetching {missing} from API"
             )
-        except Exception:
-            logger.warning("MR ETF regime sizing: failed to fetch ETF bars; using full size", exc_info=True)
-            return 1.0, {"enabled": True, "reason": "fetch_failed"}
+            try:
+                extra = self.alpaca.get_intraday_bars_for_signal(
+                    missing, today, start="09:30", end=end_time,
+                )
+                bars_by_symbol = dict(cached)
+                bars_by_symbol.update(extra)
+            except Exception:
+                logger.warning("MR ETF regime sizing: failed to fetch ETF bars; using full size", exc_info=True)
+                return 1.0, {"enabled": True, "reason": "fetch_failed"}
+        else:
+            bars_by_symbol = cached
 
         returns = {}
 
@@ -1387,32 +1521,27 @@ class CombinedOvernightReboundBot:
                 logger.warning("Cannot determine buying power — falling back to equity")
                 buying_power = equity
 
-            # Daily loss circuit breaker — abort entries if today's PnL is worse
+            # Daily loss kill switch — global flag set by
+            # _check_daily_loss_kill_switch(). Trips if today's PnL is worse
             # than DAILY_LOSS_LIMIT_PCT. account['last_equity'] is yesterday's
-            # market-close equity, so today's drawdown is a clean comparison.
-            loss_limit = float(getattr(config, "DAILY_LOSS_LIMIT_PCT", 0.0) or 0.0)
-            if loss_limit > 0:
-                try:
-                    last_equity = float(account.get("last_equity") or 0.0)
-                except (TypeError, ValueError):
-                    last_equity = 0.0
+            # close equity. Once tripped, also blocks any future entries this
+            # session (and the 10:00 ETF router entry checks the same flag).
+            if self._check_daily_loss_kill_switch(account=account):
+                logger.critical(
+                    f"MR entries BLOCKED by daily-loss kill switch — {self.kill_switch_reason}"
+                )
+                self.entries_done = True
+                return
+            try:
+                last_equity = float(account.get("last_equity") or 0.0)
                 if last_equity > 0:
                     day_ret = (equity - last_equity) / last_equity
-                    if day_ret <= -loss_limit:
-                        logger.critical(
-                            f"DAILY LOSS CIRCUIT BREAKER TRIPPED — equity ${equity:,.2f} "
-                            f"vs last_equity ${last_equity:,.2f} = {day_ret:+.2%}; "
-                            f"limit -{loss_limit:.0%}. SKIPPING all entries today."
-                        )
-                        self.entries_done = True
-                        return
                     logger.info(
-                        f"Daily PnL check OK: {day_ret:+.2%} (limit -{loss_limit:.0%})"
+                        f"Daily PnL check OK: {day_ret:+.2%} (limit "
+                        f"-{float(getattr(config, 'DAILY_LOSS_LIMIT_PCT', 0.0)):.0%})"
                     )
-                else:
-                    logger.warning(
-                        "Daily loss check skipped — last_equity unavailable from account API"
-                    )
+            except (TypeError, ValueError):
+                pass
 
             deployable = min(buying_power, equity * config.MAX_LEVERAGE)
             logger.info(
@@ -1665,7 +1794,10 @@ class CombinedOvernightReboundBot:
             # Create deterministic client_order_id for each allocation
             # Format: BOT-YYYYMMDD-HHMMSS-SYMBOL
             timestamp = datetime.now(_ET).strftime("%Y%m%d-%H%M%S")
-            submission_plans = []  # List of (alloc, qty, client_order_id, price_ref)
+            submission_plans = []  # List of (alloc, qty, client_order_id, price_ref, limit_price)
+
+            # Issue #6: marketable-limit slippage cap for MR entries.
+            mr_slippage_pct = float(getattr(config, "ENTRY_MAX_SLIPPAGE_PCT", 0.02))
 
             for alloc in allocations:
                 # Check cutoff before processing
@@ -1689,17 +1821,29 @@ class CombinedOvernightReboundBot:
                     exec_diag.failed_submissions[symbol] = "bp_resize_below_min"
                     continue
 
+                # Marketable-limit price (issue #6): cap at ask * (1 + slippage).
+                # Falls back to market order (limit_price=None) when the ask is
+                # missing from the snapshot, preserving prior behavior on
+                # degraded data instead of refusing to enter.
+                snap = (fresh_snaps or {}).get(symbol, {}) or {}
+                ask = snap.get("ask")
+                if ask and float(ask) > 0:
+                    limit_price = float(ask) * (1.0 + mr_slippage_pct)
+                else:
+                    limit_price = None
+
                 # Create deterministic client_order_id
                 client_order_id = f"BOT-{timestamp}-{symbol}"
-                planned_notional = qty * price_ref
-                
+                planned_notional = qty * (limit_price if limit_price else price_ref)
+
                 logger.info(
                     f"ENTRY PLAN {symbol}: qty={qty}, price_ref={price_ref:.4f}, "
+                    f"ask={ask}, limit={f'{limit_price:.4f}' if limit_price else 'MARKET'}, "
                     f"notional={planned_notional:,.2f}, bp_remaining={bp_remaining:,.2f}, "
                     f"sleeve={alloc.sleeve}, rank={alloc.rank}, client_id={client_order_id}"
                 )
 
-                submission_plans.append((alloc, qty, client_order_id, price_ref))
+                submission_plans.append((alloc, qty, client_order_id, price_ref, limit_price))
                 # Decrement local BP tracker by the planned notional
                 bp_remaining = max(0.0, bp_remaining - planned_notional)
 
@@ -1709,18 +1853,28 @@ class CombinedOvernightReboundBot:
 
             def _submit_entry_order(plan):
                 """Submit one buy order. Runs inside ThreadPoolExecutor."""
-                alloc, qty, client_order_id, price_ref = plan
+                alloc, qty, client_order_id, price_ref, limit_price = plan
                 symbol = alloc.symbol
                 submit_start = datetime.now(_ET)
                 t0 = time.perf_counter()
 
                 try:
-                    buy_resp, error_type = self.position_mgr.submit_buy_order(
-                        symbol,
-                        qty,
-                        client_order_id=client_order_id,
-                        timeout=getattr(config, "ENTRY_SUBMIT_TIMEOUT_SECONDS", 2),
-                    )
+                    if limit_price is not None:
+                        buy_resp, error_type = self.position_mgr.submit_buy_order(
+                            symbol,
+                            qty,
+                            client_order_id=client_order_id,
+                            timeout=getattr(config, "ENTRY_SUBMIT_TIMEOUT_SECONDS", 2),
+                            order_type="limit",
+                            limit_price=limit_price,
+                        )
+                    else:
+                        buy_resp, error_type = self.position_mgr.submit_buy_order(
+                            symbol,
+                            qty,
+                            client_order_id=client_order_id,
+                            timeout=getattr(config, "ENTRY_SUBMIT_TIMEOUT_SECONDS", 2),
+                        )
                     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
                     return {
@@ -1763,6 +1917,10 @@ class CombinedOvernightReboundBot:
                 getattr(config, "ENTRY_SUBMIT_TIMEOUT_SECONDS", 2),
             )
 
+            # Collect per-order submission latencies so we can publish a
+            # p50/p95/avg summary in the run_health artifact (observability).
+            submit_latencies_ms: List[float] = []
+
             if max_workers <= 0:
                 logger.warning("ENTRY CONCURRENT SUBMIT: no submission plans")
             else:
@@ -1783,6 +1941,7 @@ class CombinedOvernightReboundBot:
                         buy_resp = result["buy_resp"]
                         error_type = result["error_type"]
                         elapsed_ms = result["elapsed_ms"]
+                        submit_latencies_ms.append(float(elapsed_ms))
 
                         if buy_resp and buy_resp.get("id"):
                             order_id = buy_resp["id"]
@@ -1920,6 +2079,23 @@ class CombinedOvernightReboundBot:
                 if exec_diag.fill_details.get(s, {}).get("sleeve", "").startswith("GDP")
             )
 
+            # Latency summary (observability). p50/p95/avg of per-order
+            # POST /v2/orders elapsed time. Surfaces a sluggish broker
+            # endpoint into the run_health artifact instead of being buried
+            # in per-order log lines.
+            latency_summary: Dict[str, Any] = {"count": len(submit_latencies_ms)}
+            if submit_latencies_ms:
+                sorted_lat = sorted(submit_latencies_ms)
+                n = len(sorted_lat)
+                p50 = sorted_lat[n // 2]
+                p95 = sorted_lat[min(n - 1, int(n * 0.95))]
+                latency_summary.update({
+                    "avg_ms": round(sum(sorted_lat) / n, 1),
+                    "p50_ms": round(p50, 1),
+                    "p95_ms": round(p95, 1),
+                    "max_ms": round(sorted_lat[-1], 1),
+                })
+
             self._exec_stats = {
                 "selected": len(exec_diag.selected_symbols),
                 "orderable": len(exec_diag.orderable_symbols),
@@ -1932,6 +2108,7 @@ class CombinedOvernightReboundBot:
                 "total_deployed": total_deployed,
                 "equity": equity,
                 "deployable": deployable,
+                "submit_latency_ms": latency_summary,
             }
 
             deployment_pct = total_deployed / deployable * 100 if deployable > 0 else 0.0
@@ -2188,466 +2365,30 @@ class CombinedOvernightReboundBot:
 
         self._save_state()
 
+    # ────────────────────────────────────────────────────────────
+    # Premarket classifier — delegated to bot.premarket_classifier
+    # ────────────────────────────────────────────────────────────
+
     def _fetch_delayed_sip_premarket_bars(self, symbols: List[str], decision_dt: datetime) -> Dict[str, List[dict]]:
-        """Fetch delayed SIP 1-minute bars from 04:00 through decision_dt - 16 minutes.
-        
-        This uses the historical bars endpoint with feed=sip and a deliberately delayed
-        end parameter to work around the 15-minute SIP delay. For delayed SIP without
-        a live SIP subscription, the end parameter must be at least 15 minutes old.
-        
-        Returns a dict mapping symbol -> list of bars.
-        """
-        delay_minutes = getattr(config, "PREMARKET_SIP_DELAY_MINUTES", 16)
-        start_dt = datetime.combine(decision_dt.date(), dt_time(4, 0), tzinfo=_ET)
-        end_dt = decision_dt - timedelta(minutes=delay_minutes)
-        
-        data_url = getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-        url = f"{data_url}/v2/stocks/bars"
-        
-        params = {
-            "symbols": ",".join(symbols),
-            "timeframe": "1Min",
-            "start": start_dt.isoformat(),
-            "end": end_dt.isoformat(),
-            "adjustment": "raw",
-            "feed": "sip",
-            "limit": 10000,
-        }
-        
-        try:
-            resp = self.position_mgr.session.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            
-            # Parse the multi-symbol response into a dict
-            bars_by_symbol = {}
-            for symbol, bars_data in payload.get("bars", {}).items():
-                bars = bars_data if isinstance(bars_data, list) else []
-                bars_by_symbol[symbol] = bars
-            
-            logger.info(f"Delayed SIP premarket bars: fetched {len(bars_by_symbol)} symbols, end={end_dt.strftime('%H:%M')}")
-            return bars_by_symbol
-            
-        except Exception as e:
-            logger.warning(f"Delayed SIP premarket bars: failed to fetch for {len(symbols)} symbols: {e}", exc_info=True)
-            return {}
+        return premarket_classifier.fetch_delayed_sip_premarket_bars(
+            self.position_mgr.session, symbols, decision_dt,
+        )
 
     @staticmethod
     def _bar_dt(bar: dict) -> Optional[datetime]:
-        """Parse Alpaca bar timestamp into America/New_York datetime."""
-        raw = bar.get("t") or bar.get("timestamp") or bar.get("time")
-        if not raw:
-            return None
-        try:
-            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=_ET)
-            return parsed.astimezone(_ET)
-        except Exception:
-            return None
+        return premarket_classifier.bar_dt(bar)
 
     @staticmethod
     def _bar_float(bar: dict, *keys: str) -> Optional[float]:
-        """Read a float from Alpaca bar keys, supporting both short and long names."""
-        for key in keys:
-            if key in bar and bar.get(key) is not None:
-                try:
-                    return float(bar.get(key))
-                except (TypeError, ValueError):
-                    continue
-        return None
+        return premarket_classifier.bar_float(bar, *keys)
 
     def _compute_delayed_sip_premarket_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_bars: Optional[Dict[str, List[dict]]] = None) -> Dict[str, Any]:
-        """Compute premarket metrics from delayed SIP historical bars.
-        
-        This uses delayed SIP 1-minute bars ending at decision_dt - 16 minutes.
-        No SIP snapshot backup - we rely entirely on delayed SIP historical bars.
-        """
-        # Use pre-fetched bars if provided (batch mode), otherwise fetch individually
-        if pre_fetched_bars is not None:
-            bars_raw = pre_fetched_bars.get(symbol, [])
-        else:
-            # Fallback: fetch individually if not batched
-            bars_by_symbol = self._fetch_delayed_sip_premarket_bars([symbol], decision_dt)
-            bars_raw = bars_by_symbol.get(symbol, [])
-        
-        normalized = []
-        for bar in bars_raw:
-            dt_val = self._bar_dt(bar)
-            close = self._bar_float(bar, "c", "close")
-            high = self._bar_float(bar, "h", "high")
-            low = self._bar_float(bar, "l", "low")
-            volume = self._bar_float(bar, "v", "volume") or 0.0
-            if dt_val and close and high and low:
-                normalized.append({
-                    "dt": dt_val,
-                    "close": close,
-                    "high": high,
-                    "low": low,
-                    "volume": volume,
-                })
-
-        normalized.sort(key=lambda b: b["dt"])
-
-        if not normalized:
-            return {
-                "has_data": False,
-                "reason": "no_delayed_sip_bars",
-                "premarket_minutes": 0,
-                "current_return": None,
-            }
-
-        first = normalized[0]
-        last = normalized[-1]
-        sip_stale_minutes = (decision_dt - last["dt"]).total_seconds() / 60.0
-        sip_high = max(b["high"] for b in normalized)
-        sip_low = min(b["low"] for b in normalized)
-        premarket_volume = sum(b["volume"] for b in normalized)
-        sip_current = last["close"]
-        first_price = first["close"]
-
-        current_return = sip_current / buy_price - 1.0 if buy_price > 0 else 0.0
-        distance_from_high = sip_current / sip_high - 1.0 if sip_high > 0 else 0.0
-        return_from_low = sip_current / sip_low - 1.0 if sip_low > 0 else 0.0
-        trend_from_first_bar = sip_current / first_price - 1.0 if first_price > 0 else 0.0
-
-        logger.info(
-            "PREMARKET DELAYED SIP %s: entry=%.4f current=%.4f ret=%+.2f%% "
-            "high=%.4f low=%.4f bars=%d stale=%.0fm",
-            symbol,
-            buy_price,
-            sip_current,
-            current_return * 100.0,
-            sip_high,
-            sip_low,
-            len(normalized),
-            sip_stale_minutes,
+        return premarket_classifier.compute_delayed_sip_premarket_metrics(
+            self.position_mgr.session, symbol, buy_price, decision_dt, pre_fetched_bars,
         )
 
-        return {
-            "has_data": True,
-            "reason": "delayed_sip_bars",
-            "price_source": "delayed_sip",
-            "first_premarket_time": first["dt"],
-            "first_premarket_price": first_price,
-            "current_time": last["dt"],
-            "current_price": sip_current,
-            "iex_current_price": None,
-            "sip_current_price": sip_current,
-            "sip_snapshot_reason": None,
-            "premarket_high": sip_high,
-            "iex_premarket_high": sip_high,
-            "premarket_low": sip_low,
-            "premarket_minutes": len(normalized),
-            "premarket_volume": premarket_volume,
-            "last_bar_age_minutes": sip_stale_minutes,
-            "iex_last_bar_age_minutes": sip_stale_minutes,
-            "snapshot_spread_pct": None,
-            "current_return": current_return,
-            "distance_from_high": distance_from_high,
-            "return_from_low": return_from_low,
-            "trend_from_first_bar": trend_from_first_bar,
-        }
-
-    def _compute_snapshot_metrics(self, symbol: str, buy_price: float, decision_dt: datetime, pre_fetched_snapshots: Optional[Dict[str, dict]] = None) -> Dict[str, Any]:
-        """Compute premarket metrics from Alpaca SIP snapshot/quote data.
-
-        This method is intentionally reusable in two modes:
-        1. Full fallback when IEX has no premarket bars.
-        2. Current-price backup when IEX bars exist but may be stale/thin.
-
-        Price priority:
-        - Fresh NBBO midpoint when spread is sane.
-        - Fresh latest trade when midpoint is unavailable/stale.
-        Wide spreads reject the midpoint but do not automatically reject a fresh
-        latest trade; the caller may still decide whether to use it.
-        """
-        try:
-            # Use pre-fetched snapshots if provided (batch mode), otherwise fetch individually
-            if pre_fetched_snapshots is not None:
-                snapshots = pre_fetched_snapshots
-            else:
-                # Use SIP feed for snapshot backup when enabled
-                use_sip_feed = getattr(config, "USE_SIP_SNAPSHOT_PREMARKET_BACKUP", True)
-                feed = "sip" if use_sip_feed else None
-                snapshots = self.alpaca.get_snapshots([symbol], feed=feed)
-            
-            if not snapshots or symbol not in snapshots:
-                return {
-                    "has_data": False,
-                    "reason": "snapshot_not_available",
-                    "premarket_minutes": 0,
-                    "current_return": None,
-                }
-
-            snap = snapshots[symbol]
-            if not snap:
-                return {
-                    "has_data": False,
-                    "reason": "snapshot_empty",
-                    "premarket_minutes": 0,
-                    "current_return": None,
-                }
-
-            latest_trade = snap.get("latestTrade") or snap.get("last_trade") or snap.get("latest_trade") or {}
-            latest_quote = snap.get("latestQuote") or snap.get("quote") or snap.get("latest_quote") or {}
-
-            def _float_from(container: dict, *keys: str) -> float:
-                for key in keys:
-                    try:
-                        val = container.get(key)
-                        if val is not None:
-                            return float(val)
-                    except (TypeError, ValueError, AttributeError):
-                        continue
-                return 0.0
-
-            # Support both raw Alpaca nested snapshots and parsed/flattened snapshots
-            last_trade_price = (
-                _float_from(latest_trade, "p", "price")
-                or _float_from(snap, "last_price", "price", "current_price")
-            )
-
-            bid = (
-                _float_from(latest_quote, "bp", "bid_price", "bid")
-                or _float_from(snap, "bid")
-            )
-
-            ask = (
-                _float_from(latest_quote, "ap", "ask_price", "ask")
-                or _float_from(snap, "ask")
-            )
-
-            quote_timestamp = (
-                latest_quote.get("t")
-                or latest_quote.get("timestamp")
-                if latest_quote else None
-            )
-
-            trade_timestamp = (
-                latest_trade.get("t")
-                or latest_trade.get("timestamp")
-                if latest_trade else None
-            )
-
-            # Flattened parser stores the latest trade timestamp here
-            if not trade_timestamp:
-                trade_timestamp = snap.get("timestamp")
-
-            def _parse_snap_time(raw) -> Optional[datetime]:
-                if not raw:
-                    return None
-                try:
-                    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=_ET)
-                    return parsed.astimezone(_ET)
-                except Exception:
-                    return None
-
-            quote_time = _parse_snap_time(quote_timestamp)
-            trade_time = _parse_snap_time(trade_timestamp)
-
-            stale_max = getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
-            quote_stale_minutes = (decision_dt - quote_time).total_seconds() / 60.0 if quote_time else 999.0
-            trade_stale_minutes = (decision_dt - trade_time).total_seconds() / 60.0 if trade_time else 999.0
-            quote_fresh = quote_stale_minutes <= stale_max
-            trade_fresh = trade_stale_minutes <= stale_max
-
-            max_spread = getattr(config, "SIP_SNAPSHOT_MAX_SPREAD_PCT", 0.02)
-            midpoint = 0.0
-            spread_pct = None
-            midpoint_usable = False
-            if bid > 0 and ask > 0 and ask >= bid:
-                midpoint = (bid + ask) / 2.0
-                spread_pct = (ask - bid) / midpoint if midpoint > 0 else None
-                midpoint_usable = quote_fresh and spread_pct is not None and spread_pct <= max_spread
-
-            current_price = 0.0
-            source = ""
-            used_time = None
-            stale_minutes = 999.0
-
-            if midpoint_usable:
-                current_price = midpoint
-                source = "snapshot_mid"
-                used_time = quote_time
-                stale_minutes = quote_stale_minutes
-            elif last_trade_price > 0 and trade_fresh:
-                current_price = last_trade_price
-                source = "snapshot_last"
-                used_time = trade_time
-                stale_minutes = trade_stale_minutes
-            elif midpoint > 0 and quote_fresh:
-                # Quote exists but spread is too wide. Do not use it for actual
-                # pricing, but log why it was rejected.
-                logger.warning(
-                    "PREMARKET SNAPSHOT MID REJECTED: symbol=%s reason=wide_spread spread=%s bid=%.4f ask=%.4f max=%.2f%%",
-                    symbol,
-                    f"{spread_pct:.2%}" if spread_pct is not None else "None",
-                    bid,
-                    ask,
-                    max_spread * 100.0,
-                )
-
-            if current_price <= 0:
-                logger.warning(
-                    "PREMARKET SNAPSHOT REJECTED: symbol=%s reason=no_fresh_usable_price "
-                    "quote_fresh=%s trade_fresh=%s quote_stale=%.0fm trade_stale=%.0fm bid=%.4f ask=%.4f last=%.4f spread=%s",
-                    symbol,
-                    quote_fresh,
-                    trade_fresh,
-                    quote_stale_minutes,
-                    trade_stale_minutes,
-                    bid,
-                    ask,
-                    last_trade_price,
-                    f"{spread_pct:.2%}" if spread_pct is not None else "None",
-                )
-                return {
-                    "has_data": False,
-                    "reason": "snapshot_stale_or_no_fresh_data",
-                    "premarket_minutes": 0,
-                    "snapshot_bid": bid,
-                    "snapshot_ask": ask,
-                    "snapshot_spread_pct": spread_pct,
-                }
-
-            current_return = current_price / buy_price - 1.0 if buy_price > 0 else 0.0
-
-            logger.info(
-                "PREMARKET SNAPSHOT PRICE %s: source=%s bid=%.4f ask=%.4f mid=%.4f last=%.4f "
-                "used=%.4f entry=%.4f ret=%+.2f%% spread=%s stale=%.0fm",
-                symbol,
-                source,
-                bid,
-                ask,
-                midpoint,
-                last_trade_price,
-                current_price,
-                buy_price,
-                current_return * 100.0,
-                f"{spread_pct:.2%}" if spread_pct is not None else "None",
-                stale_minutes,
-            )
-
-            return {
-                "has_data": True,
-                "reason": "snapshot_data",
-                "price_source": source,
-                "current_time": used_time or decision_dt,
-                "current_price": current_price,
-                "premarket_high": current_price,
-                "premarket_low": current_price,
-                "premarket_minutes": 0,
-                "premarket_volume": 0,
-                "last_bar_age_minutes": stale_minutes,
-                "current_return": current_return,
-                "distance_from_high": 0.0,
-                "return_from_low": 0.0,
-                "trend_from_first_bar": 0.0,
-                "snapshot_bid": bid,
-                "snapshot_ask": ask,
-                "snapshot_mid": midpoint,
-                "snapshot_last": last_trade_price,
-                "snapshot_spread_pct": spread_pct,
-                "snapshot_quote_stale_minutes": quote_stale_minutes,
-                "snapshot_trade_stale_minutes": trade_stale_minutes,
-            }
-        except Exception:
-            logger.warning(f"PREMARKET SNAPSHOT FALLBACK FAILED for {symbol}", exc_info=True)
-            return {
-                "has_data": False,
-                "reason": "snapshot_not_available",
-                "premarket_minutes": 0,
-                "current_return": None,
-            }
-
     def _classify_premarket_limit(self, pos: Position, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """Lenient delayed SIP-aware dynamic limit decision.
-
-        Uses delayed SIP historical bars ending at decision_dt - 16 minutes.
-        Sparse bars are treated as usable signal rather than requiring dense coverage.
-        The fallback for unclear signals is a normal 5% harvest limit rather than no decision.
-        """
-        fallback_limit = getattr(config, "PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT", 0.05)
-        sparse_wide_limit = getattr(config, "PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT", 0.10)
-        very_high = getattr(config, "PREMARKET_DYNAMIC_VERY_HIGH_RETURN_NO_CAP_PCT", 0.10)
-        high = getattr(config, "PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT", 0.05)
-        moderate = getattr(config, "PREMARKET_DYNAMIC_MODERATE_RETURN_PCT", 0.02)
-        stale_max = getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
-
-        if not metrics.get("has_data"):
-            # No data available - no order placed
-            return {
-                "action": "NO_ACTION",
-                "limit_pct": None,
-                "reason": "data_unavailable",
-            }
-
-        bars = int(metrics.get("premarket_minutes", 0) or 0)
-        stale = float(metrics.get("last_bar_age_minutes", 999) or 999)
-        current_return = metrics.get("current_return")
-        
-        # If current_return is None, data is unavailable - should have been caught above
-        if current_return is None:
-            return {
-                "action": "NO_ACTION",
-                "limit_pct": None,
-                "reason": "data_unavailable_in_classifier",
-            }
-        
-        current_return = float(current_return) if current_return is not None else 0.0
-        distance_from_high = float(metrics.get("distance_from_high", 0.0) or 0.0)
-        trend = float(metrics.get("trend_from_first_bar", 0.0) or 0.0)
-        sleeve = str(getattr(pos, "sleeve", "UNKNOWN") or "UNKNOWN").upper()
-        fresh_enough = stale <= stale_max
-        data_source = metrics.get("reason", "")
-        
-        # Snapshot data: treat as single price point without bar count requirements
-        is_snapshot = data_source == "snapshot_data"
-        
-        if is_snapshot:
-            # Snapshot-based decision: simpler logic based on current_return and staleness
-            if current_return >= very_high and fresh_enough:
-                return {"action": "NO_CAP", "limit_pct": None, "reason": "snapshot_very_high_return_no_cap"}
-            elif current_return >= high:
-                if sleeve == "MR" and current_return < very_high:
-                    return {"action": "PLACE_LIMIT", "limit_pct": fallback_limit, "reason": "snapshot_high_return_mr_harvest_5pct"}
-                return {"action": "NO_CAP", "limit_pct": None, "reason": "snapshot_high_return_no_cap"}
-            elif current_return >= moderate:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.06, "reason": "snapshot_moderate_return_6pct"}
-            elif current_return >= 0:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.04, "reason": "snapshot_small_winner_4pct"}
-            else:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "snapshot_negative_pop_harvest_3pct"}
-
-        # Bar-based decision: delayed SIP bars with bar count requirements
-        # True runner: even sparse SIP activity is enough not to choke it.
-        if current_return >= very_high and bars >= 1 and fresh_enough:
-            return {"action": "NO_CAP", "limit_pct": None, "reason": "sip_very_high_return_no_cap"}
-
-        # Strong runner: needs at least a little SIP confirmation, but not dense tape.
-        if current_return >= high:
-            if bars >= 2 and fresh_enough:
-                # MR can still harvest below +10%; continuation/unknown stays uncapped.
-                if sleeve == "MR" and current_return < very_high:
-                    return {"action": "PLACE_LIMIT", "limit_pct": fallback_limit, "reason": "sip_high_return_mr_harvest_5pct"}
-                return {"action": "NO_CAP", "limit_pct": None, "reason": "sip_high_return_no_cap"}
-            return {"action": "PLACE_LIMIT", "limit_pct": sparse_wide_limit, "reason": "sip_high_return_sparse_wide_10pct"}
-
-        # Moderate winner: if it is building and near highs, give it more room.
-        if current_return >= moderate:
-            if distance_from_high > -0.01 and trend > 0 and fresh_enough:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.07, "reason": "sip_moderate_near_high_7pct"}
-            if distance_from_high < -0.03 or trend < 0:
-                return {"action": "PLACE_LIMIT", "limit_pct": 0.05, "reason": "sip_moderate_fading_5pct"}
-            return {"action": "PLACE_LIMIT", "limit_pct": 0.06, "reason": "sip_moderate_default_6pct"}
-
-        if current_return >= 0:
-            return {"action": "PLACE_LIMIT", "limit_pct": 0.04, "reason": "sip_small_winner_4pct"}
-
-        return {"action": "PLACE_LIMIT", "limit_pct": 0.03, "reason": "sip_negative_pop_harvest_3pct"}
+        return premarket_classifier.classify_premarket_limit(pos, metrics)
 
     def _is_decisive_premarket_signal(
         self,
@@ -2661,76 +2402,17 @@ class CombinedOvernightReboundBot:
         sleeve: str = "UNKNOWN",
         data_source: str = "",
     ) -> tuple[bool, str]:
-        """
-        Decisive = act now.
-        Not decisive = leave unresolved and check again in 15 minutes.
-        
-        Snapshot data is treated specially: no bar count requirements, only freshness and return thresholds.
-        Red/weak signals are decisive regardless of source to allow early lower-limit placement.
-        """
-        # Final checkpoint: no more waiting.
-        if decision_time >= final_time:
-            return True, "final_checkpoint"
-
-        fresh = last_bar_age_minutes <= getattr(config, "PREMARKET_DYNAMIC_MAX_STALE_MINUTES", 60)
-        is_snapshot = data_source == "snapshot_data"
-        
-        # Red/weak signal should be decisive even when source is IEX+SIP-resolved
-        # This allows red names to place lower limits earlier instead of waiting until 06:00
-        if fresh and current_return <= -0.01:
-            return True, "decisive_red_lower_limit"
-        
-        # Snapshot data: decisive based on return thresholds without bar count requirements
-        if is_snapshot and fresh:
-            if current_return >= 0.10:
-                return True, "decisive_snapshot_very_high_return"
-            if current_return >= 0.05:
-                return True, "decisive_snapshot_high_return"
-            if sleeve.upper() == "MR" and current_return >= 0.03:
-                return True, "decisive_snapshot_mr_harvest"
-
-        # Bar-based decisive logic: requires bar count confirmation
-        # 1. Obvious monster runner.
-        # Even sparse IEX is enough here.
-        if current_return >= 0.10 and minutes_traded >= 1 and fresh:
-            return True, "decisive_very_high_return"
-
-        # 2. Strong runner.
-        # Needs a little confirmation, but not dense tape.
-        if current_return >= 0.05 and minutes_traded >= 2 and fresh:
-            return True, "decisive_high_return"
-
-        # 3. Moderate runner candidate: already up, near high, building.
-        if (
-            current_return >= 0.02
-            and distance_from_high > -0.01
-            and trend_from_first_bar > 0
-            and minutes_traded >= 2
-            and fresh
-        ):
-            return True, "decisive_moderate_near_high_building"
-
-        # 4. Clear harvest / fade signal.
-        # It had strength but is already meaningfully below its premarket high.
-        if (
-            current_return >= 0.02
-            and distance_from_high < -0.03
-            and minutes_traded >= 2
-            and fresh
-        ):
-            return True, "decisive_moderate_fading"
-
-        # 5. MR-specific harvest signal.
-        # MR does not need as much upside continuation evidence to justify taking profit.
-        if (
-            sleeve.upper() == "MR"
-            and current_return >= 0.03
-            and minutes_traded >= 2
-            and fresh
-        ):
-            return True, "decisive_mr_harvest"
-
-        return False, "not_decisive_wait"
+        return premarket_classifier.is_decisive_premarket_signal(
+            decision_time=decision_time,
+            final_time=final_time,
+            current_return=current_return,
+            distance_from_high=distance_from_high,
+            trend_from_first_bar=trend_from_first_bar,
+            minutes_traded=minutes_traded,
+            last_bar_age_minutes=last_bar_age_minutes,
+            sleeve=sleeve,
+            data_source=data_source,
+        )
 
     def _place_premarket_dynamic_limit_sells(self, decision_time_str: str = None):
         """Rolling premarket dynamic limit classification (05:00 → 06:00).
@@ -2942,6 +2624,24 @@ class CombinedOvernightReboundBot:
             f"skipped={skipped}, waited={waited}, final_checkpoint={is_final}"
         )
 
+        # Append this checkpoint's outcome to the daily premarket-limits
+        # artifact (observability). One file per session with one entry
+        # per 05:00 / 05:15 / 05:30 / 05:45 / 06:00 checkpoint, so the
+        # entire premarket decision sequence is reviewable as JSON.
+        try:
+            self._append_premarket_limits_artifact(
+                decision_time_str=decision_time_str,
+                placed=placed,
+                no_cap=no_cap,
+                skipped=skipped,
+                waited=waited,
+                is_final=is_final,
+                symbol_count=len(symbols),
+                limit_order_ids=dict(self.premarket_limit_order_ids),
+            )
+        except Exception:
+            logger.warning("premarket_limits artifact append failed", exc_info=True)
+
         # If final checkpoint, mark as done
         if is_final:
             self.premarket_dynamic_limits_done = True
@@ -2950,205 +2650,127 @@ class CombinedOvernightReboundBot:
             # Save state after each checkpoint to track decided symbols
             self._save_state()
 
+    def _append_premarket_limits_artifact(
+        self,
+        decision_time_str: str,
+        placed: int,
+        no_cap: int,
+        skipped: int,
+        waited: int,
+        is_final: bool,
+        symbol_count: int,
+        limit_order_ids: Dict[str, str],
+    ):
+        """Append one checkpoint outcome to state/logs/premarket_limits_YYYY-MM-DD.json.
+
+        File schema:
+          {
+            "date": "YYYY-MM-DD",
+            "checkpoints": [
+              {"time": "05:00", "placed": 2, "no_cap": 0, "skipped": 1, "waited": 3, ...},
+              ...
+            ],
+            "limit_order_ids_at_end": {"AAPL": "<order_id>", ...}
+          }
+
+        Idempotent at the checkpoint level: appending the same HH:MM twice
+        replaces the prior entry rather than duplicating it (defensive
+        against any future retry path).
+        """
+        import json
+        today = date.today().isoformat()
+        path = os.path.join(config.LOG_DIR, f"premarket_limits_{today}.json")
+
+        existing: Dict[str, Any] = {"date": today, "checkpoints": []}
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    existing = json.load(f) or existing
+                if not isinstance(existing, dict) or "checkpoints" not in existing:
+                    existing = {"date": today, "checkpoints": []}
+            except Exception:
+                logger.warning(f"premarket_limits artifact: could not read {path}; overwriting", exc_info=True)
+                existing = {"date": today, "checkpoints": []}
+
+        # Replace prior entry for this checkpoint if present.
+        checkpoints = [c for c in existing.get("checkpoints", []) if c.get("time") != decision_time_str]
+        checkpoints.append({
+            "time": decision_time_str,
+            "is_final": is_final,
+            "symbols_considered": symbol_count,
+            "placed": placed,
+            "no_cap": no_cap,
+            "skipped": skipped,
+            "waited": waited,
+        })
+        existing["checkpoints"] = sorted(checkpoints, key=lambda c: c["time"])
+        existing["limit_order_ids_at_end"] = limit_order_ids
+        existing["decided_symbols"] = sorted(self.premarket_decided_symbols)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(existing, f, indent=2, default=str)
+        logger.info(f"Premarket-limits artifact updated for {decision_time_str}: {path}")
+
+    def _build_etf_router_summary(self) -> Dict[str, Any]:
+        """Compact ETF router summary for run_health + standalone artifact.
+
+        Captures what was decided, whether an entry actually fired, and
+        the realized fill price so a post-day review can be done from a
+        single JSON file. Returns an empty dict when the router is
+        disabled (e.g. ``ETF_ROUTER_ENABLED=False``).
+        """
+        if not getattr(config, "ETF_ROUTER_ENABLED", False):
+            return {"enabled": False}
+
+        decision = self.router_decision
+        summary: Dict[str, Any] = {
+            "enabled": True,
+            "tape_initialized": self.tape_initialized,
+            "decision_made": self.router_decision_made,
+            "branch": self.router_branch,
+            "mr_blocked_today": self.mr_blocked_today,
+            "router_traded_today": self.router_traded_today,
+        }
+        if decision is not None:
+            try:
+                summary["decision"] = decision.to_dict()
+            except Exception:
+                logger.warning("ETF router decision.to_dict() failed", exc_info=True)
+        if self.etf_position:
+            # The exit path nulls out etf_position on a successful exit, so
+            # a non-null value here means we still have an open ETF
+            # position at EOD (which would be a bug — log it loud).
+            logger.warning(f"ETF router EOD: still holding {self.etf_position.get('symbol')}")
+            summary["open_position_at_eod"] = self.etf_position
+        return summary
+
+    def _save_etf_router_artifact(self):
+        """Write state/logs/etf_router_YYYY-MM-DD.json for forensic review."""
+        import json
+        today = date.today().isoformat()
+        path = os.path.join(config.LOG_DIR, f"etf_router_{today}.json")
+        payload = {"date": today, **self._build_etf_router_summary()}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        logger.info(f"ETF router artifact saved: {path}")
+
+    # ────────────────────────────────────────────────────────────
+    # State persistence + EOD reports — delegated to bot.state_io
+    # ────────────────────────────────────────────────────────────
+
     def _save_end_of_day_reports(self):
-        """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
-        try:
-            stats = self._exec_stats
-            total_candidates = len(self.mr_candidates) + len(self.gdp_candidates)
-            save_run_health(
-                diag=self._universe_diag,
-                scored_count=total_candidates,
-                selected_count=stats.get("selected", 0),
-                orderable_count=stats.get("orderable", 0),
-                filled_count=stats.get("entries_filled", 0),
-                total_deployed=stats.get("total_deployed", 0.0),
-                equity=stats.get("equity", 0.0),
-                exec_rejected=stats.get("exec_rejected_reasons"),
-                extra={"api_calls_total": get_api_call_count()},
-            )
-        except Exception as e:
-            logger.error(f"Failed to save health report: {e}")
-
-        try:
-            if self._universe_diag:
-                save_universe_audit(self._universe_diag, self.universe)
-        except Exception as e:
-            logger.error(f"Failed to save universe audit: {e}")
-
-        try:
-            def _mr_dict(c):
-                return {
-                    "symbol": c.symbol,
-                    "sleeve": "MR",
-                    "selection_score": round(c.selection_score, 4),
-                    "signal_price": round(c.signal_price, 4),
-                    "day_return": round(c.day_return, 4),
-                    "volume_ratio": round(c.volume_ratio, 2),
-                    "close_position": round(c.close_position, 3),
-                    "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
-                    "adv_dollars": round(c.adv_dollars, 0),
-                }
-            def _gdp_dict(c):
-                return {
-                    "symbol": c.symbol,
-                    "sleeve": "GDP",
-                    "selection_score": round(c.selection_score, 4),
-                    "signal_price": round(c.signal_price, 4),
-                    "day_return": round(c.day_return, 4),
-                    "price_vs_vwap": round(c.price_vs_vwap, 4),
-                    "late_mom_1530_signal": round(c.late_mom_1530_signal, 4),
-                    "volume_ratio": round(c.volume_ratio, 2),
-                    "close_position": round(c.close_position, 3),
-                    "adv_dollars": round(c.adv_dollars, 0),
-                }
-            audit_dicts = {
-                "mr_selected": [_mr_dict(c) for c in self.mr_candidates[:config.MR_MAX_POSITIONS]],
-                "mr_all_passed": [_mr_dict(c) for c in self.mr_candidates],
-                "gdp_selected": [_gdp_dict(c) for c in self.gdp_candidates[:config.GDP_MAX_POSITIONS]],
-                "gdp_all_passed": [_gdp_dict(c) for c in self.gdp_candidates],
-            }
-            if audit_dicts["mr_selected"] or audit_dicts["gdp_selected"]:
-                save_candidates_audit(audit_dicts)
-        except Exception as e:
-            logger.error(f"Failed to save candidates audit: {e}")
-
-        try:
-            if self._exec_diag:
-                save_execution_audit(self._exec_diag)
-        except Exception as e:
-            logger.error(f"Failed to save execution audit: {e}")
+        state_io.save_end_of_day_reports(self)
 
     def _finalize_day(self, clear_state: bool = True):
-        """End-of-day: write reports, optionally clear state.
-
-        When clear_state=True (no-entry day), we clear bot flags so tomorrow
-        starts fresh, and only persist positions (which should be empty).
-        We deliberately do NOT call _save_state() after clearing, because
-        _save_state() would re-write the bot flags we just cleared.
-        """
-        logger.info("Finalizing trading day")
-        self._save_end_of_day_reports()
-        if clear_state:
-            self.state_mgr.clear_bot_state()
-            # Only persist positions (should be empty); do NOT re-save bot flags
-            self.state_mgr.save_positions(self.position_mgr.positions)
-        else:
-            self._save_state()
+        state_io.finalize_day(self, clear_state=clear_state)
 
     def _save_state(self):
-        """Persist current state to disk."""
-        try:
-            # Save positions
-            self.state_mgr.save_positions(self.position_mgr.positions)
-
-            # Save bot state
-            bot_state = {
-                "date": datetime.now(_ET).strftime("%Y-%m-%d"),
-                "morning_exits_done": self.morning_exits_done,
-                "gdp_exits_done": self.gdp_exits_done,
-                "mr_exits_done": self.mr_exits_done,
-                "red_trail_exit_submitted": self.red_trail_exit_submitted,
-                "red_trail_order_ids": self.red_trail_order_ids,
-                "red_trail_symbols": list(self.red_trail_symbols),
-                "open_exit_plan": self.open_exit_plan,
-                "morning_open_orders_cancelled": self.morning_open_orders_cancelled,
-                "premarket_dynamic_limits_done": self.premarket_dynamic_limits_done,
-                "premarket_limit_order_ids": self.premarket_limit_order_ids,
-                "premarket_decided_symbols": list(self.premarket_decided_symbols),
-                "premarket_checkpoints_done": list(self.premarket_checkpoints_done),
-                "open_market_rescue_done": self.open_market_rescue_done,
-                "end_of_day_reports_done": self.end_of_day_reports_done,
-                "post_exit_failsafe_done": self.post_exit_failsafe_done,
-                "data_collected": self.data_collected,
-                "scoring_done": self.scoring_done,
-                "entries_done": self.entries_done,
-                "sold_today": list(self.sold_today),
-                # ETF Router state
-                "router_decision": self.router_decision.to_dict() if self.router_decision else None,
-                "router_traded_today": self.router_traded_today,
-                "router_branch": self.router_branch,
-                "mr_blocked_today": self.mr_blocked_today,
-                "etf_position": self.etf_position,
-                "startup_done": self.startup_done,
-                "tape_initialized": self.tape_initialized,
-                "router_decision_made": self.router_decision_made,
-            }
-            self.state_mgr.save_bot_state(bot_state)
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
+        state_io.save_state(self)
 
     def _load_state(self):
-        """Load state from previous run (same-day recovery only)."""
-        today = datetime.now(_ET).strftime("%Y-%m-%d")
-        bot_state = self.state_mgr.load_bot_state()
-
-        if not bot_state or bot_state.get("date") != today:
-            logger.info("No same-day state to restore — fresh start")
-            # Reset ETF router state for new day
-            self.etf_router.reset()
-            self.router_decision = None
-            self.router_traded_today = False
-            self.router_branch = None
-            self.mr_blocked_today = False
-            self.etf_position = None
-            self.startup_done = False
-            self.tape_initialized = False
-            self.router_decision_made = False
-            logger.info("ETF router state reset for new trading day")
-            # Load positions from file (may have overnight holds from yesterday's entries)
-            saved = self.state_mgr.load_positions()
-            if saved:
-                self.position_mgr.load_positions(saved)
-                logger.info(f"Loaded {len(saved)} saved positions")
-            return
-
-        # Same-day state: restore flags
-        logger.info("Restoring same-day bot state")
-        self.morning_exits_done = bot_state.get("morning_exits_done", False)
-        # Handle backward compatibility: old v2_classified flag maps to both new flags
-        if "v2_classified" in bot_state and "gdp_exits_done" not in bot_state:
-            v2_done = bot_state.get("v2_classified", False)
-            self.gdp_exits_done = v2_done
-            self.mr_exits_done = v2_done
-        else:
-            self.gdp_exits_done = bot_state.get("gdp_exits_done", False)
-            self.mr_exits_done = bot_state.get("mr_exits_done", False)
-        self.post_exit_failsafe_done = bot_state.get("post_exit_failsafe_done", False)
-        self.data_collected = bot_state.get("data_collected", False)
-        self.scoring_done = bot_state.get("scoring_done", False)
-        self.entries_done = bot_state.get("entries_done", False)
-        self.sold_today = set(bot_state.get("sold_today", []))
-        self.red_trail_exit_submitted = bot_state.get("red_trail_exit_submitted", False)
-        self.red_trail_order_ids = bot_state.get("red_trail_order_ids", {})
-        self.red_trail_symbols = set(bot_state.get("red_trail_symbols", []))
-        self.open_exit_plan = bot_state.get("open_exit_plan", [])
-        self.morning_open_orders_cancelled = bot_state.get("morning_open_orders_cancelled", False)
-        # New premarket fields
-        self.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
-        self.premarket_limit_order_ids = bot_state.get("premarket_limit_order_ids", {})
-        self.premarket_decided_symbols = set(bot_state.get("premarket_decided_symbols", []))
-        self.premarket_checkpoints_done = set(bot_state.get("premarket_checkpoints_done", []))
-        
-        # Open market exit state
-        self.open_market_rescue_done = bot_state.get("open_market_rescue_done", False)
-        
-        self.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
-
-        # ETF Router state
-        self.router_decision = parse_router_decision_from_dict(bot_state.get("router_decision"))
-        self.router_traded_today = bot_state.get("router_traded_today", False)
-        self.router_branch = bot_state.get("router_branch", None)
-        self.mr_blocked_today = bot_state.get("mr_blocked_today", False)
-        self.etf_position = bot_state.get("etf_position", None)
-        self.startup_done = bot_state.get("startup_done", False)
-        self.tape_initialized = bot_state.get("tape_initialized", False)
-        self.router_decision_made = bot_state.get("router_decision_made", False)
-
-        # Load positions
-        saved = self.state_mgr.load_positions()
-        if saved:
-            self.position_mgr.load_positions(saved)
-            logger.info(f"Loaded {len(saved)} saved positions")
+        state_io.load_state(self)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # ETF Router Methods
@@ -3194,62 +2816,150 @@ class CombinedOvernightReboundBot:
         logger.info("Startup phase complete")
 
     def _cancel_stale_etf_orders(self):
-        """Cancel any stale ETF router orders from previous day."""
-        etf_symbols = getattr(config, "ETF_ROUTER_SYMBOLS", ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"])
-        logger.info(f"Cancelling any stale orders for: {etf_symbols}")
+        """Cancel only stale ETF router orders from a previous session.
+
+        IMPORTANT: must NOT touch overnight premarket limit sells placed
+        between 05:00 and 06:00 — those are on equity positions, never
+        on ETF router symbols. Earlier versions used
+        ``cancel_all_open_orders()`` here which wiped those limits before
+        they had any chance to fill in the 09:00-09:25 pre-open window.
+        """
+        etf_symbols = getattr(
+            config,
+            "ETF_ROUTER_SYMBOLS",
+            ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"],
+        )
+        logger.info(f"Cancelling any stale ETF-only orders for: {etf_symbols}")
         try:
-            # Cancel all open orders to ensure clean slate
-            # (ETF router uses same symbols as momentum, so clear everything)
-            self.position_mgr.cancel_all_open_orders()
-            logger.info("Stale order cleanup complete")
+            cancelled = self.position_mgr.cancel_orders_for_symbols(etf_symbols)
+            logger.info(f"Stale ETF order cleanup complete: {cancelled} canceled")
         except Exception as e:
-            logger.error(f"Error cancelling stale orders: {e}")
+            logger.error(f"Error cancelling stale ETF orders: {e}")
 
     def _initialize_tape_recording(self):
-        """9:30 AM: Record opens and start tape recording."""
+        """9:30 AM: Record canonical 09:30 opens and start tape recording.
+
+        Source priority (highest to lowest fidelity):
+          1. First 1-min bar of today via get_intraday_bars_for_signal — this
+             is the canonical 09:30 opening print.
+          2. snapshot.daily_bar.o, but ONLY if daily_bar.t parses to today.
+             At ~09:30:00 the daily_bar field often still holds the prior
+             trading day's bar; we must reject those.
+          3. snapshot.last_trade.p, but ONLY if last_trade.t is within the
+             last 60s. This guards against stale pre-market prints (e.g.
+             a 09:29:50 IEX trade being treated as the 09:30 open).
+
+        If none of the sources are usable for a given symbol, that symbol is
+        skipped. ``ETFTapeSnapshot.is_valid()`` will then be False for it and
+        ``ETFRouter.make_decision`` will gracefully resolve to NO_TRADE.
+
+        If NO symbols produce a usable open (the most common case when this
+        runs at exactly 09:30:00.x and the 1-min bar hasn't formed yet), we
+        leave ``tape_initialized = False`` so the next 1s tick retries.
+        """
         logger.info("=" * 60)
         logger.info("TAPE INITIALIZATION (9:30)")
         logger.info("=" * 60)
 
-        etf_symbols = getattr(config, "ETF_ROUTER_SYMBOLS", ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"])
+        etf_symbols = getattr(
+            config,
+            "ETF_ROUTER_SYMBOLS",
+            ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"],
+        )
         now = datetime.now(_ET)
+        today_iso = now.date().isoformat()
 
-        # Get opens
         try:
-            snapshots = self.alpaca.get_snapshots(etf_symbols)
-            opens = {}
-            sources = {}  # Track source of each open for diagnostics
+            # 1) Canonical source: first 1-min bar of today, 09:30 -> 09:31.
+            minute_bars: Dict[str, List[dict]] = {}
+            try:
+                minute_bars = self.alpaca.get_intraday_bars_for_signal(
+                    etf_symbols, today_iso, start="09:30", end="09:31",
+                )
+            except Exception:
+                logger.warning("Tape init: 09:30 minute-bar fetch failed; will rely on snapshot fallbacks", exc_info=True)
+
+            # 2) Snapshot fallbacks (also captured for "latest" logging).
+            snapshots = self.alpaca.get_snapshots(etf_symbols) or {}
+
+            opens: Dict[str, float] = {}
+            sources: Dict[str, str] = {}
 
             for symbol in etf_symbols:
-                snap = snapshots.get(symbol, {})
+                open_price: Optional[float] = None
+                source = "none"
 
-                # Try daily bar open first (most accurate for 9:30)
-                daily_bar = snap.get("daily_bar") or {}
-                open_price = daily_bar.get("o") if daily_bar else None
-                source = "daily_bar"
+                # ── Source 1: today's first 1-min bar ──────────────────────
+                bars = minute_bars.get(symbol) or []
+                if bars:
+                    first_bar = bars[0]
+                    bar_dt = self._bar_dt(first_bar)
+                    bar_open = self._bar_float(first_bar, "o", "open")
+                    if (
+                        bar_open is not None
+                        and bar_open > 0
+                        and bar_dt is not None
+                        and bar_dt.date() == now.date()
+                        and bar_dt.hour == 9
+                        and bar_dt.minute == 30
+                    ):
+                        open_price = bar_open
+                        source = "minute_bar_0930"
 
-                if not open_price:
-                    # Fallback to last trade
-                    last_trade = snap.get("last_trade", {})
-                    open_price = last_trade.get("p") if last_trade else None
-                    source = "last_trade"
+                snap = snapshots.get(symbol, {}) or {}
 
-                if open_price:
-                    open_price = float(open_price)
+                # ── Source 2: parsed snapshot last_price if fresh (<= 60s) ──
+                # NOTE: get_snapshots returns flattened dicts; the raw
+                # latestTrade/dailyBar fields are not exposed as nested
+                # objects. There is no exposed daily_bar timestamp, so we
+                # cannot safely use the daily_bar open as a fallback — it
+                # may be the prior trading day's bar. Rely on a fresh
+                # last_price instead.
+                if open_price is None:
+                    lt_p = snap.get("last_price")
+                    lt_t = snap.get("timestamp")
+                    if lt_p and lt_t:
+                        try:
+                            lt_dt = datetime.fromisoformat(str(lt_t).replace("Z", "+00:00"))
+                            age_s = (now - lt_dt.astimezone(_ET)).total_seconds()
+                        except (TypeError, ValueError):
+                            age_s = 9999.0
+                        if 0 <= age_s <= 60:
+                            open_price = float(lt_p)
+                            source = f"last_price_fresh_{age_s:.0f}s"
+                        else:
+                            logger.warning(
+                                f"Tape init {symbol}: rejecting last_price — age={age_s:.0f}s (limit 60s)"
+                            )
+
+                if open_price is not None and open_price > 0:
                     opens[symbol] = open_price
                     self.etf_opens_930[symbol] = open_price
                     sources[symbol] = source
-
-                    # Log each symbol individually for debugging
-                    latest = snap.get("last_trade", {}).get("p", "N/A")
-                    logger.info(f"ETF open {symbol}: ${open_price:.2f} (source={source}, latest={latest}, ts={now.strftime('%H:%M:%S')})")
+                    latest = snap.get("last_price", "N/A")
+                    logger.info(
+                        f"ETF open {symbol}: ${open_price:.2f} (source={source}, "
+                        f"latest={latest}, ts={now.strftime('%H:%M:%S')})"
+                    )
                 else:
-                    logger.error(f"Could not get 9:30 open for {symbol} - no daily_bar or last_trade")
+                    logger.warning(
+                        f"Tape init {symbol}: no usable 09:30 open yet — will retry on next tick"
+                    )
 
             logger.info(f"9:30 Opens summary: {opens}")
             logger.info(f"Open sources: {sources}")
 
-            # Start tape recording
+            # If we couldn't seed ANY symbol yet, defer init so the next 1s
+            # tick retries (the 1-min bar typically lands within ~30s of the
+            # open with the IEX feed).
+            if not opens:
+                logger.warning("Tape init: no symbols had a usable open; retrying next tick")
+                return
+
+            # If we got SOME but not all, still proceed — the missing ones
+            # will get populated by subsequent _update_tape() calls (their
+            # open_930 will then be the first tape print, which is acceptable
+            # for the symbols that couldn't be sourced cleanly).
             self.etf_router.start_recording(opens, datetime.now(_ET))
             self.tape_recording_active = True
             self.tape_initialized = True
@@ -3258,30 +2968,58 @@ class CombinedOvernightReboundBot:
         except Exception as e:
             logger.error(f"Error initializing tape: {e}", exc_info=True)
 
-    def _update_tape(self):
-        """Update tape with latest prices during 9:30-10:00 window."""
+    def _update_tape(self, force: bool = False):
+        """Update tape with latest prices during 9:30-10:00 window.
+
+        Uses the parsed snapshot ``last_price`` field.
+
+        Throttled (API efficiency #1) to one snapshot fetch per
+        ``ETF_TAPE_UPDATE_INTERVAL_SECONDS`` (default 5s). The main loop
+        ticks every 1s in this hot window, but the router only needs the
+        9:30 open, the 9:45 continuation print, and the 10:00 final
+        price — sub-second granularity is wasted budget.
+
+        Pass ``force=True`` to bypass the throttle (used for the final
+        tape update right before the 10:00 decision).
+        """
         if not self.tape_recording_active:
             return
 
-        etf_symbols = getattr(config, "ETF_ROUTER_SYMBOLS", ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"])
+        # Throttle: skip if the previous fetch was too recent.
+        interval = float(getattr(config, "ETF_TAPE_UPDATE_INTERVAL_SECONDS", 5))
+        now_mono = time.monotonic()
+        if not force and interval > 0 and (now_mono - self._tape_last_update_monotonic) < interval:
+            return
+
+        etf_symbols = getattr(
+            config,
+            "ETF_ROUTER_SYMBOLS",
+            ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"],
+        )
 
         try:
             snapshots = self.alpaca.get_snapshots(etf_symbols)
             now = datetime.now(_ET)
 
             for symbol in etf_symbols:
-                snap = snapshots.get(symbol, {})
-                last_trade = snap.get("last_trade", {})
-                price = last_trade.get("p")
-
+                snap = snapshots.get(symbol, {}) or {}
+                price = snap.get("last_price")
                 if price:
                     self.etf_router.update_tape(symbol, float(price), now)
+
+            self._tape_last_update_monotonic = now_mono
 
         except Exception as e:
             logger.error(f"Error updating tape: {e}")
 
     def _make_router_decision(self):
-        """10:00 AM: Make ETF router decision."""
+        """10:00 AM: Make ETF router decision and (maybe) enter.
+
+        The daily-loss kill switch is checked BEFORE the ETF entry. The
+        decision and ``mr_blocked_today`` flag are still recorded so the
+        EOD report reflects what the router would have done; we just
+        suppress the order submission.
+        """
         logger.info("=" * 60)
         logger.info("ROUTER DECISION (10:00)")
         logger.info("=" * 60)
@@ -3305,15 +3043,28 @@ class CombinedOvernightReboundBot:
         if decision.symbol:
             logger.info(f"Selected ETF: {decision.symbol}")
             logger.info(f"Entry: {decision.entry_time}, Exit: {decision.exit_time}")
-            # Execute ETF entry
-            self._execute_etf_entry(decision)
+            # Kill-switch gate (issue #5): block 10:00 ETF entry if the
+            # daily-loss circuit breaker has tripped.
+            if self._check_daily_loss_kill_switch():
+                logger.critical(
+                    f"ETF entry BLOCKED by daily-loss kill switch — {self.kill_switch_reason}; "
+                    f"branch={decision.branch.value} would have bought {decision.symbol}"
+                )
+            else:
+                self._execute_etf_entry(decision)
         else:
             logger.info("No ETF trade - MR allowed at 15:45")
 
         self._save_state()
 
     def _execute_etf_entry(self, decision: RouterDecision):
-        """Execute ETF entry after 10:00 decision."""
+        """Execute ETF entry after 10:00 decision.
+
+        Adds (issue #4) a spread + staleness execution gate via
+        ``filter_execution_ready`` and a marketable-limit order (issue #6)
+        at ``ask * (1 + ETF_ENTRY_MAX_SLIPPAGE_PCT)`` so a momentary wide
+        quote cannot cost more than the configured slippage cap.
+        """
         if not decision.symbol:
             return
 
@@ -3331,26 +3082,62 @@ class CombinedOvernightReboundBot:
             etf_capital_pct = getattr(config, "ETF_ROUTER_CAPITAL_PCT", 0.30)
             etf_budget = equity * etf_capital_pct
 
-            # Get current price
-            snapshots = self.alpaca.get_snapshots([symbol])
-            snap = snapshots.get(symbol, {})
-            last_trade = snap.get("last_trade", {})
-            price = last_trade.get("p")
+            # Fresh snapshot for sizing AND for the execution gate.
+            snapshots = self.alpaca.get_snapshots([symbol]) or {}
+            snap = snapshots.get(symbol, {}) or {}
 
-            if not price:
-                logger.error(f"Cannot get price for {symbol}")
+            # Execution gate (issue #4): tight spread, fresh quote, require quote.
+            orderable, exec_rejected = filter_execution_ready(
+                [symbol], snapshots,
+                max_spread_pct=float(getattr(config, "ETF_ENTRY_MAX_SPREAD_PCT", 0.005)),
+                require_quote=True,
+                max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 10.0)),
+            )
+            if symbol not in orderable:
+                reason = exec_rejected.get(symbol, "unknown")
+                logger.warning(f"ETF entry REJECTED for {symbol}: {reason}")
                 return
 
-            price = float(price)
-            qty = int(etf_budget / price)
+            ask = snap.get("ask")
+            bid = snap.get("bid")
+            last_price = snap.get("last_price")
+            if not last_price:
+                logger.error(f"ETF entry {symbol}: no last_price after gate (should not happen)")
+                return
+
+            # Size off ask (where we'd actually fill) if available, else last.
+            sizing_price = float(ask) if ask else float(last_price)
+            qty = int(etf_budget / sizing_price)
 
             if qty <= 0:
-                logger.warning(f"ETF qty <= 0, skipping entry: budget=${etf_budget:.2f}, price=${price:.2f}")
+                logger.warning(
+                    f"ETF qty <= 0, skipping entry: budget=${etf_budget:.2f}, "
+                    f"sizing_price=${sizing_price:.2f}"
+                )
                 return
 
-            # Submit buy order
-            logger.info(f"Buying {qty} shares of {symbol} at ~${price:.2f}")
-            order, error_type = self.position_mgr.submit_buy_order(symbol, qty)
+            # Marketable limit (issue #6): bound slippage above the ask.
+            slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
+            if ask:
+                limit_price = float(ask) * (1.0 + slippage_pct)
+                order_type = "limit"
+                logger.info(
+                    f"ETF entry {symbol}: qty={qty}, bid={bid}, ask={ask}, "
+                    f"last={last_price}, marketable_limit={limit_price:.4f} "
+                    f"(ask + {slippage_pct:.2%})"
+                )
+                order, error_type = self.position_mgr.submit_buy_order(
+                    symbol, qty, order_type="limit", limit_price=limit_price,
+                )
+            else:
+                # No ask available — falls back to market order. Should be
+                # rare after the execution gate, kept as a defensive path.
+                logger.warning(f"ETF entry {symbol}: no ask after gate — using market order")
+                order, error_type = self.position_mgr.submit_buy_order(symbol, qty)
+                limit_price = None
+                order_type = "market"
+
+            price = float(last_price)
 
             if order and order.get("id"):
                 # Wait for fill confirmation (max 10 seconds for liquid ETFs)
@@ -3506,6 +3293,34 @@ def main():
     except Exception:
         logging.critical("UNHANDLED EXCEPTION during bot initialisation", exc_info=True)
         raise
+
+    # Install signal handlers for graceful shutdown. The handler only flips
+    # a flag; the main loop polls it between ticks so we never interrupt a
+    # broker submission / fill check mid-flight. Both SIGINT (Ctrl+C) and
+    # SIGTERM (kill / systemd stop) are honored. SIGTERM is not available
+    # on Windows so we guard the install.
+    def _signal_handler(signum, _frame):
+        try:
+            sig_name = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            sig_name = str(signum)
+        if not bot._shutdown_requested:
+            bot._shutdown_requested = True
+            bot._shutdown_signal = sig_name
+            logger.warning(f"Received {sig_name}; requesting graceful shutdown")
+        else:
+            logger.warning(f"Received {sig_name} again; shutdown already in progress")
+
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+    except (ValueError, OSError):
+        logger.warning("Could not install SIGINT handler", exc_info=True)
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except (ValueError, OSError):
+            logger.warning("Could not install SIGTERM handler", exc_info=True)
+
     bot.run()
 
 
