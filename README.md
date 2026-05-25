@@ -64,10 +64,34 @@ pip install -r requirements.txt
 
 ## Architecture
 
+The orchestrator (`integrated_main.py`) owns timing, state, and the event
+loop. All business logic lives in focused modules that take the orchestrator
+instance (`bot`) as their first argument, so state ownership stays in one
+place while each module has a single responsibility.
+
 ```
 run.py                              # entry point
 bot/
   integrated_main.py                # CombinedOvernightReboundBot orchestrator
+                                    #   event loop, scheduling, state, forwarders
+  ── extracted business logic ──
+  state_io.py                       # save/load state, EOD reports, finalize_day
+  premarket_classifier.py           # pure: delayed-SIP bar fetch, classify limit,
+                                    #   decisive-signal detector
+  premarket_runner.py               # 05:00→06:00 checkpoint loop + artifact writer
+  morning_exits.py                  # 09:25→09:45 exit pipeline (sleeve, single,
+                                    #   open-exit plan, batched sells, broker
+                                    #   rescue, red-trail, failsafe flatten)
+  scoring.py                        # 15:30 universe, 15:50 MR+GDP scoring,
+                                    #   kill switch, MR ETF regime sizing
+  entry_executor.py                 # 15:45 entry pipeline (waterfall allocator,
+                                    #   execution gate, marketable limits,
+                                    #   concurrent submit + reconciliation,
+                                    #   fill monitoring, shortfall diagnostics)
+  etf_router_runtime.py             # 9:00→15:00 ETF router (startup, tape
+                                    #   recording, 10:00 decision, entry/exit
+                                    #   execution, EOD summary + artifact)
+  ── lower-level building blocks ──
   position_manager_overnight.py     # entry/exit/failsafe + REST polling
   fill_stream.py                    # /stream trade_updates websocket (push fills)
   market_data.py                    # AlpacaDataClient — snapshots, bars, ADV
@@ -75,10 +99,34 @@ bot/
   universe_builder.py               # 4-stage universe pipeline + diagnostics
   mean_reversion_scorer.py          # MR_WIDE candidate build + filter
   green_day_pullback_scorer.py      # GDP_BASE candidate build + filter
+  etf_router.py                     # ETF tape dataclass + routing decision logic
   scorer_utils.py                   # shared bar/VWAP/intraday metric helpers
   rate_limiter.py                   # shared sliding-window rate limiter (80/min)
   state_manager.py                  # atomic JSON state writes
   config.py + config_*.py           # broker / runtime / universe / strategy
+```
+
+### Module pattern
+
+Every extracted module follows the same convention:
+
+```python
+# bot/some_module.py
+def do_thing(bot, ...):
+    """`bot` is the CombinedOvernightReboundBot orchestrator.
+    Mutate bot state directly; never own state in this module."""
+    bot.position_mgr.do_something()
+    bot.some_flag = True
+    bot._save_state()
+```
+
+`CombinedOvernightReboundBot` keeps a thin forwarder for each public method
+so the call sites (event loop, sibling modules) don't need to know which
+module a method lives in:
+
+```python
+def _step_execute_entries(self):
+    return entry_executor.step_execute_entries(self)
 ```
 
 ### Key reliability features

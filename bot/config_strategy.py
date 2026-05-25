@@ -181,9 +181,11 @@ PREMARKET_DYNAMIC_LIMIT_TIME_IN_FORCE = "day"
 PREMARKET_DYNAMIC_LIMIT_EXTENDED_HOURS = True
 PREMARKET_DYNAMIC_MAX_STALE_MINUTES = 60
 
-# Dynamic classification thresholds. These are intentionally lenient for IEX:
-# runners should usually show at least some IEX activity, but sparse IEX bars
-# should not automatically invalidate the signal.
+# Dynamic classification thresholds. These are intentionally lenient for the
+# delayed-SIP feed: runners should usually show meaningful premarket activity
+# in the historical SIP bars, but a sparse stretch (e.g. illiquid ticker with
+# few prints in the last 30 minutes before the 16-minute delay window) should
+# not automatically invalidate the signal.
 PREMARKET_DYNAMIC_DEFAULT_LIMIT_PCT = 0.05
 PREMARKET_DYNAMIC_SPARSE_HIGH_RETURN_LIMIT_PCT = 0.10
 PREMARKET_DYNAMIC_VERY_HIGH_RETURN_NO_CAP_PCT = 0.10
@@ -191,26 +193,18 @@ PREMARKET_DYNAMIC_HIGH_RETURN_NO_CAP_PCT = 0.05
 PREMARKET_DYNAMIC_MODERATE_RETURN_PCT = 0.02
 
 # ═══════════════════════════════════════════════════
-# SIP snapshot backup for premarket dynamic limits
+# Legacy SIP-snapshot backup knobs (DISABLED — not wired at runtime)
 # ═══════════════════════════════════════════════════
-# When enabled, SIP snapshot data is used as a current-price cross-check even
-# when IEX bars exist. This protects the classifier from thin, stale, or
-# understated IEX premarket prints. If there are no usable IEX bars, the
-# same SIP snapshot path becomes the full fallback.
-# DISABLED: SIP not currently available, using IEX only
+# The active premarket classifier in `bot/premarket_classifier.py` calls the
+# historical-bars endpoint with `feed=sip` and an end timestamp ~16 minutes
+# behind decision time (delayed SIP). It does NOT use a live snapshot feed
+# and these knobs are not read anywhere. Left in place purely as a placeholder
+# for a future SIP-snapshot cross-check; toggle the BACKUP flag and re-wire
+# the classifier if you bring that path back online.
 USE_SIP_SNAPSHOT_PREMARKET_BACKUP = False
-
-# Feed to use for premarket dynamic limit data (iex only, SIP disabled)
-PREMARKET_DYNAMIC_DATA_FEED = "iex"
-
-# Maximum spread for SIP snapshot midpoint to be considered usable (2% default)
-SIP_SNAPSHOT_MAX_SPREAD_PCT = 0.02
-
-# Maximum difference between SIP and IEX prices to consider SIP as "confirming" IEX (0.75% default)
-SIP_IEX_CONFIRM_DIFF_PCT = 0.0075
-
-# Allow SIP to correct the premarket high upward if SIP shows a higher price (True default)
-SIP_ALLOW_HIGH_CORRECTION = True
+SIP_SNAPSHOT_MAX_SPREAD_PCT = 0.02       # max spread for SIP midpoint to be usable
+SIP_IEX_CONFIRM_DIFF_PCT = 0.0075        # SIP-vs-IEX agreement threshold
+SIP_ALLOW_HIGH_CORRECTION = True         # let SIP raise the premarket high
 
 # DEPRECATED: No-data fallback limit is no longer used.
 # New behavior: No data = no order. This config is kept for reference only.
