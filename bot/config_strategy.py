@@ -94,7 +94,7 @@ ETF_ENTRY_MAX_STALE_SECONDS = 10.0     # Quote freshness gate for ETF entry
 # ═══════════════════════════════════════════════════
 MR_MIN_PRICE = 1.00
 MR_MAX_PRICE = 2.00
-MR_DAY_RET_MAX = -0.05          # clean-cache candidate: return vs prior/entry-day signal <= -5%
+MR_DAY_RET_MAX = -0.04          # clean-cache candidate: return vs prior/entry-day signal <= -4%
 MR_VOLUME_RATIO_MIN = 0.0       # no relative-volume requirement in finalist test
 MR_CLOSE_POSITION_MAX = 0.25    # close in bottom 25% of day range
 MR_LATE_DROP_MAX = None         # optional, off

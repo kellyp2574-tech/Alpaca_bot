@@ -1,11 +1,11 @@
-# Combined Overnight Rebound Bot
+# Combined MR + Router Bot
 
-Automated equity trading bot on Alpaca. Runs a two-sleeve overnight hold:
+Automated equity trading bot on Alpaca. Runs two non-overlapping strategies:
 
-- **MR_WIDE** — mean reversion on $1–5 stocks that sold off hard with elevated volume and closed near the day's low
-- **GDP_BASE** — green-day pullback on $1–10 stocks that pulled back below intraday VWAP with decelerating late momentum
+- **MR (Mean Reversion)** — overnight hold on $1–2 stocks that sold off ≥4% and closed in the bottom 25% of the day's range. Up to 3 positions, ADV-capped, regime-sized.
+- **ETF Router** — pure intraday leveraged ETF trade (TQQQ/SQQQ/UVXY) based on a 7-tier decision tree evaluated at ~10:00 ET. One trade per day max.
 
-Static **70/30 MR/GDP** allocation, max 20 combined positions, 10% single-name cap, 0.3% ADV liquidity cap.
+Capital is shared; holding periods don't overlap (router exits same-day, MR exits next morning).
 
 For the full strategy spec see `bot/STRATEGY.md`.
 
@@ -15,11 +15,14 @@ For the full strategy spec see `bot/STRATEGY.md`.
 
 ```
 T-1 entry day:
-  15:30  Build universe (asset → price → ADV cache → tradability)
-  15:50  Fetch 9:30→15:50 minute bars, score MR + GDP, run execution gate
-  15:50  Submit market buys (single account fetch, BP-aware sizing,
+  09:00  Bot starts, reconciles broker positions
+  10:00  ETF Router decision + entry (if signal fires)
+  11:00–15:00  Router exit at tier-specific time
+  15:30  Build MR universe (asset → price → ADV cache → tradability)
+  15:45  Score MR candidates, apply ETF regime sizing, run execution gate
+  15:45  Submit up to 3 market buys (BP-aware sizing, ADV-capped,
          daily-loss circuit breaker check)
-  16:00  Save EOD reports, hold positions overnight
+  16:00  Save EOD reports, hold MR positions overnight
 
 T+1 exit day:
   05:00  Bot starts, reconciles broker, restores state
@@ -30,11 +33,11 @@ T+1 exit day:
          red-trail mode is mutually exclusive and disabled by default)
   09:45  V2 failsafe flatten (market → -3% → -5%, with broker price
          fallback if snapshot fails)
-  16:00  Day complete; restart cycle next afternoon at 15:30
+  16:00  Day complete; restart cycle
 ```
 
-The main loop sleeps adaptively: 1s during the three hot windows above, 30s
-otherwise.
+The main loop sleeps adaptively: 1s during hot windows (05:00–06:02,
+09:24–10:05, 15:29–16:01), 30s otherwise.
 
 ---
 
@@ -186,18 +189,17 @@ In `bot/config_strategy.py`:
 
 | Knob | Default | Purpose |
 |---|---|---|
-| `MR_ALLOCATION_PCT` / `GDP_ALLOCATION_PCT` | 0.70 / 0.30 | Sleeve budget split |
-| `COMBINED_MAX_POSITIONS` | 20 | Hard cap across both sleeves |
-| `MAX_SINGLE_POSITION_PCT` | 0.10 | Max equity per name |
-| `ADV_CAP_PCT` | 0.003 | Max position notional as fraction of 20-day ADV$ |
-| `MIN_SHARES` | 25 | Minimum order size |
+| `MR_MAX_POSITIONS` | 3 | Max MR entries per day |
+| `MR_MIN_PRICE` / `MR_MAX_PRICE` | 1.00 / 2.00 | MR price band |
+| `MR_DAY_RET_MAX` | −4.0 | Minimum decline to qualify |
+| `MR_CLOSE_POSITION_MAX` | 0.25 | Must close in bottom 25% of range |
+| `MR_MIN_AVG_DOLLAR_VOLUME` | 1,000,000 | ADV filter ($) |
+| `ADV_CAP_PCT` | 0.003 | Max position as fraction of 20-day ADV$ |
+| `ENABLE_MR_ETF_REGIME_SIZING` | True | Half-size when market green |
 | `DAILY_LOSS_LIMIT_PCT` | 0.05 | Skip entries if today PnL ≤ −5% (0 disables) |
 | `ENABLE_FAST_OPEN_MARKET_EXIT` | True | 09:30 batched market sells (production mode) |
-| `ENABLE_RED_OPEN_TRAIL_EXIT` | False | 09:30 trailing-stop on red opens (mutually exclusive with fast-exit) |
-| `RED_OPEN_TRAIL_PCT` | 1.0 | Trailing stop percent (only used when red-trail mode is on) |
-| `ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS` | True | 05:00→06:00 IEX classification |
-| `MR_*` filters | see file | Mean-reversion candidate gates |
-| `GDP_*` filters | see file | Green-day pullback gates |
+| `ENABLE_PREMARKET_DYNAMIC_LIMIT_SELLS` | True | 05:00→06:00 premarket classification |
+| ETF Router config | see `etf_router.py` | Decision tree thresholds and exit times |
 
 In `bot/config_universe.py`:
 
