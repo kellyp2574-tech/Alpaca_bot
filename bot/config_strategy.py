@@ -33,7 +33,7 @@ MR_PERMISSION_MODE = "skip_if_router_traded"  # "skip_if_router_traded" or "all_
 ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"]
 
 # Capital allocation for ETF router (separate from MR capital)
-ETF_ROUTER_CAPITAL_PCT = 0.30  # 30% of available capital for ETF router
+ETF_ROUTER_CAPITAL_PCT = 0.90  # 90% of equity for ETF router (single daily position, maximize deployment)
 
 # Tape recording cadence. The main loop ticks every 1 s during the
 # 09:24-10:02 hot window; calling get_snapshots on 8 ETFs every tick is
@@ -62,7 +62,7 @@ COMBINED_MAX_POSITIONS = 3   # Paper MR test: top 3 only
 # ═══════════════════════════════════════════════════
 MAX_LEVERAGE = 1.0               # 1.0 = no margin (cash account)
 ADV_CAP_PCT = 0.003              # 0.3% of ADV max position size
-MAX_SINGLE_POSITION_PCT = 0.10 # 10% max of portfolio in one stock
+MAX_SINGLE_POSITION_PCT = 0.34 # 34% max per position allows 3 positions to use full 100% sleeve budget
 MIN_POSITION_DOLLARS = 50        # Min order notional (skip if ADV cap < this)
 MIN_SHARES = 25                  # Minimum share count per position
 MAX_POSITION_DOLLARS = 50_000    # Absolute dollar cap per position (legacy)
