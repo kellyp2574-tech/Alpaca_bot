@@ -67,6 +67,12 @@ MIN_POSITION_DOLLARS = 50        # Min order notional (skip if ADV cap < this)
 MIN_SHARES = 25                  # Minimum share count per position
 MAX_POSITION_DOLLARS = 50_000    # Absolute dollar cap per position (legacy)
 
+# ADV multiplier for IEX data (IEX reports lower volume than composite)
+ADV_DOLLAR_MULTIPLIER = 50.0     # Multiply raw IEX ADV by this for sizing
+
+# Leftover redeployment: redeploy unused sleeve budget to other candidates
+ENABLE_LEFTOVER_REDEPLOYMENT = True
+
 # ═══════════════════════════════════════════════════
 # Entry execution (concurrent submission with client_order_id)
 # ═══════════════════════════════════════════════════

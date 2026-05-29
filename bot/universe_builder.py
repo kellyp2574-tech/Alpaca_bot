@@ -627,6 +627,7 @@ class ExecutionDiagnostics:
     filled_symbols: List[str] = field(default_factory=list)
     failed_submissions: Dict[str, str] = field(default_factory=dict)
     fill_details: Dict[str, dict] = field(default_factory=dict)
+    sizing_diagnostics: Dict[str, dict] = field(default_factory=dict)  # Per-symbol sizing info
 
     def to_dict(self) -> dict:
         return {
@@ -637,6 +638,7 @@ class ExecutionDiagnostics:
             "filled": self.filled_symbols,
             "failed_submissions": self.failed_submissions,
             "fill_details": self.fill_details,
+            "sizing": self.sizing_diagnostics,
             "counts": {
                 "selected": len(self.selected_symbols),
                 "orderable": len(self.orderable_symbols),

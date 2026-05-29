@@ -98,11 +98,16 @@ def step_execute_entries(bot) -> None:
 
         max_single_dollars = equity * config.MAX_SINGLE_POSITION_PCT
 
+        # Get ADV multiplier from config (for IEX data compensation)
+        adv_multiplier = getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0)
+
         # Pre-filter: skip candidates where cap is below effective minimum
         viable = []
         skips = {}
         for c in candidates:
-            adv_cap = c.adv_dollars * config.ADV_CAP_PCT if c.adv_dollars > 0 else 0.0
+            # Apply multiplier to raw ADV for sizing calculations
+            sizing_adv_dollars = c.adv_dollars * adv_multiplier if c.adv_dollars > 0 else 0.0
+            adv_cap = sizing_adv_dollars * config.ADV_CAP_PCT if sizing_adv_dollars > 0 else 0.0
             cap = min(
                 adv_cap,
                 max_single_dollars,
@@ -116,10 +121,19 @@ def step_execute_entries(bot) -> None:
             )
 
             if cap < effective_min:
-                skips[c.symbol] = (
-                    f"cap_below_effective_min: cap=${cap:.2f}, "
-                    f"effective_min=${effective_min:.2f}, adv=${c.adv_dollars:.0f}, price=${c.signal_price:.2f}"
-                )
+                skips[c.symbol] = {
+                    "reason": "cap_below_effective_min",
+                    "cap": round(cap, 2),
+                    "effective_min": round(effective_min, 2),
+                    "raw_adv_dollars": round(c.adv_dollars, 0),
+                    "adv_multiplier": adv_multiplier,
+                    "sizing_adv_dollars": round(sizing_adv_dollars, 0),
+                    "adv_cap_pct": config.ADV_CAP_PCT,
+                    "adv_cap_dollars": round(adv_cap, 2),
+                    "max_single_dollars": round(max_single_dollars, 2),
+                    "price": round(c.signal_price, 2),
+                    "skip_reason": f"cap=${cap:.2f} < effective_min=${effective_min:.2f}"
+                }
                 continue
 
             viable.append(c)
@@ -137,15 +151,26 @@ def step_execute_entries(bot) -> None:
             logger.warning(f"{sleeve_name}: no viable candidates after cap/min-share filters")
             return []
 
-        # Calculate per-candidate caps
+        # Calculate per-candidate caps with ADV multiplier
         caps = {}
+        sizing_info = {}  # Track raw vs adjusted ADV for diagnostics
         for c in viable:
-            adv_cap = c.adv_dollars * config.ADV_CAP_PCT
+            sizing_adv_dollars = c.adv_dollars * adv_multiplier if c.adv_dollars > 0 else 0.0
+            adv_cap = sizing_adv_dollars * config.ADV_CAP_PCT
             caps[c.symbol] = min(
                 adv_cap,
                 max_single_dollars,
                 config.MAX_POSITION_DOLLARS,
             )
+            sizing_info[c.symbol] = {
+                "raw_adv_dollars": round(c.adv_dollars, 0),
+                "adv_multiplier": adv_multiplier,
+                "sizing_adv_dollars": round(sizing_adv_dollars, 0),
+                "adv_cap_pct": config.ADV_CAP_PCT,
+                "adv_cap_dollars": round(adv_cap, 2),
+                "max_single_dollars": round(max_single_dollars, 2),
+                "final_cap_dollars": round(caps[c.symbol], 2),
+            }
 
         allocations = {c.symbol: 0.0 for c in viable}
         base_target = sleeve_budget / len(viable)
@@ -174,13 +199,28 @@ def step_execute_entries(bot) -> None:
         result = []
         for c in viable:
             effective_min = max(config.MIN_POSITION_DOLLARS, config.MIN_SHARES * c.signal_price)
-            if allocations[c.symbol] >= effective_min:
+            raw_target = allocations[c.symbol]
+            if raw_target >= effective_min:
+                # Build sizing diagnostics for this allocation
+                sizing_diag = sizing_info.get(c.symbol, {})
+                sizing_diag.update({
+                    "raw_target": round(raw_target, 2),
+                    "final_target": round(raw_target, 2),  # May be adjusted later by BP
+                    "effective_min": round(effective_min, 2),
+                    "min_shares": config.MIN_SHARES,
+                    "min_position_dollars": config.MIN_POSITION_DOLLARS,
+                })
+                # Store sizing diagnostics for JSON output
+                if bot._exec_diag:
+                    bot._exec_diag.sizing_diagnostics[c.symbol] = sizing_diag
                 result.append({
                     "symbol": c.symbol,
                     "target_dollars": allocations[c.symbol],
                     "cap_dollars": caps[c.symbol],
                     "adv_dollars": c.adv_dollars,
+                    "sizing_adv_dollars": sizing_adv_dollars,
                     "candidate": c,
+                    "sizing": sizing_diag,
                 })
 
         # Log allocation summary
@@ -343,15 +383,14 @@ def step_execute_entries(bot) -> None:
             f"positions={len(gdp_results)}"
         )
 
-        # MR-only paper test: no fallback/redeployment. Leftover stays as cash.
-        # This ensures selection remains exactly the researched top-N close-location sleeve.
-        if getattr(config, "GDP_MAX_POSITIONS", 0) <= 0 or getattr(config, "GDP_ALLOCATION_PCT", 0.0) <= 0:
-            if total_leftover > config.MIN_POSITION_DOLLARS:
-                logger.info(
-                    "MR-only paper test: skipping global leftover redeployment. "
-                    "Leftover $%.2f remains as cash.",
-                    total_leftover,
-                )
+        # Leftover redeployment: controlled by ENABLE_LEFTOVER_REDEPLOYMENT config
+        enable_redeployment = getattr(config, "ENABLE_LEFTOVER_REDEPLOYMENT", True)
+        if not enable_redeployment and total_leftover > config.MIN_POSITION_DOLLARS:
+            logger.info(
+                "Leftover redeployment DISABLED: $%.2f remains as cash. "
+                "Set ENABLE_LEFTOVER_REDEPLOYMENT=True to redeploy.",
+                total_leftover,
+            )
         elif total_leftover > config.MIN_POSITION_DOLLARS:
             # Build set of already allocated symbols
             allocated_symbols = {r["symbol"] for r in mr_results + gdp_results}
