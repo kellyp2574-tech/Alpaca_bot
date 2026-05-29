@@ -111,6 +111,14 @@ def save_state(bot) -> None:
             "startup_done": bot.startup_done,
             "tape_initialized": bot.tape_initialized,
             "router_decision_made": bot.router_decision_made,
+            # No-trade QQQ breakout fallback state (MR-permission-neutral)
+            "no_trade_breakout_active": getattr(bot, "no_trade_breakout_active", False),
+            "no_trade_breakout_done": getattr(bot, "no_trade_breakout_done", False),
+            "no_trade_breakout_entered_today": getattr(bot, "no_trade_breakout_entered_today", False),
+            "no_trade_breakout_subtype": getattr(bot, "no_trade_breakout_subtype", None),
+            "no_trade_breakout_range": getattr(bot, "no_trade_breakout_range", None),
+            "no_trade_breakout_high": getattr(bot, "no_trade_breakout_high", None),
+            "no_trade_breakout_low": getattr(bot, "no_trade_breakout_low", None),
         }
         bot.state_mgr.save_bot_state(bot_state)
     except Exception as e:
@@ -134,6 +142,13 @@ def load_state(bot) -> None:
         bot.startup_done = False
         bot.tape_initialized = False
         bot.router_decision_made = False
+        bot.no_trade_breakout_active = False
+        bot.no_trade_breakout_done = False
+        bot.no_trade_breakout_entered_today = False
+        bot.no_trade_breakout_subtype = None
+        bot.no_trade_breakout_range = None
+        bot.no_trade_breakout_high = None
+        bot.no_trade_breakout_low = None
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -179,6 +194,13 @@ def load_state(bot) -> None:
     bot.startup_done = bot_state.get("startup_done", False)
     bot.tape_initialized = bot_state.get("tape_initialized", False)
     bot.router_decision_made = bot_state.get("router_decision_made", False)
+    bot.no_trade_breakout_active = bot_state.get("no_trade_breakout_active", False)
+    bot.no_trade_breakout_done = bot_state.get("no_trade_breakout_done", False)
+    bot.no_trade_breakout_entered_today = bot_state.get("no_trade_breakout_entered_today", False)
+    bot.no_trade_breakout_subtype = bot_state.get("no_trade_breakout_subtype", None)
+    bot.no_trade_breakout_range = bot_state.get("no_trade_breakout_range", None)
+    bot.no_trade_breakout_high = bot_state.get("no_trade_breakout_high", None)
+    bot.no_trade_breakout_low = bot_state.get("no_trade_breakout_low", None)
 
     saved = bot.state_mgr.load_positions()
     if saved:

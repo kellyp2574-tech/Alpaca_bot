@@ -95,6 +95,29 @@ ETF_ENTRY_MAX_SPREAD_PCT = 0.005       # 0.5% spread gate for ETF entry
 ETF_ENTRY_MAX_SLIPPAGE_PCT = 0.005     # 0.5% above ask for ETF marketable limit
 ETF_ENTRY_MAX_STALE_SECONDS = 10.0     # Quote freshness gate for ETF entry
 
+# No-trade QQQ range-breakout fallback.
+# This is an intraday-only fallback that is eligible ONLY when the 10:00
+# ETF router resolves to NO_TRADE. It is intentionally MR-permission-neutral:
+# a filled fallback trade must be flat by 11:30 and must not block the 15:45
+# overnight MR sleeve.
+NO_TRADE_QQQ_BREAKOUT_ENABLED = True
+NO_TRADE_QQQ_BREAKOUT_CAPITAL_PCT = 0.50
+NO_TRADE_QQQ_BREAKOUT_RANGE_THRESHOLD = 0.0045  # 0.45% QQQ 09:30-<10:00 range
+NO_TRADE_QQQ_BREAKOUT_TRAIL_PCT = 1.50          # Alpaca trailing_stop trail_percent value
+NO_TRADE_QQQ_BREAKOUT_ENTRY_AFTER = "10:00"
+NO_TRADE_QQQ_BREAKOUT_EXIT_TIME = "11:30"
+NO_TRADE_QQQ_BREAKOUT_POLL_SECONDS = 5.0
+NO_TRADE_QQQ_BREAKOUT_ENTRY_MAX_SPREAD_PCT = 0.005
+NO_TRADE_QQQ_BREAKOUT_ENTRY_MAX_SLIPPAGE_PCT = 0.005
+NO_TRADE_QQQ_BREAKOUT_ENTRY_MAX_STALE_SECONDS = 10.0
+NO_TRADE_QQQ_BREAKOUT_ALLOWED_SUBTYPES = [
+    "LIVE_FLAT_CHOP",
+    "LIVE_WEAK_GREEN",
+    "LIVE_MILD_RISK_OFF",
+    "LIVE_BULLISH_MESSY",
+    "LIVE_VOL_WARNING",
+]
+
 # ═══════════════════════════════════════════════════
 # Sleeve 1: Mean Reversion — MR_WIDE
 # ═══════════════════════════════════════════════════

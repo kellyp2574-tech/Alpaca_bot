@@ -216,3 +216,51 @@ All re-exported by `bot/config.py` for `from bot import config; config.X` use.
 ---
 
 *Last updated: Combined MR + Router strategy consolidation.*
+
+---
+
+## Strategy 3 — No-Trade QQQ Range-Breakout Fallback
+
+### Overview
+This is an intraday-only fallback sleeve that is eligible only after the
+primary 10:00 ETF router resolves to **No Trade**. It is deliberately
+MR-permission-neutral: a fallback trade does **not** block the 15:45 overnight
+MR sleeve.
+
+### Eligibility
+- Primary ETF router branch must be `No trade`.
+- Live no-trade subtype must be in Set C:
+  - `LIVE_FLAT_CHOP`
+  - `LIVE_WEAK_GREEN`
+  - `LIVE_MILD_RISK_OFF`
+  - `LIVE_BULLISH_MESSY`
+  - `LIVE_VOL_WARNING`
+- QQQ 09:30 to strictly-before-10:00 range must be at least `0.45%` (`NO_TRADE_QQQ_BREAKOUT_RANGE_THRESHOLD`).
+
+### Entry
+- After 10:00, monitor QQQ live (poll every `NO_TRADE_QQQ_BREAKOUT_POLL_SECONDS`).
+- If QQQ breaks above the 09:30–10:00 high → buy `TQQQ`.
+- If QQQ breaks below the 09:30–10:00 low → buy `SQQQ`.
+- One attempt only. No re-entry.
+- Size: `equity × NO_TRADE_QQQ_BREAKOUT_CAPITAL_PCT` (default 50%).
+
+### Exit / Risk
+- Submit a broker-native `NO_TRADE_QQQ_BREAKOUT_TRAIL_PCT` (default 1.50%) trailing-stop sell after the ETF buy fills.
+- Force exit any remaining position at `NO_TRADE_QQQ_BREAKOUT_EXIT_TIME` (default 11:30).
+- The hard 11:30 exit cancels any resting trailing stop before selling.
+
+### MR Interaction
+This sleeve must not set `mr_blocked_today`. MR is blocked only by the original
+primary router branches. Because this fallback exits by 11:30, it does not
+overlap the 15:45 MR overnight entry window.
+
+### Key Config Knobs
+| Knob | Default | Description |
+|---|---|---|
+| `NO_TRADE_QQQ_BREAKOUT_ENABLED` | `True` | Master switch |
+| `NO_TRADE_QQQ_BREAKOUT_CAPITAL_PCT` | `0.50` | Fraction of equity to use |
+| `NO_TRADE_QQQ_BREAKOUT_RANGE_THRESHOLD` | `0.0045` | Min QQQ 09:30-10:00 range to arm |
+| `NO_TRADE_QQQ_BREAKOUT_TRAIL_PCT` | `1.50` | Trailing stop % |
+| `NO_TRADE_QQQ_BREAKOUT_EXIT_TIME` | `"11:30"` | Hard exit deadline |
+| `NO_TRADE_QQQ_BREAKOUT_POLL_SECONDS` | `5.0` | QQQ poll interval |
+| `NO_TRADE_QQQ_BREAKOUT_ALLOWED_SUBTYPES` | Set C list | Live day subtypes that can arm the breakout |

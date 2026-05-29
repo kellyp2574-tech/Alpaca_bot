@@ -137,6 +137,18 @@ class CombinedOvernightReboundBot:
         # of the last snapshot fetch; 0.0 means "never run yet".
         self._tape_last_update_monotonic: float = 0.0
 
+        # No-trade QQQ range-breakout fallback state. This sleeve is only
+        # eligible after the primary router returns NO_TRADE and is explicitly
+        # MR-permission-neutral. It must be flat by 11:30.
+        self.no_trade_breakout_active = False
+        self.no_trade_breakout_done = False
+        self.no_trade_breakout_entered_today = False
+        self.no_trade_breakout_subtype: Optional[str] = None
+        self.no_trade_breakout_range: Optional[float] = None
+        self.no_trade_breakout_high: Optional[float] = None
+        self.no_trade_breakout_low: Optional[float] = None
+        self._no_trade_breakout_last_check_monotonic: float = 0.0
+
         # Stage flags
         self.startup_done = False         # 9:00-9:25 startup phase
         self.tape_initialized = False     # 9:30 opens recorded
@@ -527,15 +539,18 @@ class CombinedOvernightReboundBot:
                     self._update_tape(force=True)  # Final tape update bypasses throttle
                     self._make_router_decision()
 
-                # ETF exit checkpoints (11:00 UVXY, 14:00 SQQQ, 15:00 TQQQ)
-                if self.router_traded_today and self.etf_position:
-                    symbol = self.etf_position.get("symbol")
-                    if symbol == "UVXY" and current_time >= t_uvxy_exit:
-                        self._check_etf_exits(current_time)
-                    elif symbol == "SQQQ" and current_time >= t_sqqq_exit:
-                        self._check_etf_exits(current_time)
-                    elif symbol == "TQQQ" and current_time >= t_tqqq_exit:
-                        self._check_etf_exits(current_time)
+                # No-trade QQQ breakout fallback monitor. This only arms after
+                # the primary router returns NO_TRADE and does not block MR.
+                if (getattr(config, "NO_TRADE_QQQ_BREAKOUT_ENABLED", False)
+                        and self.router_decision_made
+                        and self.no_trade_breakout_active
+                        and not self.no_trade_breakout_done):
+                    self._monitor_no_trade_qqq_breakout(current_time)
+
+                # ETF exits use the stored planned_exit_time. This handles both
+                # original router positions and the 11:30 no-trade fallback.
+                if self.etf_position:
+                    self._check_etf_exits(current_time)
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions
@@ -788,6 +803,9 @@ class CombinedOvernightReboundBot:
 
     def _execute_etf_exit(self):
         return etf_router_runtime.execute_etf_exit(self)
+
+    def _monitor_no_trade_qqq_breakout(self, current_time):
+        return etf_router_runtime.monitor_no_trade_qqq_breakout(self, current_time)
 
 
 

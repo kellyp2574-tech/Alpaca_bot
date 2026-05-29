@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from bot import config
-from bot.etf_router import RouterDecision
+from bot.etf_router import RouterBranch, RouterDecision
 from bot.universe_builder import filter_execution_ready
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,15 @@ def build_etf_router_summary(bot) -> Dict[str, Any]:
         "branch": bot.router_branch,
         "mr_blocked_today": bot.mr_blocked_today,
         "router_traded_today": bot.router_traded_today,
+        "no_trade_breakout": {
+            "active": getattr(bot, "no_trade_breakout_active", False),
+            "done": getattr(bot, "no_trade_breakout_done", False),
+            "entered": getattr(bot, "no_trade_breakout_entered_today", False),
+            "subtype": getattr(bot, "no_trade_breakout_subtype", None),
+            "qqq_range": getattr(bot, "no_trade_breakout_range", None),
+            "morning_high": getattr(bot, "no_trade_breakout_high", None),
+            "morning_low": getattr(bot, "no_trade_breakout_low", None),
+        },
     }
     if decision is not None:
         try:
@@ -377,7 +386,8 @@ def make_router_decision(bot) -> None:
         else:
             execute_etf_entry(bot, decision)
     else:
-        logger.info("No ETF trade - MR allowed at 15:45")
+        logger.info("No primary ETF router trade - MR allowed at 15:45")
+        prepare_no_trade_qqq_breakout(bot, decision, now)
 
     bot._save_state()
 
@@ -616,3 +626,333 @@ def execute_etf_exit(bot) -> None:
 
     except Exception as e:
         logger.error(f"Error executing ETF exit: {e}", exc_info=True)
+
+
+# ────────────────────────────────────────────────────────────────────
+# No-trade QQQ range-breakout fallback
+# ────────────────────────────────────────────────────────────────────
+
+def _parse_hhmm(value: str) -> dt_time:
+    parts = str(value).split(":")
+    return dt_time(int(parts[0]), int(parts[1]))
+
+
+def classify_no_trade_live_subtype(bot) -> str:
+    """Classify a primary-router NO_TRADE day into a live subtype.
+
+    The research files used precomputed live subtypes. The live bot did not
+    have that classifier wired in, so this runtime classifier intentionally
+    uses only the already-recorded 09:30-10:00 ETF tape. Keep this simple and
+    auditable; if you later recover the exact research classifier, swap it in
+    here without changing the execution plumbing.
+    """
+    returns = bot.etf_router.tape.get_returns_summary()
+    qqq = returns.get("QQQ")
+    spy = returns.get("SPY")
+    iwm = returns.get("IWM")
+    xlk = returns.get("XLK")
+    vxx = returns.get("VXX")
+    uvxy = returns.get("UVXY")
+
+    qqq = 0.0 if qqq is None else float(qqq)
+    spy = 0.0 if spy is None else float(spy)
+    iwm = 0.0 if iwm is None else float(iwm)
+    xlk = 0.0 if xlk is None else float(xlk)
+    vxx = 0.0 if vxx is None else float(vxx)
+    uvxy = 0.0 if uvxy is None else float(uvxy)
+
+    if vxx > 25 or uvxy > 75:
+        return "LIVE_VOL_WARNING"
+
+    if qqq > 5 and spy > -5:
+        if xlk > 0:
+            return "LIVE_BULLISH_MESSY"
+        return "LIVE_WEAK_GREEN"
+
+    if qqq < -10 or spy < -10:
+        return "LIVE_MILD_RISK_OFF"
+
+    if iwm < -15 and qqq > -10 and spy > -10:
+        return "LIVE_SMALL_CAP_WEAKNESS"
+
+    return "LIVE_FLAT_CHOP"
+
+
+def _get_qqq_morning_range_from_bars(bot, today_iso: str) -> tuple:
+    """Return (range_pct, high, low) for QQQ 09:30 <= t < 10:00.
+
+    Prefer the historical 1-minute bars so the fallback uses the same range
+    definition as the research. Fall back to the live tape if the minute bars
+    are unavailable at exactly 10:00.
+    """
+    try:
+        bars_by_symbol = bot.alpaca.get_intraday_bars_for_signal(
+            ["QQQ"], today_iso, start="09:30", end="10:00",
+        ) or {}
+        bars = bars_by_symbol.get("QQQ") or []
+        highs = []
+        lows = []
+        first_open = None
+        for bar in bars:
+            bar_dt = bot._bar_dt(bar)
+            if bar_dt is None or not (bar_dt.hour == 9 and 30 <= bar_dt.minute < 60):
+                continue
+            high = bot._bar_float(bar, "h", "high")
+            low = bot._bar_float(bar, "l", "low")
+            opn = bot._bar_float(bar, "o", "open")
+            if high is None or low is None:
+                continue
+            highs.append(float(high))
+            lows.append(float(low))
+            if first_open is None and opn is not None and opn > 0:
+                first_open = float(opn)
+        if highs and lows and first_open and first_open > 0:
+            hi = max(highs)
+            lo = min(lows)
+            return (hi - lo) / first_open, hi, lo
+    except Exception:
+        logger.warning("No-trade breakout: QQQ 09:30-10:00 bar range fetch failed; using tape fallback", exc_info=True)
+
+    q = bot.etf_router.tape.qqq
+    if q.open_930 and q.high and q.low and q.open_930 > 0:
+        return (q.high - q.low) / q.open_930, q.high, q.low
+    return None, None, None
+
+
+def prepare_no_trade_qqq_breakout(bot, decision: RouterDecision, timestamp: datetime) -> None:
+    """Arm the no-trade QQQ breakout fallback after a primary NO_TRADE decision."""
+    bot.no_trade_breakout_active = False
+    bot.no_trade_breakout_done = True
+    bot.no_trade_breakout_entered_today = False
+    bot.no_trade_breakout_subtype = None
+    bot.no_trade_breakout_range = None
+    bot.no_trade_breakout_high = None
+    bot.no_trade_breakout_low = None
+
+    if not getattr(config, "NO_TRADE_QQQ_BREAKOUT_ENABLED", False):
+        return
+
+    if decision.branch != RouterBranch.NO_TRADE or decision.symbol:
+        return
+
+    subtype = classify_no_trade_live_subtype(bot)
+    allowed = set(getattr(config, "NO_TRADE_QQQ_BREAKOUT_ALLOWED_SUBTYPES", []))
+    bot.no_trade_breakout_subtype = subtype
+
+    if allowed and subtype not in allowed:
+        logger.info("No-trade QQQ breakout not armed: subtype=%s not in allowed=%s", subtype, sorted(allowed))
+        return
+
+    today_iso = timestamp.date().isoformat()
+    q_range, q_high, q_low = _get_qqq_morning_range_from_bars(bot, today_iso)
+    threshold = float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_RANGE_THRESHOLD", 0.0045))
+    bot.no_trade_breakout_range = q_range
+    bot.no_trade_breakout_high = q_high
+    bot.no_trade_breakout_low = q_low
+
+    if q_range is None or q_high is None or q_low is None:
+        logger.warning("No-trade QQQ breakout not armed: missing QQQ range data")
+        return
+
+    if q_range < threshold:
+        logger.info(
+            "No-trade QQQ breakout not armed: subtype=%s qqq_range=%.3f%% < %.3f%%",
+            subtype, q_range * 100.0, threshold * 100.0,
+        )
+        return
+
+    bot.no_trade_breakout_active = True
+    bot.no_trade_breakout_done = False
+    logger.warning(
+        "NO_TRADE_QQQ_BREAKOUT ARMED: subtype=%s qqq_range=%.3f%% high=%.4f low=%.4f "
+        "threshold=%.3f%% exit=%s MR_ALLOWED=True",
+        subtype,
+        q_range * 100.0,
+        q_high,
+        q_low,
+        threshold * 100.0,
+        getattr(config, "NO_TRADE_QQQ_BREAKOUT_EXIT_TIME", "11:30"),
+    )
+
+
+def monitor_no_trade_qqq_breakout(bot, current_time: dt_time) -> None:
+    """Poll QQQ after 10:00 and enter TQQQ/SQQQ on range break.
+
+    Uses latest QQQ price, not minute high/low, to approximate live polling.
+    Once a trade is attempted, the sleeve is marked done for the day; there is
+    no re-entry.
+    """
+    if bot.no_trade_breakout_done or not bot.no_trade_breakout_active:
+        return
+
+    exit_t = _parse_hhmm(getattr(config, "NO_TRADE_QQQ_BREAKOUT_EXIT_TIME", "11:30"))
+    if current_time >= exit_t:
+        logger.info("No-trade QQQ breakout expired flat at %s", current_time)
+        bot.no_trade_breakout_active = False
+        bot.no_trade_breakout_done = True
+        bot._save_state()
+        return
+
+    if bot.etf_position:
+        return
+
+    interval = float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_POLL_SECONDS", 5.0))
+    now_mono = time.monotonic()
+    if interval > 0 and (now_mono - bot._no_trade_breakout_last_check_monotonic) < interval:
+        return
+    bot._no_trade_breakout_last_check_monotonic = now_mono
+
+    q_high = bot.no_trade_breakout_high
+    q_low = bot.no_trade_breakout_low
+    if q_high is None or q_low is None:
+        bot.no_trade_breakout_active = False
+        bot.no_trade_breakout_done = True
+        bot._save_state()
+        return
+
+    try:
+        snaps = bot.alpaca.get_snapshots(["QQQ"]) or {}
+        q_snap = snaps.get("QQQ", {}) or {}
+        q_price = q_snap.get("last_price") or q_snap.get("close")
+        if not q_price:
+            logger.warning("No-trade QQQ breakout: no QQQ last price")
+            return
+        q_price = float(q_price)
+    except Exception:
+        logger.warning("No-trade QQQ breakout: QQQ snapshot failed", exc_info=True)
+        return
+
+    if q_price > float(q_high):
+        logger.warning(
+            "NO_TRADE_QQQ_BREAKOUT trigger UP: QQQ %.4f > morning_high %.4f -> TQQQ",
+            q_price, q_high,
+        )
+        execute_no_trade_breakout_entry(bot, symbol="TQQQ", trigger_price=q_price, trigger_direction="up")
+    elif q_price < float(q_low):
+        logger.warning(
+            "NO_TRADE_QQQ_BREAKOUT trigger DOWN: QQQ %.4f < morning_low %.4f -> SQQQ",
+            q_price, q_low,
+        )
+        execute_no_trade_breakout_entry(bot, symbol="SQQQ", trigger_price=q_price, trigger_direction="down")
+
+
+def execute_no_trade_breakout_entry(bot, symbol: str, trigger_price: float, trigger_direction: str) -> None:
+    """Buy TQQQ/SQQQ for the no-trade breakout fallback and place trailing stop."""
+    bot.no_trade_breakout_active = False
+    bot.no_trade_breakout_done = True
+
+    if bot._check_daily_loss_kill_switch():
+        logger.critical(
+            "No-trade QQQ breakout BLOCKED by daily-loss kill switch — %s", bot.kill_switch_reason
+        )
+        bot._save_state()
+        return
+
+    try:
+        account = bot.position_mgr.get_account()
+        if not account:
+            logger.error("No-trade QQQ breakout: cannot fetch account for sizing")
+            bot._save_state()
+            return
+        equity = float(account.get("equity", 0) or 0)
+        if equity <= 0:
+            logger.error("No-trade QQQ breakout: equity <= 0")
+            bot._save_state()
+            return
+
+        budget = equity * float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_CAPITAL_PCT", 0.50))
+        snapshots = bot.alpaca.get_snapshots([symbol]) or {}
+        snap = snapshots.get(symbol, {}) or {}
+
+        orderable, rejected = filter_execution_ready(
+            [symbol], snapshots,
+            max_spread_pct=float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_ENTRY_MAX_SPREAD_PCT", 0.005)),
+            require_quote=True,
+            max_stale_seconds=float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_ENTRY_MAX_STALE_SECONDS", 10.0)),
+        )
+        if symbol not in orderable:
+            logger.warning("No-trade QQQ breakout entry rejected for %s: %s", symbol, rejected.get(symbol, "unknown"))
+            bot._save_state()
+            return
+
+        ask = snap.get("ask")
+        bid = snap.get("bid")
+        last = snap.get("last_price") or snap.get("close")
+        if not last:
+            logger.error("No-trade QQQ breakout: no last price for %s", symbol)
+            bot._save_state()
+            return
+
+        sizing_price = float(ask) if ask else float(last)
+        qty = int(budget / sizing_price)
+        if qty <= 0:
+            logger.warning("No-trade QQQ breakout: qty <= 0 for %s budget=$%.2f price=%.4f", symbol, budget, sizing_price)
+            bot._save_state()
+            return
+
+        slippage_pct = float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
+        if ask:
+            limit_price = float(ask) * (1.0 + slippage_pct)
+            order_type = "limit"
+            logger.warning(
+                "No-trade QQQ breakout BUY %s qty=%d bid=%s ask=%s last=%s limit=%.4f trigger=%s %.4f",
+                symbol, qty, bid, ask, last, limit_price, trigger_direction, trigger_price,
+            )
+            order, error_type = bot.position_mgr.submit_buy_order(
+                symbol, qty, order_type="limit", limit_price=limit_price, timeout=5,
+            )
+        else:
+            order_type = "market"
+            limit_price = None
+            order, error_type = bot.position_mgr.submit_buy_order(symbol, qty, timeout=5)
+
+        if not order or not order.get("id"):
+            logger.error("No-trade QQQ breakout buy failed for %s: %s", symbol, error_type)
+            bot._save_state()
+            return
+
+        fill = bot.position_mgr.get_order_fill(order["id"], max_wait=10)
+        if not fill or int(fill.get("filled_qty", 0)) <= 0:
+            logger.warning("No-trade QQQ breakout buy not filled for %s; canceling", symbol)
+            bot.position_mgr._cancel_order(order["id"])
+            bot._save_state()
+            return
+
+        filled_qty = int(fill["filled_qty"])
+        fill_price = float(fill.get("filled_avg_price", last))
+        trail_pct = float(getattr(config, "NO_TRADE_QQQ_BREAKOUT_TRAIL_PCT", 1.50))
+        trailing_order = bot.position_mgr.submit_trailing_stop_sell_order(symbol, filled_qty, trail_pct)
+        trailing_id = trailing_order.get("id") if trailing_order else None
+        if not trailing_id:
+            logger.error("No-trade QQQ breakout: trailing stop submit failed for %s; 11:30 failsafe exit will still run", symbol)
+
+        bot.etf_position = {
+            "symbol": symbol,
+            "qty": filled_qty,
+            "entry_price": fill_price,
+            "entry_time": datetime.now(_ET).isoformat(),
+            "branch": "NO_TRADE_QQQ_BREAKOUT",
+            "planned_exit_time": _parse_hhmm(getattr(config, "NO_TRADE_QQQ_BREAKOUT_EXIT_TIME", "11:30")).isoformat(),
+            "order_id": order.get("id"),
+            "entry_order_type": order_type,
+            "entry_limit_price": limit_price,
+            "trailing_stop_order_id": trailing_id,
+            "trail_percent": trail_pct,
+            "mr_blocking": False,
+            "trigger_direction": trigger_direction,
+            "trigger_price": trigger_price,
+            "live_subtype": bot.no_trade_breakout_subtype,
+            "qqq_range": bot.no_trade_breakout_range,
+            "qqq_morning_high": bot.no_trade_breakout_high,
+            "qqq_morning_low": bot.no_trade_breakout_low,
+        }
+        bot.no_trade_breakout_entered_today = True
+        logger.warning(
+            "NO_TRADE_QQQ_BREAKOUT POSITION OPENED: %s qty=%d fill=%.4f trail=%.2f%% exit=%s MR_ALLOWED=True",
+            symbol, filled_qty, fill_price, trail_pct, bot.etf_position["planned_exit_time"],
+        )
+        bot._save_state()
+
+    except Exception:
+        logger.error("No-trade QQQ breakout entry failed", exc_info=True)
+        bot._save_state()
