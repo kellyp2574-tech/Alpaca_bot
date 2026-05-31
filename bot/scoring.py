@@ -20,10 +20,6 @@ from bot.mean_reversion_scorer import (
     build_mean_reversion_candidates,
     filter_mean_reversion_candidates,
 )
-from bot.green_day_pullback_scorer import (
-    build_green_day_pullback_candidates,
-    filter_green_day_pullback_candidates,
-)
 from bot.universe_builder import (
     build_universe,
     filter_minute_data_quality,
@@ -66,9 +62,9 @@ def step_collect_data(bot) -> None:
 
 
 def step_score_and_rank(bot) -> None:
-    """~3:50 PM: Fetch 9:30-15:50 bars, run Stage C quality filter, build MR and GDP candidates."""
+    """~15:45: Fetch 9:30-15:45 bars, run Stage C quality filter, build MR candidates."""
     logger.info("=" * 50)
-    logger.info("SCORING (combined): Building MR and GDP candidates")
+    logger.info("SCORING: Building MR candidates")
     logger.info("=" * 50)
 
     try:
@@ -156,53 +152,21 @@ def step_score_and_rank(bot) -> None:
             f"passed={len(filtered_mr)}"
         )
 
-        # 4. Build raw GDP candidates from minute bars
-        raw_gdp = build_green_day_pullback_candidates(
-            bot.universe,
-            bot._minute_bars,
-            bot._adv_cache,
-        )
-        filtered_gdp = filter_green_day_pullback_candidates(raw_gdp)
-
-        # 5. Remove GDP candidates that are already MR candidates (MR takes priority)
-        mr_symbols = {c.symbol for c in filtered_mr}  # Use full filtered list
-        filtered_gdp = [c for c in filtered_gdp if c.symbol not in mr_symbols]
-        bot.gdp_candidates = filtered_gdp  # Keep ALL passed candidates for allocator
-
-        # CRITICAL DIAGNOSTIC: GDP pipeline counts
-        logger.info(
-            f"GDP pipeline: "
-            f"universe={len(bot.universe)}, "
-            f"raw={len(raw_gdp)}, "
-            f"passed={len(filtered_gdp)}"
-        )
-
         bot.scoring_done = True
         bot._save_state()
 
         logger.info(
-            f"Combined scoring: "
-            f"MR raw={len(raw_mr)} passed={len(filtered_mr)} top_slots={min(len(filtered_mr), config.MR_MAX_POSITIONS)} | "
-            f"GDP raw={len(raw_gdp)} passed={len(filtered_gdp)} top_slots={min(len(filtered_gdp), config.GDP_MAX_POSITIONS)}"
+            f"MR scoring: raw={len(raw_mr)} passed={len(filtered_mr)} "
+            f"top_slots={min(len(filtered_mr), config.MR_MAX_PRIMARY_POSITIONS)}"
         )
 
         # Log top MR candidates (only up to max positions)
-        for c in bot.mr_candidates[:config.MR_MAX_POSITIONS]:
+        for c in bot.mr_candidates[:config.MR_MAX_PRIMARY_POSITIONS]:
             logger.info(
                 f"MR TOP {c.symbol}: price={c.signal_price:.2f}, "
                 f"day_ret={c.day_return:.2%}, vol_ratio={c.volume_ratio:.2f}x, "
                 f"close_pos={c.close_position:.2f}, "
                 f"late_drop={c.late_drop_1530_1550:.2%}, "
-                f"score={c.selection_score:.3f}"
-            )
-
-        # Log top GDP candidates (only up to max positions)
-        for c in bot.gdp_candidates[:config.GDP_MAX_POSITIONS]:
-            logger.info(
-                f"GDP TOP {c.symbol}: price={c.signal_price:.2f}, "
-                f"day_ret={c.day_return:.2%}, price_vs_vwap={c.price_vs_vwap:.2%}, "
-                f"late_mom={c.late_mom_1530_signal:.2%}, "
-                f"close_pos={c.close_position:.2f}, vol_ratio={c.volume_ratio:.2f}x, "
                 f"score={c.selection_score:.3f}"
             )
 
@@ -220,34 +184,17 @@ def step_score_and_rank(bot) -> None:
                 "adv_dollars": round(c.adv_dollars, 0),
             }
 
-        def _gdp_dict(c):
-            return {
-                "symbol": c.symbol,
-                "sleeve": "GDP",
-                "selection_score": round(c.selection_score, 4),
-                "signal_price": round(c.signal_price, 4),
-                "day_return": round(c.day_return, 4),
-                "price_vs_vwap": round(c.price_vs_vwap, 4),
-                "late_mom_1530_signal": round(c.late_mom_1530_signal, 4),
-                "volume_ratio": round(c.volume_ratio, 2),
-                "close_position": round(c.close_position, 3),
-                "adv_dollars": round(c.adv_dollars, 0),
-            }
-
         audit_dicts = {
-            "mr_selected": [_mr_dict(c) for c in bot.mr_candidates[:config.MR_MAX_POSITIONS]],
+            "mr_selected": [_mr_dict(c) for c in bot.mr_candidates[:config.MR_MAX_PRIMARY_POSITIONS]],
             "mr_all_passed": [_mr_dict(c) for c in bot.mr_candidates],
-            "gdp_selected": [_gdp_dict(c) for c in bot.gdp_candidates[:config.GDP_MAX_POSITIONS]],
-            "gdp_all_passed": [_gdp_dict(c) for c in bot.gdp_candidates],
         }
         save_candidates_audit(audit_dicts)
 
         if bot._universe_diag:
             top_mr = [_mr_dict(c) for c in bot.mr_candidates[:20]]
-            top_gdp = [_gdp_dict(c) for c in bot.gdp_candidates[:20]]
             save_universe_audit(
                 bot._universe_diag, bot.universe,
-                scored_top20=top_mr + top_gdp,
+                scored_top20=top_mr,
             )
 
     except Exception as e:

@@ -211,16 +211,80 @@ class PositionManager:
             logger.error(f"Buy order FAILED (network) | symbol={symbol} | qty={qty} | error={e}")
             return None, "network_error"
 
+    def _verify_sell_qty(self, symbol: str, qty: int) -> int:
+        """Verify broker actually holds at least ``qty`` shares of ``symbol``.
+
+        Returns a safe quantity to sell:
+          - 0  if the broker confirms no position (404) or holds nothing.
+          - qty if the broker confirms it holds >= qty (no clamp needed).
+          - clamped value if broker holds 0 < broker_qty < qty.
+          - qty (no clamp) if the broker API errored — preserve prior behavior
+            and let the caller's existing failure handling kick in. We never
+            *increase* qty here; we only ever clamp down.
+
+        This is the last line of defense against accidental shorts: every
+        sell order goes through ``_submit_sell_order`` /
+        ``submit_trailing_stop_sell_order``, both of which call this method
+        immediately before submitting to Alpaca.
+        """
+        if qty <= 0:
+            return 0
+        broker_pos = self.get_broker_position(symbol)
+        if broker_pos is None:
+            # API error — unknown state. Don't clamp; let the caller decide.
+            logger.warning(
+                f"SELL VERIFY {symbol}: broker API error — cannot confirm holdings, "
+                f"submitting requested qty={qty}"
+            )
+            return qty
+        if broker_pos is self.BROKER_NOT_FOUND:
+            logger.error(
+                f"SELL BLOCKED {symbol}: broker confirmed NO POSITION — refusing to "
+                f"submit sell qty={qty} (would create short)"
+            )
+            return 0
+        try:
+            broker_qty = abs(int(float(broker_pos.get("qty", 0))))
+        except (TypeError, ValueError):
+            broker_qty = 0
+        if broker_qty <= 0:
+            logger.error(
+                f"SELL BLOCKED {symbol}: broker qty=0 — refusing to submit sell "
+                f"qty={qty} (would create short)"
+            )
+            return 0
+        if broker_qty < qty:
+            logger.warning(
+                f"SELL CLAMP {symbol}: requested qty={qty} but broker holds {broker_qty} "
+                f"— clamping to broker_qty"
+            )
+            return broker_qty
+        return qty
+
     def _submit_sell_order(self, symbol: str, qty: int, order_type: str = "market",
                            limit_price: Optional[float] = None,
                            time_in_force: str = "day",
-                           extended_hours: bool = False) -> Optional[dict]:
+                           extended_hours: bool = False,
+                           verify_broker_qty: bool = True) -> Optional[dict]:
         """Submit a sell order via POST /v2/orders.
 
         ALL exits go through this method — never DELETE /v2/positions.
         ``time_in_force`` is configurable so the overnight 20:00 limit-sell
         orders can rest as GTC orders, while normal 09:30 exits remain DAY.
+
+        Safety: ``verify_broker_qty=True`` (default) calls
+        :meth:`_verify_sell_qty` immediately before submission. If the broker
+        confirms no position (or holds fewer shares), the order is refused
+        or clamped down to broker_qty. This prevents accidental short sales
+        that could result from stale local state. Pass ``False`` only when
+        the caller has already verified holdings (e.g. ``_exit_position``
+        or ``force_flatten_broker_positions``) to avoid double API calls.
         """
+        if verify_broker_qty:
+            safe_qty = self._verify_sell_qty(symbol, qty)
+            if safe_qty <= 0:
+                return None
+            qty = safe_qty
         url = f"{self.base_url}/v2/orders"
         order_data = {
             "symbol": symbol,
@@ -279,13 +343,21 @@ class PositionManager:
                 )
             return None
 
-    def submit_trailing_stop_sell_order(self, symbol: str, qty: int, trail_percent: float) -> Optional[dict]:
+    def submit_trailing_stop_sell_order(self, symbol: str, qty: int, trail_percent: float,
+                                        verify_broker_qty: bool = True) -> Optional[dict]:
         """Submit a day trailing-stop sell order via POST /v2/orders.
 
-        Used by the paper red-open trailing exit experiment. Alpaca trails by
-        percent when trail_percent is supplied; the order becomes a market sell
-        when the trailing stop is triggered.
+        Used by V2/P1 fallback ETF entries to attach a percent trailing stop.
+        Alpaca converts to a market sell when the trailing stop is triggered.
+
+        Safety: same broker pre-check as ``_submit_sell_order``. If the broker
+        confirms no position, the order is refused (would create a short).
         """
+        if verify_broker_qty:
+            safe_qty = self._verify_sell_qty(symbol, qty)
+            if safe_qty <= 0:
+                return None
+            qty = safe_qty
         url = f"{self.base_url}/v2/orders"
         order_data = {
             "symbol": symbol,
@@ -664,7 +736,8 @@ class PositionManager:
             position.quantity = qty
 
         # ── Market sell attempt ──────────────────────────────────
-        sell_resp = self._submit_sell_order(symbol, qty)
+        # We just verified broker holdings above; skip the redundant API call.
+        sell_resp = self._submit_sell_order(symbol, qty, verify_broker_qty=False)
 
         # ── Limit fallback with proper price rounding ────────────
         if not sell_resp:
@@ -672,7 +745,7 @@ class PositionManager:
             if last_price and last_price > 0:
                 limit_price = self.round_limit_price(last_price * 0.97)
                 logger.warning(f"Market sell failed for {symbol}, trying limit sell @ {limit_price}")
-                sell_resp = self._submit_sell_order(symbol, qty, "limit", limit_price)
+                sell_resp = self._submit_sell_order(symbol, qty, "limit", limit_price, verify_broker_qty=False)
 
         if not sell_resp:
             logger.error(f"Failed to exit {symbol} (market + limit both failed) - {reason}")

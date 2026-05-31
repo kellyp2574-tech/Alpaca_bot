@@ -81,11 +81,6 @@ def save_state(bot) -> None:
         bot_state = {
             "date": datetime.now(_ET).strftime("%Y-%m-%d"),
             "morning_exits_done": bot.morning_exits_done,
-            "gdp_exits_done": bot.gdp_exits_done,
-            "mr_exits_done": bot.mr_exits_done,
-            "red_trail_exit_submitted": bot.red_trail_exit_submitted,
-            "red_trail_order_ids": bot.red_trail_order_ids,
-            "red_trail_symbols": list(bot.red_trail_symbols),
             "open_exit_plan": bot.open_exit_plan,
             "morning_open_orders_cancelled": bot.morning_open_orders_cancelled,
             "premarket_dynamic_limits_done": bot.premarket_dynamic_limits_done,
@@ -111,14 +106,18 @@ def save_state(bot) -> None:
             "startup_done": bot.startup_done,
             "tape_initialized": bot.tape_initialized,
             "router_decision_made": bot.router_decision_made,
-            # No-trade QQQ breakout fallback state (MR-permission-neutral)
-            "no_trade_breakout_active": getattr(bot, "no_trade_breakout_active", False),
-            "no_trade_breakout_done": getattr(bot, "no_trade_breakout_done", False),
-            "no_trade_breakout_entered_today": getattr(bot, "no_trade_breakout_entered_today", False),
-            "no_trade_breakout_subtype": getattr(bot, "no_trade_breakout_subtype", None),
-            "no_trade_breakout_range": getattr(bot, "no_trade_breakout_range", None),
-            "no_trade_breakout_high": getattr(bot, "no_trade_breakout_high", None),
-            "no_trade_breakout_low": getattr(bot, "no_trade_breakout_low", None),
+            # Unified System: Intraday ETF sleeve state
+            "intraday_etf_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
+            "router_entry_pending": getattr(bot, "router_entry_pending", False),
+            "router_no_trade_subtype": getattr(bot, "router_no_trade_subtype", None),
+            "v2_active": getattr(bot, "v2_active", False),
+            "v2_direction": getattr(bot, "v2_direction", None),
+            "v2_trigger_price": getattr(bot, "v2_trigger_price", None),
+            "v2_trigger_high": getattr(bot, "v2_trigger_high", None),
+            "v2_trigger_low": getattr(bot, "v2_trigger_low", None),
+            "v2_trigger_range_pct": getattr(bot, "v2_trigger_range_pct", None),
+            "v2_hybrid_checkpoint_done": getattr(bot, "v2_hybrid_checkpoint_done", False),
+            "p1_active": getattr(bot, "p1_active", False),
         }
         bot.state_mgr.save_bot_state(bot_state)
     except Exception as e:
@@ -142,13 +141,18 @@ def load_state(bot) -> None:
         bot.startup_done = False
         bot.tape_initialized = False
         bot.router_decision_made = False
-        bot.no_trade_breakout_active = False
-        bot.no_trade_breakout_done = False
-        bot.no_trade_breakout_entered_today = False
-        bot.no_trade_breakout_subtype = None
-        bot.no_trade_breakout_range = None
-        bot.no_trade_breakout_high = None
-        bot.no_trade_breakout_low = None
+        # Unified System: reset intraday ETF sleeve state
+        bot.intraday_etf_sleeve_filled = False
+        bot.router_entry_pending = False
+        bot.router_no_trade_subtype = None
+        bot.v2_active = False
+        bot.v2_direction = None
+        bot.v2_trigger_price = None
+        bot.v2_trigger_high = None
+        bot.v2_trigger_low = None
+        bot.v2_trigger_range_pct = None
+        bot.v2_hybrid_checkpoint_done = False
+        bot.p1_active = False
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -158,8 +162,6 @@ def load_state(bot) -> None:
 
     logger.info("Restoring same-day bot state")
     bot.morning_exits_done = bot_state.get("morning_exits_done", False)
-    bot.gdp_exits_done = bot_state.get("gdp_exits_done", False)
-    bot.mr_exits_done = bot_state.get("mr_exits_done", False)
     bot.post_exit_failsafe_done = bot_state.get("post_exit_failsafe_done", False)
     bot.data_collected = bot_state.get("data_collected", False)
     bot.scoring_done = bot_state.get("scoring_done", False)
@@ -172,9 +174,6 @@ def load_state(bot) -> None:
             f"Daily-loss kill switch is ACTIVE from earlier this session — "
             f"{bot.kill_switch_reason}. All entries remain blocked."
         )
-    bot.red_trail_exit_submitted = bot_state.get("red_trail_exit_submitted", False)
-    bot.red_trail_order_ids = bot_state.get("red_trail_order_ids", {})
-    bot.red_trail_symbols = set(bot_state.get("red_trail_symbols", []))
     bot.open_exit_plan = bot_state.get("open_exit_plan", [])
     bot.morning_open_orders_cancelled = bot_state.get("morning_open_orders_cancelled", False)
     bot.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
@@ -194,13 +193,18 @@ def load_state(bot) -> None:
     bot.startup_done = bot_state.get("startup_done", False)
     bot.tape_initialized = bot_state.get("tape_initialized", False)
     bot.router_decision_made = bot_state.get("router_decision_made", False)
-    bot.no_trade_breakout_active = bot_state.get("no_trade_breakout_active", False)
-    bot.no_trade_breakout_done = bot_state.get("no_trade_breakout_done", False)
-    bot.no_trade_breakout_entered_today = bot_state.get("no_trade_breakout_entered_today", False)
-    bot.no_trade_breakout_subtype = bot_state.get("no_trade_breakout_subtype", None)
-    bot.no_trade_breakout_range = bot_state.get("no_trade_breakout_range", None)
-    bot.no_trade_breakout_high = bot_state.get("no_trade_breakout_high", None)
-    bot.no_trade_breakout_low = bot_state.get("no_trade_breakout_low", None)
+    # Unified System: restore intraday ETF sleeve state
+    bot.intraday_etf_sleeve_filled = bot_state.get("intraday_etf_sleeve_filled", False)
+    bot.router_entry_pending = bot_state.get("router_entry_pending", False)
+    bot.router_no_trade_subtype = bot_state.get("router_no_trade_subtype", None)
+    bot.v2_active = bot_state.get("v2_active", False)
+    bot.v2_direction = bot_state.get("v2_direction", None)
+    bot.v2_trigger_price = bot_state.get("v2_trigger_price", None)
+    bot.v2_trigger_high = bot_state.get("v2_trigger_high", None)
+    bot.v2_trigger_low = bot_state.get("v2_trigger_low", None)
+    bot.v2_trigger_range_pct = bot_state.get("v2_trigger_range_pct", None)
+    bot.v2_hybrid_checkpoint_done = bot_state.get("v2_hybrid_checkpoint_done", False)
+    bot.p1_active = bot_state.get("p1_active", False)
 
     saved = bot.state_mgr.load_positions()
     if saved:
@@ -226,26 +230,11 @@ def _mr_candidate_dict(c) -> Dict[str, Any]:
     }
 
 
-def _gdp_candidate_dict(c) -> Dict[str, Any]:
-    return {
-        "symbol": c.symbol,
-        "sleeve": "GDP",
-        "selection_score": round(c.selection_score, 4),
-        "signal_price": round(c.signal_price, 4),
-        "day_return": round(c.day_return, 4),
-        "price_vs_vwap": round(c.price_vs_vwap, 4),
-        "late_mom_1530_signal": round(c.late_mom_1530_signal, 4),
-        "volume_ratio": round(c.volume_ratio, 2),
-        "close_position": round(c.close_position, 3),
-        "adv_dollars": round(c.adv_dollars, 0),
-    }
-
-
 def save_end_of_day_reports(bot) -> None:
     """Write all daily diagnostic artifacts. Called on EVERY completed market day."""
     try:
         stats = bot._exec_stats
-        total_candidates = len(bot.mr_candidates) + len(bot.gdp_candidates)
+        total_candidates = len(bot.mr_candidates)
 
         extras: Dict[str, Any] = {
             "api_calls_total": get_api_call_count(),
@@ -284,12 +273,10 @@ def save_end_of_day_reports(bot) -> None:
 
     try:
         audit_dicts = {
-            "mr_selected": [_mr_candidate_dict(c) for c in bot.mr_candidates[:config.MR_MAX_POSITIONS]],
+            "mr_selected": [_mr_candidate_dict(c) for c in bot.mr_candidates[:config.MR_MAX_PRIMARY_POSITIONS]],
             "mr_all_passed": [_mr_candidate_dict(c) for c in bot.mr_candidates],
-            "gdp_selected": [_gdp_candidate_dict(c) for c in bot.gdp_candidates[:config.GDP_MAX_POSITIONS]],
-            "gdp_all_passed": [_gdp_candidate_dict(c) for c in bot.gdp_candidates],
         }
-        if audit_dicts["mr_selected"] or audit_dicts["gdp_selected"]:
+        if audit_dicts["mr_selected"]:
             save_candidates_audit(audit_dicts)
     except Exception as e:
         logger.error(f"Failed to save candidates audit: {e}")
