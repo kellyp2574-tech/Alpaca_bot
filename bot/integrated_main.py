@@ -39,14 +39,15 @@ from bot import config
 from bot import entry_executor
 from bot import etf_router_runtime
 from bot import morning_exits
+from bot import p1_fallback
 from bot import premarket_classifier
 from bot import premarket_runner
 from bot import scoring
 from bot import state_io
+from bot import v2_fallback
 from bot.massive_client import MassiveClient
 from bot.market_data import AlpacaDataClient
 from bot.mean_reversion_scorer import MeanReversionCandidate
-from bot.green_day_pullback_scorer import GreenDayPullbackCandidate
 from bot.etf_router import ETFRouter, RouterDecision
 from bot.position_manager_overnight import PositionManager
 from bot.state_manager import StateManager
@@ -90,13 +91,16 @@ def _parse_config_time(time_str: str) -> dt_time:
 # Hot windows where the main loop should tick at 1s for prompt action.
 # Outside these windows the loop sleeps up to 30s to save CPU and rate-limit
 # budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
+# Unified system timeline: 5:00 start, 10:00 router, 10:05 entry, 10:10-10:30 V2, 10:15 P1
 _HOT_WINDOWS_HHMM = (
     (5, 0, 6, 2),     # Premarket dynamic-limit checkpoints (incl. final 06:00 trip)
-    (9, 24, 10, 2),   # Order cancel, 09:30 batch sells, 09:31 rescue + ETF router
-    (10, 59, 11, 2),  # UVXY exit
-    (13, 59, 14, 2),  # SQQQ exit
-    (14, 59, 15, 2),  # TQQQ exit
-    (15, 29, 16, 1),  # Universe build, scoring, entries, EOD
+    (9, 24, 9, 32),   # Order cancel, 09:30 batch sells, 09:31 rescue
+    (9, 58, 10, 32),  # ETF tape final, 10:00 decision, 10:05 entry, 10:10-10:30 V2/P1
+    (11, 28, 11, 32), # V2 11:30 hybrid checkpoint
+    (13, 58, 14, 2),  # SQQQ exit
+    (14, 58, 15, 2),  # TQQQ/P1 exit
+    (15, 28, 15, 32), # V2 final exit / intraday hard flatten
+    (15, 44, 16, 1),  # MR selection, entry, EOD
 )
 
 
@@ -110,7 +114,32 @@ def _is_hot_window(now_t: dt_time) -> bool:
 
 
 class CombinedOvernightReboundBot:
-    """Main bot orchestrator for combined MR_WIDE + GDP_BASE strategy"""
+    """Unified Bot Orchestrator — Intraday ETF (Router > V2 > P1) + Overnight MR
+    
+    Capital allocation:
+    - 90% intraday ETF bucket (Router priority 1, V2 priority 2, P1 priority 3)
+    - 30% per MR position, max 3 positions = 90% total, 0.3% ADV cap per symbol
+    
+    Daily Timeline (ET):
+    05:00 - Bot startup, load state, verify calendar
+    05:00-06:00 - Premarket MR monitoring and dynamic limit decisions
+    09:25 - Cancel premarket limits, prepare for open
+    09:30 - Batch market sell remaining MR positions
+    09:30-10:00 - Build ETF tape snapshot
+    10:00 - Router decision (priority 1)
+    10:05 - Router entry (if fired)
+    10:10-10:30 - V2 fallback window (priority 2, if router no-trade)
+    10:15 - P1 fallback entry (priority 3, if router+V2 no-trade)
+    11:30 - V2 hybrid checkpoint (exit/hold decision)
+    14:00 - SQQQ Goldilocks exit
+    15:00 - Router/P1 TQQQ exit
+    15:30 - V2 final exit / hard flatten all intraday ETF
+    15:45 - MR candidate selection (if router no-trade and subtype qualifies)
+    15:45 - MR batch entry
+    16:00 - Market close, final reconciliation
+    
+    Key rule: Only router trade blocks MR. V2/P1 do NOT block MR.
+    """
 
     def __init__(self):
         self.massive = MassiveClient()
@@ -122,7 +151,6 @@ class CombinedOvernightReboundBot:
         # Universe & candidates
         self.universe: List[str] = []
         self.mr_candidates: List[MeanReversionCandidate] = []
-        self.gdp_candidates: List[GreenDayPullbackCandidate] = []
         self._universe_diag: Optional[UniverseDiagnostics] = None
 
         # ETF Router state
@@ -137,18 +165,28 @@ class CombinedOvernightReboundBot:
         # of the last snapshot fetch; 0.0 means "never run yet".
         self._tape_last_update_monotonic: float = 0.0
 
-        # No-trade QQQ range-breakout fallback state. This sleeve is only
-        # eligible after the primary router returns NO_TRADE and is explicitly
-        # MR-permission-neutral. It must be flat by 11:30.
-        self.no_trade_breakout_active = False
-        self.no_trade_breakout_done = False
-        self.no_trade_breakout_entered_today = False
-        self.no_trade_breakout_subtype: Optional[str] = None
-        self.no_trade_breakout_range: Optional[float] = None
-        self.no_trade_breakout_high: Optional[float] = None
-        self.no_trade_breakout_low: Optional[float] = None
-        self._no_trade_breakout_last_check_monotonic: float = 0.0
-
+        # ═══════════════════════════════════════════════════
+        # Unified System: Intraday ETF sleeve state
+        # ═══════════════════════════════════════════════════
+        # Only one intraday sleeve can be filled per day: Router > V2 > P1
+        self.intraday_etf_sleeve_filled = False  # True if any intraday ETF position taken
+        
+        # Router state extensions
+        self.router_entry_pending = False  # Entry queued at 10:00 for 10:05 execution
+        self.router_no_trade_subtype: Optional[str] = None  # Classified subtype for V2/P1 eval
+        
+        # V2 fallback state
+        self.v2_active = False
+        self.v2_direction: Optional[str] = None  # "long" or "short"
+        self.v2_trigger_price: Optional[float] = None
+        self.v2_trigger_high: Optional[float] = None
+        self.v2_trigger_low: Optional[float] = None
+        self.v2_trigger_range_pct: Optional[float] = None
+        self.v2_hybrid_checkpoint_done = False  # 11:30 decision made
+        
+        # P1 fallback state
+        self.p1_active = False
+        
         # Stage flags
         self.startup_done = False         # 9:00-9:25 startup phase
         self.tape_initialized = False     # 9:30 opens recorded
@@ -158,12 +196,7 @@ class CombinedOvernightReboundBot:
         self.scoring_done = False         # 3:50 PM scoring complete
         self.entries_done = False         # 3:50 PM entries executed
 
-        # Sleeve-specific exit flags
-        self.gdp_exits_done = False
-        self.mr_exits_done = False
-        self.red_trail_exit_submitted = False
-        self.red_trail_order_ids: Dict[str, str] = {}
-        self.red_trail_symbols: set = set()
+        # Open-exit state
         self.open_exit_plan: List[Dict[str, Any]] = []  # Frozen broker-position sell plan built after 09:25 cleanup
 
         # Morning/overnight order management
@@ -227,37 +260,31 @@ class CombinedOvernightReboundBot:
 
     def _validate_config(self):
         """Fail fast on config combinations that contradict the researched setup."""
-        total_alloc = config.MR_ALLOCATION_PCT + config.GDP_ALLOCATION_PCT
-        if abs(total_alloc - 1.0) > 1e-6:
-            raise ValueError(
-                f"Allocation must sum to 1.0, got MR={config.MR_ALLOCATION_PCT}, "
-                f"GDP={config.GDP_ALLOCATION_PCT}, total={total_alloc}"
+        # Live MR sleeve: 3 positions x 30% per position = 90% total max.
+        per_pos = float(getattr(config, "MR_ALLOC_PER_POSITION_PCT", 0.0))
+        total = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.0))
+        max_pos = int(getattr(config, "MR_MAX_PRIMARY_POSITIONS", 0))
+        if not (0.0 < per_pos <= 1.0):
+            raise ValueError(f"MR_ALLOC_PER_POSITION_PCT must be in (0, 1], got {per_pos}")
+        if not (0.0 < total <= 1.0):
+            raise ValueError(f"MR_MAX_TOTAL_ALLOCATION_PCT must be in (0, 1], got {total}")
+        if max_pos < 1:
+            raise ValueError(f"MR_MAX_PRIMARY_POSITIONS must be >= 1, got {max_pos}")
+        if per_pos * max_pos < total - 1e-6:
+            logger.warning(
+                f"MR sizing: per_pos*{max_pos}={per_pos*max_pos:.2%} < total cap {total:.0%}; "
+                f"sleeve cannot reach the configured total cap with this many positions"
             )
+
+        intraday = float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.0))
+        if not (0.0 < intraday <= 1.0):
+            raise ValueError(f"INTRADAY_ETF_ALLOCATION_PCT must be in (0, 1], got {intraday}")
 
         if _parse_config_time(config.SCORING_TIME) > _parse_config_time(config.ENTRY_TIME):
             raise ValueError(
                 f"SCORING_TIME must be <= ENTRY_TIME, got "
                 f"{config.SCORING_TIME} > {config.ENTRY_TIME}"
             )
-
-        if config.GDP_EXIT_TIME != config.MR_EXIT_TIME:
-            logger.warning(
-                f"GDP_EXIT_TIME ({config.GDP_EXIT_TIME}) != MR_EXIT_TIME ({config.MR_EXIT_TIME}); "
-                f"current bot exits both at GDP_EXIT_TIME"
-            )
-        if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
-            if getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", False):
-                raise ValueError(
-                    "ENABLE_FAST_OPEN_MARKET_EXIT and ENABLE_RED_OPEN_TRAIL_EXIT are "
-                    "mutually exclusive — fast-exit wins at 09:30 but red-trail still "
-                    "forces the 10:00 failsafe schedule. Set exactly one to True."
-                )
-            if _parse_config_time(config.RED_OPEN_TRAIL_FAILSAFE_TIME) <= _parse_config_time(config.GDP_EXIT_TIME):
-                raise ValueError(
-                    "RED_OPEN_TRAIL_FAILSAFE_TIME must be after the 09:30 exit decision"
-                )
-            if config.RED_OPEN_TRAIL_PCT <= 0:
-                raise ValueError("RED_OPEN_TRAIL_PCT must be positive")
 
     def _run(self):
         """Inner run — called by run() which wraps it with top-level error handling."""
@@ -286,15 +313,11 @@ class CombinedOvernightReboundBot:
             self.morning_exits_done = True
 
         # Pre-compute schedule times from config
-        t_exit_all     = _parse_config_time(config.GDP_EXIT_TIME)           # 09:30 (both sleeves)
-        t_failsafe     = _parse_config_time(
-            config.RED_OPEN_TRAIL_FAILSAFE_TIME
-            if getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False)
-            else config.V2_FAILSAFE_TIME
-        )
+        t_exit_all     = _parse_config_time(config.MORNING_EXIT_TIME)       # 09:30 batched market sells
+        t_failsafe     = _parse_config_time(config.V2_FAILSAFE_TIME)        # 09:45 post-exit failsafe
         t_data_collect = _parse_config_time(config.DATA_COLLECTION_TIME)    # 15:30
-        t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:50
-        t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:50
+        t_scoring      = _parse_config_time(config.SCORING_TIME)            # 15:45
+        t_entry        = _parse_config_time(config.ENTRY_TIME)              # 15:45
         t_cancel_orders = _parse_config_time(getattr(config, "MORNING_CANCEL_OPEN_ORDERS_TIME", "09:25"))
         t_premarket_start = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_START_TIME", "05:00"))
         t_premarket_final = _parse_config_time(getattr(config, "PREMARKET_DYNAMIC_FINAL_TIME", "06:00"))
@@ -384,15 +407,13 @@ class CombinedOvernightReboundBot:
                     self.premarket_dynamic_limits_done = True
                     self._save_state()
 
-                # 09:25 — cancel any resting premarket limit/trailing orders before normal exits.
+                # 09:25 — cancel any resting premarket limit orders before normal exits.
                 # Run regardless of local position state for safety.
                 if (not self.morning_open_orders_cancelled
                         and current_time >= t_cancel_orders):
                     logger.warning("09:25 order cleanup: canceling all open orders before 09:30 exits")
                     self.position_mgr.cancel_all_open_orders()
                     self.premarket_limit_order_ids.clear()
-                    self.red_trail_order_ids.clear()
-                    self.red_trail_symbols.clear()
                     self.morning_open_orders_cancelled = True
                     self._build_open_exit_plan_from_broker(reason="09:25 post-cancel broker snapshot")
                     self._save_state()
@@ -416,23 +437,10 @@ class CombinedOvernightReboundBot:
                 if has_positions and not self.morning_exits_done:
                     # 09:30 — fast open liquidation. Use the frozen 09:25 broker-position
                     # plan and submit every market sell before monitoring fills.
-                    if not self.gdp_exits_done and current_time >= t_exit_all:
-                        if getattr(config, "ENABLE_FAST_OPEN_MARKET_EXIT", True):
-                            self._submit_open_exit_market_sells()
-                            self.gdp_exits_done = True
-                            self.mr_exits_done = True
-                            self._save_state()
-                        elif getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False):
-                            self._submit_red_open_trail_or_sell_green()
-                            self.gdp_exits_done = True
-                            self.mr_exits_done = True
-                            self._save_state()
-                        else:
-                            self._exit_sleeve_positions("GDP", "09:30 all positions (GDP)")
-                            self._exit_sleeve_positions("MR", "09:30 all positions (MR)")
-                            self.gdp_exits_done = True
-                            self.mr_exits_done = True
-                            self._save_state()
+                    if current_time >= t_exit_all and not getattr(self, "_open_exit_submitted", False):
+                        self._submit_open_exit_market_sells()
+                        self._open_exit_submitted = True
+                        self._save_state()
 
                     # 09:31 — broker-native rescue pass for any remaining positions.
                     # Issue #7: this used to require gdp_exits_done AND mr_exits_done
@@ -453,10 +461,7 @@ class CombinedOvernightReboundBot:
                         self.open_market_rescue_done = True
                         self._save_state()
 
-                    # Failsafe at V2_FAILSAFE_TIME (or RED_OPEN_TRAIL_FAILSAFE_TIME).
-                    # Same hardening as the rescue: time + broker-not-flat is the
-                    # only requirement so a partial-failure 09:30 path still gets
-                    # the safety net.
+                    # 09:45 post-exit failsafe — force-flatten if broker still holds anything.
                     if (not self.post_exit_failsafe_done
                             and current_time >= t_failsafe):
                         bc = self.position_mgr.broker_position_count()
@@ -465,22 +470,13 @@ class CombinedOvernightReboundBot:
                             self._run_failsafe_flatten(f"{t_failsafe.strftime('%H:%M')} post-exit failsafe")
                         elif bc == 0:
                             logger.info("Post-exit failsafe: broker confirmed flat")
-                            if self.red_trail_order_ids:
-                                logger.warning("Broker flat at failsafe; canceling remembered trailing-stop orders")
-                                self.position_mgr.cancel_all_open_orders()
-                                self.red_trail_order_ids.clear()
-                                self.red_trail_symbols.clear()
                             self.position_mgr.reconcile_local_positions_from_broker()
                         self.post_exit_failsafe_done = True
                         self.morning_exits_done = True
                         self._save_state()
 
-                    # Early completion: allowed after the 09:30 submit time when no
-                    # trailing orders are active and the broker is confirmed flat.
-                    # No longer requires gdp_exits_done/mr_exits_done flags.
-                    if (not getattr(config, "ENABLE_RED_OPEN_TRAIL_EXIT", False)
-                            and current_time >= t_exit_all
-                            and not self.morning_exits_done):
+                    # Early completion: after 09:30 submit, when broker confirmed flat.
+                    if current_time >= t_exit_all and not self.morning_exits_done:
                         bc = self.position_mgr.broker_position_count()
                         if bc == 0:
                             logger.info("All exits complete — broker confirmed flat")
@@ -489,21 +485,29 @@ class CombinedOvernightReboundBot:
                             self._save_state()
 
             # ════════════════════════════════════════════
-            # INTRADAY ETF ROUTER (9:00 - 15:45)
+            # UNIFIED SYSTEM: Intraday ETF Sleeve (Router > V2 > P1)
+            # 90% of equity, only one sleeve per day, MR not blocked by V2/P1
             # ════════════════════════════════════════════
 
             if getattr(config, "ETF_ROUTER_ENABLED", False):
-                t_startup = _parse_config_time(getattr(config, "BOT_START_TIME", "09:00"))
+                # Unified system timeline constants
+                t_startup = _parse_config_time(getattr(config, "BOT_START_TIME", "05:00"))
                 t_market_open = _parse_config_time(getattr(config, "MARKET_OPEN_TIME", "09:30"))
                 t_router_decision = _parse_config_time(getattr(config, "ROUTER_DECISION_TIME", "10:00"))
-                t_uvxy_exit = _parse_config_time(getattr(config, "UVXY_EXIT_TIME", "11:00"))
+                t_router_entry = _parse_config_time(getattr(config, "ROUTER_ENTRY_TIME", "10:05"))
+                t_v2_start = _parse_config_time(getattr(config, "V2_LONG_ENTRY_WINDOW_START", "10:10"))
+                t_v2_end = _parse_config_time(getattr(config, "V2_LONG_ENTRY_WINDOW_END", "10:30"))
+                t_p1_entry = _parse_config_time(getattr(config, "P1_ENTRY_TIME", "10:15"))
+                t_v2_checkpoint = _parse_config_time(getattr(config, "V2_HYBRID_CHECKPOINT_TIME", "11:30"))
                 t_sqqq_exit = _parse_config_time(getattr(config, "SQQQ_EXIT_TIME", "14:00"))
                 t_tqqq_exit = _parse_config_time(getattr(config, "TQQQ_EXIT_TIME", "15:00"))
+                t_v2_final_exit = _parse_config_time(getattr(config, "V2_FINAL_EXIT_TIME", "15:30"))
+                t_intraday_flatten = _parse_config_time(getattr(config, "INTRADAY_ETF_HARD_FLATTEN_TIME", "15:30"))
 
-                # 09:00 startup - pre-market prep (allow up to 10:00 for late starts)
+                # 05:00 startup - pre-market prep (unified system starts at 5 AM)
                 if (not self.startup_done
                         and current_time >= t_startup
-                        and current_time < t_router_decision):
+                        and current_time < t_market_open):
                     self._run_startup_phase()
 
                 # 09:30 initialize ETF tape (once market opens)
@@ -512,11 +516,8 @@ class CombinedOvernightReboundBot:
                         and not self.router_decision_made
                         and current_time >= t_market_open
                         and current_time < t_router_decision):
-                    # Guard: if starting after 09:31, tape will be incomplete (missing 09:30-09:xx data)
-                    # For safety, disable router on late starts until backfill is implemented
                     if current_time > dt_time(9, 31):
                         logger.warning(f"ETF router late-start at {current_time.strftime('%H:%M')} without 09:30 tape; disabling router for today")
-                        logger.warning("Router disabled to prevent false signals from incomplete range calculations")
                         self.router_decision_made = True
                         self.router_traded_today = False
                         self.mr_blocked_today = False
@@ -532,25 +533,89 @@ class CombinedOvernightReboundBot:
                         and current_time < t_router_decision):
                     self._update_tape()
 
-                # 10:00 make router decision
+                # 10:00 make router decision (stores decision, doesn't enter yet)
                 if (self.tape_initialized
                         and not self.router_decision_made
                         and current_time >= t_router_decision):
-                    self._update_tape(force=True)  # Final tape update bypasses throttle
+                    self._update_tape(force=True)
                     self._make_router_decision()
 
-                # No-trade QQQ breakout fallback monitor. This only arms after
-                # the primary router returns NO_TRADE and does not block MR.
-                if (getattr(config, "NO_TRADE_QQQ_BREAKOUT_ENABLED", False)
-                        and self.router_decision_made
-                        and self.no_trade_breakout_active
-                        and not self.no_trade_breakout_done):
-                    self._monitor_no_trade_qqq_breakout(current_time)
+                # 10:05 execute router entry (if decision was to trade)
+                if (self.router_decision_made
+                        and self.router_entry_pending
+                        and current_time >= t_router_entry
+                        and not self.intraday_etf_sleeve_filled):
+                    self._execute_pending_router_entry()
 
-                # ETF exits use the stored planned_exit_time. This handles both
-                # original router positions and the 11:30 no-trade fallback.
+                # ═══════════════════════════════════════════════════
+                # Priority 2: V2 Fallback (only if router no-trade)
+                # ═══════════════════════════════════════════════════
+                if (getattr(config, "ENABLE_V2_FALLBACK", False)
+                        and self.router_decision_made
+                        and not self.intraday_etf_sleeve_filled
+                        and not getattr(self, "router_entry_pending", False)):
+                    
+                    # V2 Long: 10:10-10:30 window
+                    if (current_time >= t_v2_start 
+                            and current_time <= t_v2_end
+                            and not self.v2_active):
+                        if self._evaluate_v2_long(current_time):
+                            self._execute_v2_entry("long", current_time)
+                    
+                    # V2 Short: 10:15-10:30 window (if no V2 long)
+                    if (current_time >= t_v2_start.replace(minute=15)  # 10:15
+                            and current_time <= t_v2_end
+                            and not self.v2_active
+                            and not self.intraday_etf_sleeve_filled):
+                        if self._evaluate_v2_short(current_time):
+                            self._execute_v2_entry("short", current_time)
+
+                # ═══════════════════════════════════════════════════
+                # Priority 3: P1 Fallback (only if router and V2 both no-trade)
+                # ═══════════════════════════════════════════════════
+                if (getattr(config, "ENABLE_P1_FALLBACK", False)
+                        and self.router_decision_made
+                        and not self.intraday_etf_sleeve_filled
+                        and not self.v2_active):
+                    # P1 entry at 10:15 or later (Issue 3: prevent stealing V2 short priority)
+                    if current_time >= t_p1_entry and not getattr(self, "p1_entry_checked", False):
+                        if self._evaluate_p1_fallback(current_time):
+                            self._execute_p1_entry(current_time)
+                        self.p1_entry_checked = True
+
+                # ═══════════════════════════════════════════════════
+                # V2 Hybrid Checkpoint: 11:30 exit/hold decision
+                # ═══════════════════════════════════════════════════
+                if (self.v2_active 
+                        and not self.v2_hybrid_checkpoint_done
+                        and current_time >= t_v2_checkpoint):
+                    if self._evaluate_v2_hybrid_checkpoint(current_time):
+                        # Checkpoint says exit
+                        self._execute_etf_exit()
+                    self.v2_hybrid_checkpoint_done = True
+                    self._save_state()
+
+                # ═══════════════════════════════════════════════════
+                # ETF Exits (uses planned_exit_time from position)
+                # ═══════════════════════════════════════════════════
                 if self.etf_position:
                     self._check_etf_exits(current_time)
+
+                # ═══════════════════════════════════════════════════
+                # V2 Final Exit: 15:30 hard deadline
+                # ═══════════════════════════════════════════════════
+                if (self.v2_active
+                        and current_time >= t_v2_final_exit):
+                    logger.warning("V2 final exit reached at 15:30")
+                    self._execute_etf_exit()
+
+                # ═══════════════════════════════════════════════════
+                # Intraday Hard Flatten: 15:30 - all ETF must be flat
+                # ═══════════════════════════════════════════════════
+                if (current_time >= t_intraday_flatten
+                        and self.etf_position):
+                    logger.critical("Intraday hard flatten at 15:30 - forcing ETF exit")
+                    self._execute_etf_exit()
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions
@@ -564,7 +629,7 @@ class CombinedOvernightReboundBot:
                     logger.warning("Past 3:50 PM without data collection — attempting now")
                     self._step_collect_data()
 
-            # 3:50 PM — Score and rank using 9:30-15:50 bars
+            # 3:50 PM — Score and rank using 9:30-15:45 bars
             if self.data_collected and not self.scoring_done and current_time >= t_scoring:
                 self._step_score_and_rank()
 
@@ -624,12 +689,6 @@ class CombinedOvernightReboundBot:
     # MORNING EXIT METHODS
     # ════════════════════════════════════════════════════════════
 
-    def _exit_sleeve_positions(self, sleeve: str, reason: str):
-        return morning_exits.exit_sleeve_positions(self, sleeve, reason)
-
-    def _exit_single_position(self, symbol: str, reason: str):
-        return morning_exits.exit_single_position(self, symbol, reason)
-
     def _build_open_exit_plan_from_broker(self, reason: str = "broker snapshot") -> List[Dict[str, Any]]:
         return morning_exits.build_open_exit_plan_from_broker(self, reason)
 
@@ -663,12 +722,6 @@ class CombinedOvernightReboundBot:
     # ════════════════════════════════════════════════════════════
     # INFRASTRUCTURE (failsafe, state, etc.)
     # ════════════════════════════════════════════════════════════
-
-    def _position_reference_price(self, broker_pos: dict, symbol: str) -> Optional[float]:
-        return morning_exits.position_reference_price(self, broker_pos, symbol)
-
-    def _submit_red_open_trail_or_sell_green(self):
-        return morning_exits.submit_red_open_trail_or_sell_green(self)
 
     def _run_failsafe_flatten(self, label: str):
         return morning_exits.run_failsafe_flatten(self, label)
@@ -783,9 +836,6 @@ class CombinedOvernightReboundBot:
     def _run_startup_phase(self):
         return etf_router_runtime.run_startup_phase(self)
 
-    def _cancel_stale_etf_orders(self):
-        return etf_router_runtime.cancel_stale_etf_orders(self)
-
     def _initialize_tape_recording(self):
         return etf_router_runtime.initialize_tape_recording(self)
 
@@ -795,17 +845,38 @@ class CombinedOvernightReboundBot:
     def _make_router_decision(self):
         return etf_router_runtime.make_router_decision(self)
 
-    def _execute_etf_entry(self, decision):
-        return etf_router_runtime.execute_etf_entry(self, decision)
-
     def _check_etf_exits(self, current_time):
         return etf_router_runtime.check_etf_exits(self, current_time)
 
     def _execute_etf_exit(self):
         return etf_router_runtime.execute_etf_exit(self)
 
-    def _monitor_no_trade_qqq_breakout(self, current_time):
-        return etf_router_runtime.monitor_no_trade_qqq_breakout(self, current_time)
+    def _execute_pending_router_entry(self):
+        return etf_router_runtime.execute_pending_router_entry(self)
+
+    # ═══════════════════════════════════════════════════
+    # Unified System: V2 Fallback delegates
+    # ═══════════════════════════════════════════════════
+    def _evaluate_v2_long(self, current_time):
+        return v2_fallback.evaluate_v2_long(self, current_time)
+
+    def _evaluate_v2_short(self, current_time):
+        return v2_fallback.evaluate_v2_short(self, current_time)
+
+    def _execute_v2_entry(self, direction, current_time):
+        return v2_fallback.execute_v2_entry(self, direction, current_time)
+
+    def _evaluate_v2_hybrid_checkpoint(self, current_time):
+        return v2_fallback.evaluate_v2_hybrid_checkpoint(self, current_time)
+
+    # ═══════════════════════════════════════════════════
+    # Unified System: P1 Fallback delegates
+    # ═══════════════════════════════════════════════════
+    def _evaluate_p1_fallback(self, current_time):
+        return p1_fallback.evaluate_p1_fallback(self, current_time)
+
+    def _execute_p1_entry(self, current_time):
+        return p1_fallback.execute_p1_entry(self, current_time)
 
 
 
