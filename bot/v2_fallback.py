@@ -57,11 +57,16 @@ def _is_v2_subtype_allowed(subtype: Optional[str]) -> bool:
     return subtype in allowed
 
 
-def evaluate_v2_long(bot, current_time: dt_time) -> bool:
+def evaluate_v2_long(bot, current_time: dt_time, snapshots: Optional[Dict[str, dict]] = None) -> bool:
     """Evaluate V2 long entry conditions.
     
     Returns True if V2 long should fire (QQQ breaks above morning high).
     Called during 10:10-10:30 window when router returned no-trade.
+    
+    Args:
+        bot: Bot instance
+        current_time: Current time
+        snapshots: Optional pre-fetched snapshot dict (for throttled evaluation)
     """
     if not getattr(config, "ENABLE_V2_FALLBACK", False):
         return False
@@ -91,9 +96,9 @@ def evaluate_v2_long(bot, current_time: dt_time) -> bool:
         logger.info(f"V2 long: QQQ range {q_range_pct:.3%} < threshold {threshold:.3%}")
         return False
     
-    # Get current QQQ price
+    # Get current QQQ price (use provided snapshots or fetch)
     try:
-        snaps = bot.alpaca.get_snapshots(["QQQ"]) or {}
+        snaps = snapshots if snapshots is not None else bot.alpaca.get_snapshots(["QQQ"]) or {}
         q_snap = snaps.get("QQQ", {}) or {}
         q_price = q_snap.get("last_price") or q_snap.get("close")
         if not q_price:
@@ -116,11 +121,16 @@ def evaluate_v2_long(bot, current_time: dt_time) -> bool:
     return False
 
 
-def evaluate_v2_short(bot, current_time: dt_time) -> bool:
+def evaluate_v2_short(bot, current_time: dt_time, snapshots: Optional[Dict[str, dict]] = None) -> bool:
     """Evaluate V2 short entry conditions.
     
     Returns True if V2 short should fire (QQQ/SPY/IWM all break below morning lows).
     Called during 10:15-10:30 window when router returned no-trade and no V2 long.
+    
+    Args:
+        bot: Bot instance
+        current_time: Current time
+        snapshots: Optional pre-fetched snapshot dict (for throttled evaluation)
     """
     if not getattr(config, "ENABLE_V2_FALLBACK", False):
         return False
@@ -152,9 +162,9 @@ def evaluate_v2_short(bot, current_time: dt_time) -> bool:
         logger.info(f"V2 short: QQQ range {q_range_pct:.3%} < threshold {threshold:.3%}")
         return False
     
-    # Get current prices
+    # Get current prices (use provided snapshots or fetch)
     try:
-        snaps = bot.alpaca.get_snapshots(["QQQ", "SPY", "IWM"]) or {}
+        snaps = snapshots if snapshots is not None else bot.alpaca.get_snapshots(["QQQ", "SPY", "IWM"]) or {}
         q_price = snaps.get("QQQ", {}).get("last_price") or snaps.get("QQQ", {}).get("close")
         spy_price = snaps.get("SPY", {}).get("last_price") or snaps.get("SPY", {}).get("close")
         iwm_price = snaps.get("IWM", {}).get("last_price") or snaps.get("IWM", {}).get("close")

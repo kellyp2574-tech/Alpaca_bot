@@ -69,7 +69,7 @@ def step_score_and_rank(bot) -> None:
 
     try:
         today = date.today().isoformat()
-        signal_end = config.ENTRY_TIME  # 15:50
+        signal_end = config.ENTRY_TIME  # usually 15:45 in current paper/live config
 
         # 1. Fetch 9:30-15:50 minute bars for the full base universe AND
         # the MR ETF regime symbols in a single batched request (API #2:
@@ -124,13 +124,43 @@ def step_score_and_rank(bot) -> None:
         )
         filtered_mr = filter_mean_reversion_candidates(raw_mr)
 
-        # Paper-test: enforce min ADV filter explicitly (config may not be wired into scorer)
-        min_adv = getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 0)
+        # Paper-test: enforce min ADV filter explicitly.
+        # Live Alpaca IEX volume is much lower than composite volume, so apply the
+        # same multiplier used for ADV sizing/caps before comparing to the liquidity floor.
+        min_adv = float(getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 0) or 0)
+        adv_multiplier = float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0) or 1.0)
+
         if min_adv > 0:
-            filtered_mr = [
-                c for c in filtered_mr
-                if getattr(c, "adv_dollars", 0.0) >= min_adv
-            ]
+            before_adv = len(filtered_mr)
+            adv_passed = []
+            adv_rejected_sample = []
+
+            for c in filtered_mr:
+                raw_adv = float(getattr(c, "adv_dollars", 0.0) or 0.0)
+                adjusted_adv = raw_adv * adv_multiplier
+
+                if adjusted_adv >= min_adv:
+                    adv_passed.append(c)
+                elif len(adv_rejected_sample) < 10:
+                    adv_rejected_sample.append({
+                        "symbol": c.symbol,
+                        "raw_adv_dollars": round(raw_adv, 0),
+                        "adjusted_adv_dollars": round(adjusted_adv, 0),
+                        "min_required": round(min_adv, 0),
+                    })
+
+            filtered_mr = adv_passed
+
+            logger.info(
+                "MR ADV filter: %d -> %d using raw_adv * %.1f >= $%.0f",
+                before_adv,
+                len(filtered_mr),
+                adv_multiplier,
+                min_adv,
+            )
+
+            if adv_rejected_sample:
+                logger.info("MR ADV rejected sample: %s", adv_rejected_sample)
 
         # Paper-test: rank by lowest close_position when configured
         if getattr(config, "MR_RANK_BY_CLOSE_LOCATION_ONLY", False):
@@ -152,6 +182,22 @@ def step_score_and_rank(bot) -> None:
             f"passed={len(filtered_mr)}"
         )
 
+        # Better "why no MR trade" log when final candidate list is empty
+        if not filtered_mr:
+            logger.warning(
+                "MR NO-CANDIDATES after filters: raw=%d, stage_c_universe=%d, "
+                "min_adv=$%.0f, adv_multiplier=%.1f, price_range=$%.2f-$%.2f, "
+                "day_ret_max=%.2f, close_pos_max=%.2f",
+                len(raw_mr),
+                len(bot.universe),
+                float(getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 0) or 0),
+                float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0) or 1.0),
+                float(getattr(config, "MR_MIN_PRICE", 0) or 0),
+                float(getattr(config, "MR_MAX_PRICE", 0) or 0),
+                float(getattr(config, "MR_DAY_RET_MAX", 0) or 0),
+                float(getattr(config, "MR_CLOSE_POSITION_MAX", 0) or 0),
+            )
+
         bot.scoring_done = True
         bot._save_state()
 
@@ -172,6 +218,10 @@ def step_score_and_rank(bot) -> None:
 
         # Save candidates audit artifact
         def _mr_dict(c):
+            raw_adv = float(getattr(c, "adv_dollars", 0.0) or 0.0)
+            adv_multiplier = float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0) or 1.0)
+            adjusted_adv = raw_adv * adv_multiplier
+
             return {
                 "symbol": c.symbol,
                 "sleeve": "MR",
@@ -181,7 +231,9 @@ def step_score_and_rank(bot) -> None:
                 "volume_ratio": round(c.volume_ratio, 2),
                 "close_position": round(c.close_position, 3),
                 "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
-                "adv_dollars": round(c.adv_dollars, 0),
+                "adv_dollars_raw": round(raw_adv, 0),
+                "adv_multiplier": adv_multiplier,
+                "adv_dollars_adjusted": round(adjusted_adv, 0),
             }
 
         audit_dicts = {

@@ -107,6 +107,10 @@ V2_ALLOWED_SUBTYPES = [
     "LIVE_VOL_WARNING",
 ]
 
+# V2 polling cadence. The main loop ticks every 1s in the hot window,
+# but V2 does not need a fresh REST snapshot every second.
+V2_EVAL_INTERVAL_SECONDS = 10
+
 # MR subtypes that allow MR entries (router no-trade subtypes)
 # MR only runs on these subtypes that were profitable in backtest
 MR_ALLOWED_SUBTYPES = [

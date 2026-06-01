@@ -183,6 +183,8 @@ class CombinedOvernightReboundBot:
         self.v2_trigger_low: Optional[float] = None
         self.v2_trigger_range_pct: Optional[float] = None
         self.v2_hybrid_checkpoint_done = False  # 11:30 decision made
+        # V2 rate-limit protection
+        self._v2_last_eval_monotonic: float = 0.0
         
         # P1 fallback state
         self.p1_active = False
@@ -284,6 +286,17 @@ class CombinedOvernightReboundBot:
             raise ValueError(
                 f"SCORING_TIME must be <= ENTRY_TIME, got "
                 f"{config.SCORING_TIME} > {config.ENTRY_TIME}"
+            )
+
+        # IEX volume multiplier warning
+        data_feed = str(getattr(config, "DATA_FEED", "")).lower()
+        adv_multiplier = float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0) or 1.0)
+        min_adv = float(getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 0) or 0)
+
+        if data_feed == "iex" and adv_multiplier <= 1.0 and min_adv > 0:
+            logger.warning(
+                "DATA_FEED=iex but ADV_DOLLAR_MULTIPLIER <= 1.0. "
+                "MR liquidity filters may reject valid candidates."
             )
 
     def _run(self):
@@ -553,22 +566,36 @@ class CombinedOvernightReboundBot:
                 if (getattr(config, "ENABLE_V2_FALLBACK", False)
                         and self.router_decision_made
                         and not self.intraday_etf_sleeve_filled
-                        and not getattr(self, "router_entry_pending", False)):
-                    
-                    # V2 Long: 10:10-10:30 window
-                    if (current_time >= t_v2_start 
-                            and current_time <= t_v2_end
-                            and not self.v2_active):
-                        if self._evaluate_v2_long(current_time):
-                            self._execute_v2_entry("long", current_time)
-                    
-                    # V2 Short: 10:15-10:30 window (if no V2 long)
-                    if (current_time >= t_v2_start.replace(minute=15)  # 10:15
-                            and current_time <= t_v2_end
-                            and not self.v2_active
-                            and not self.intraday_etf_sleeve_filled):
-                        if self._evaluate_v2_short(current_time):
-                            self._execute_v2_entry("short", current_time)
+                        and not getattr(self, "router_entry_pending", False)
+                        and not self.v2_active):
+
+                    in_v2_window = (
+                        current_time >= t_v2_start
+                        and current_time <= t_v2_end
+                    )
+
+                    if in_v2_window:
+                        v2_interval = float(getattr(config, "V2_EVAL_INTERVAL_SECONDS", 10.0))
+                        now_mono = time.monotonic()
+
+                        if (now_mono - self._v2_last_eval_monotonic) >= v2_interval:
+                            self._v2_last_eval_monotonic = now_mono
+
+                            # Fetch combined snapshots once per V2 tick
+                            v2_snaps = self.alpaca.get_snapshots(["QQQ", "SPY", "IWM"]) or {}
+
+                            # Long can evaluate from 10:10 onward.
+                            if self._evaluate_v2_long(current_time, snapshots=v2_snaps):
+                                self._execute_v2_entry("long", current_time)
+
+                            # Short only starts at configured short window, and only if long did not fill.
+                            elif (
+                                current_time >= _parse_config_time(getattr(config, "V2_SHORT_ENTRY_WINDOW_START", "10:15"))
+                                and not self.intraday_etf_sleeve_filled
+                                and not self.v2_active
+                            ):
+                                if self._evaluate_v2_short(current_time, snapshots=v2_snaps):
+                                    self._execute_v2_entry("short", current_time)
 
                 # ═══════════════════════════════════════════════════
                 # Priority 3: P1 Fallback (only if router and V2 both no-trade)
@@ -857,11 +884,11 @@ class CombinedOvernightReboundBot:
     # ═══════════════════════════════════════════════════
     # Unified System: V2 Fallback delegates
     # ═══════════════════════════════════════════════════
-    def _evaluate_v2_long(self, current_time):
-        return v2_fallback.evaluate_v2_long(self, current_time)
+    def _evaluate_v2_long(self, current_time, snapshots=None):
+        return v2_fallback.evaluate_v2_long(self, current_time, snapshots=snapshots)
 
-    def _evaluate_v2_short(self, current_time):
-        return v2_fallback.evaluate_v2_short(self, current_time)
+    def _evaluate_v2_short(self, current_time, snapshots=None):
+        return v2_fallback.evaluate_v2_short(self, current_time, snapshots=snapshots)
 
     def _execute_v2_entry(self, direction, current_time):
         return v2_fallback.execute_v2_entry(self, direction, current_time)
