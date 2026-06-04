@@ -211,6 +211,121 @@ class PositionManager:
             logger.error(f"Buy order FAILED (network) | symbol={symbol} | qty={qty} | error={e}")
             return None, "network_error"
 
+    def submit_bracket_buy_order(
+        self,
+        symbol: str,
+        qty: int,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
+        stop_loss_pct: Optional[float] = None,
+        take_profit_pct: Optional[float] = None,
+        fill_price_hint: Optional[float] = None,
+        timeout: int = 10,
+    ) -> Tuple[Optional[dict], Optional[str]]:
+        """Submit a buy order with optional bracket (SL + TP), OTO (SL or TP only),
+        or plain order when neither SL nor TP is configured.
+
+        Alpaca order_class selection:
+          - both SL and TP → ``bracket``  (OTOCO)
+          - SL only         → ``oto``     with stop_loss leg
+          - TP only         → ``oto``     with take_profit leg
+          - neither         → plain order (no order_class field)
+
+        Args:
+            symbol: Ticker symbol.
+            qty: Shares to buy.
+            order_type: ``"market"`` or ``"limit"``.
+            limit_price: Required when ``order_type="limit"``.
+            stop_loss_pct: Fraction below fill price for the stop trigger
+                (e.g. 0.06 → stop at fill * 0.94).  None = no stop-loss leg.
+            take_profit_pct: Fraction above fill price for the limit exit
+                (e.g. 0.20 → TP limit at fill * 1.20). None = no TP leg.
+            fill_price_hint: Used to pre-compute SL/TP prices when
+                ``order_type="market"`` (Alpaca requires concrete prices
+                even for bracket market orders). Should be the current ask
+                or last price.  Ignored when ``order_type="limit"`` (we use
+                ``limit_price`` instead).
+            timeout: HTTP request timeout in seconds.
+
+        Returns:
+            (order_response, error_type) — same contract as submit_buy_order.
+        """
+        if order_type == "limit" and (limit_price is None or limit_price <= 0):
+            return None, "invalid_limit_price"
+
+        has_sl = stop_loss_pct is not None and stop_loss_pct > 0
+        has_tp = take_profit_pct is not None and take_profit_pct > 0
+
+        if (has_sl or has_tp) and fill_price_hint is None and order_type != "limit":
+            return None, "fill_price_hint_required_for_bracket_market_order"
+
+        # Reference price for computing SL/TP legs
+        ref_price = float(limit_price) if order_type == "limit" else float(fill_price_hint)
+
+        url = f"{self.base_url}/v2/orders"
+        order_data: dict = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "buy",
+            "type": order_type,
+            "time_in_force": "day",
+        }
+
+        if order_type == "limit":
+            lp = self.round_limit_price(float(limit_price))
+            decimals = 2 if lp >= 1.0 else 4
+            order_data["limit_price"] = f"{lp:.{decimals}f}"
+
+        if has_sl or has_tp:
+            if has_sl and has_tp:
+                order_data["order_class"] = "bracket"
+            else:
+                order_data["order_class"] = "oto"
+
+            if has_tp:
+                tp_price = self.round_limit_price(ref_price * (1.0 + take_profit_pct))
+                dec = 2 if tp_price >= 1.0 else 4
+                order_data["take_profit"] = {"limit_price": f"{tp_price:.{dec}f}"}
+
+            if has_sl:
+                sl_price = self.round_limit_price(ref_price * (1.0 - stop_loss_pct))
+                dec = 2 if sl_price >= 1.0 else 4
+                order_data["stop_loss"] = {"stop_price": f"{sl_price:.{dec}f}"}
+
+        try:
+            response = self.session.post(url, json=order_data, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            order_class = order_data.get("order_class", "simple")
+            sl_info = f" SL={stop_loss_pct:.1%}" if has_sl else ""
+            tp_info = f" TP={take_profit_pct:.1%}" if has_tp else ""
+            lim_info = f" @ {order_data.get('limit_price', '')}" if order_type == "limit" else ""
+            logger.info(
+                f"Buy order submitted [{order_class}]: {symbol} {order_type} x{qty}"
+                f"{lim_info}{sl_info}{tp_info} (ID: {order_id})"
+            )
+            return data, None
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "N/A"
+            body = ""
+            try:
+                body = e.response.text[:500] if e.response is not None else ""
+            except Exception:
+                body = "<unreadable>"
+            logger.error(
+                f"Buy order FAILED [{order_data.get('order_class', 'simple')}] | "
+                f"symbol={symbol} | type={order_type} | qty={qty} | "
+                f"status={status_code} | body={body}"
+            )
+            return None, f"http_{status_code}"
+        except requests.exceptions.Timeout:
+            logger.error(f"Buy order TIMEOUT | symbol={symbol} | qty={qty}")
+            return None, "timeout"
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Buy order FAILED (network) | symbol={symbol} | qty={qty} | error={e}")
+            return None, "network_error"
+
     def _verify_sell_qty(self, symbol: str, qty: int) -> int:
         """Verify broker actually holds at least ``qty`` shares of ``symbol``.
 
@@ -849,6 +964,36 @@ class PositionManager:
             return data
         symbol_set = {s.upper() for s in symbols}
         return [o for o in data if str(o.get("symbol", "")).upper() in symbol_set]
+
+    def cancel_open_sell_orders_for_symbol(self, symbol: str) -> int:
+        """Cancel all open sell-side orders for a single symbol.
+
+        Used before a scheduled or manual ETF exit to clear any resting
+        bracket/OTO TP or SL child orders.  Canceling only sell orders
+        avoids accidentally nuking unrelated buy orders on the same symbol.
+
+        Returns the number of orders successfully canceled.
+        """
+        open_orders = self.list_open_orders(symbols=[symbol])
+        if not open_orders:
+            return 0
+
+        cancelled = 0
+        for order in open_orders:
+            if str(order.get("side", "")).lower() != "sell":
+                continue
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            if self._cancel_order(order_id):
+                cancelled += 1
+                logger.info(
+                    f"cancel_open_sell_orders_for_symbol: canceled {symbol} sell order {order_id} "
+                    f"(type={order.get('type')} order_class={order.get('order_class')})"
+                )
+        if cancelled:
+            logger.warning(f"cancel_open_sell_orders_for_symbol: canceled {cancelled} sell orders for {symbol}")
+        return cancelled
 
     def cancel_orders_for_symbols(self, symbols: List[str]) -> int:
         """Cancel only open orders whose symbol is in the given list.

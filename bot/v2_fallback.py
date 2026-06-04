@@ -4,7 +4,8 @@ V2 evaluates when the primary ETF router returns NO_TRADE.
 - V2 Long: QQQ breaks above 09:30-10:00 morning high, Set C subtype, 10:10-10:30 window
 - V2 Short: QQQ/SPY/IWM all break below 09:30-10:00 lows, Set C subtype, 10:15-10:30 window
 - Entry uses 90% ETF bucket (same as router)
-- Trailing stop after entry
+- V2 Long: trailing stop after entry (V2_TRAIL_PCT=1.5%)
+- V2 Short: bracket order with SL=-2% / TP=+3% (per ETF_SL_TP["V2_SHORT"])
 - 11:30 hybrid checkpoint: exit if red or trend fails, hold if green
 - Hard exit at 15:30 if still holding
 
@@ -255,43 +256,64 @@ def execute_v2_entry(bot, direction: str, current_time: dt_time) -> bool:
             logger.warning(f"V2 {direction}: qty <= 0 for {vehicle} budget=${budget:.2f} price={sizing_price:.4f}")
             return False
         
+        # Per-branch SL/TP: V2 Long leaves trailing stop; V2 Short uses bracket
+        sl_tp_table = getattr(config, "ETF_SL_TP", {})
+        branch_key = f"V2_{direction.upper()}"  # "V2_LONG" or "V2_SHORT"
+        sl_tp = sl_tp_table.get(branch_key, {})
+        sl_pct = sl_tp.get("sl")
+        tp_pct = sl_tp.get("tp")
+
         # Submit order
         slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
             order_type = "limit"
             logger.warning(
-                f"V2 {direction.upper()} BUY {vehicle} qty={qty} ask={ask} last={last} limit={limit_price:.4f}"
+                f"V2 {direction.upper()} BUY {vehicle} qty={qty} ask={ask} last={last} "
+                f"limit={limit_price:.4f} SL={sl_pct} TP={tp_pct}"
             )
-            order, error_type = bot.position_mgr.submit_buy_order(
-                vehicle, qty, order_type="limit", limit_price=limit_price, timeout=5
+            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+                vehicle, qty,
+                order_type="limit", limit_price=limit_price,
+                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
+                timeout=5,
             )
         else:
             order_type = "market"
-            order, error_type = bot.position_mgr.submit_buy_order(vehicle, qty, timeout=5)
-        
+            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+                vehicle, qty,
+                order_type="market",
+                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
+                fill_price_hint=float(last),
+                timeout=5,
+            )
+            limit_price = None
+
         if not order or not order.get("id"):
             logger.error(f"V2 {direction} buy failed for {vehicle}: {error_type}")
             return False
-        
+
         # Wait for fill
         fill = bot.position_mgr.get_order_fill(order["id"], max_wait=10)
         if not fill or int(fill.get("filled_qty", 0)) <= 0:
             logger.warning(f"V2 {direction} buy not filled for {vehicle}; canceling")
             bot.position_mgr._cancel_order(order["id"])
             return False
-        
+
         filled_qty = int(fill["filled_qty"])
         fill_price = float(fill.get("filled_avg_price", last))
-        
-        # Submit trailing stop
-        trail_pct = float(getattr(config, "V2_TRAIL_PCT", 1.50))
-        trailing_order = bot.position_mgr.submit_trailing_stop_sell_order(vehicle, filled_qty, trail_pct)
-        trailing_id = trailing_order.get("id") if trailing_order else None
-        
-        if not trailing_id:
-            logger.error(f"V2 {direction}: trailing stop submit failed for {vehicle}; will use hard exit")
-        
+
+        # V2 Long: trailing stop (unchanged per backtest table)
+        # V2 Short: bracket handles exits, no trailing stop
+        trailing_id = None
+        trail_pct = None
+        if direction == "long":
+            trail_pct = float(getattr(config, "V2_TRAIL_PCT", 1.50))
+            trailing_order = bot.position_mgr.submit_trailing_stop_sell_order(vehicle, filled_qty, trail_pct)
+            trailing_id = trailing_order.get("id") if trailing_order else None
+            if not trailing_id:
+                logger.error(f"V2 long: trailing stop submit failed for {vehicle}; will use hard exit")
+
         # Record position
         bot.etf_position = {
             "symbol": vehicle,
@@ -305,6 +327,9 @@ def execute_v2_entry(bot, direction: str, current_time: dt_time) -> bool:
             "entry_limit_price": limit_price if order_type == "limit" else None,
             "trailing_stop_order_id": trailing_id,
             "trail_percent": trail_pct,
+            "bracket_order_id": order.get("id") if (sl_pct or tp_pct) else None,
+            "sl_pct": sl_pct,
+            "tp_pct": tp_pct,
             "mr_blocking": False,  # V2 does NOT block MR
             "trigger_price": getattr(bot, "v2_trigger_price", None),
             "trigger_high": getattr(bot, "v2_trigger_high", None),
@@ -315,10 +340,10 @@ def execute_v2_entry(bot, direction: str, current_time: dt_time) -> bool:
         bot.v2_active = True
         bot.v2_direction = direction
         bot.intraday_etf_sleeve_filled = True  # Mark that we've used the intraday sleeve
-        
+
         logger.warning(
             f"V2 {direction.upper()} POSITION OPENED: {vehicle} qty={filled_qty} "
-            f"fill={fill_price:.4f} trail={trail_pct:.2f}% exit=15:30 MR_ALLOWED=True"
+            f"fill={fill_price:.4f} trail={trail_pct} SL={sl_pct} TP={tp_pct} exit=15:30 MR_ALLOWED=True"
         )
         bot._save_state()
         return True

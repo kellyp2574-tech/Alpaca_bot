@@ -5,7 +5,7 @@ P1 evaluates when both the primary ETF router AND V2 fallback return NO_TRADE.
 - Entry at 10:15, exit at 15:00
 - Vehicle: TQQQ
 - Uses 90% ETF bucket (same as router and V2)
-- NO trailing stop (simple time-based exit)
+- Bracket order with SL=-4% / TP=+5% (per ETF_SL_TP["P1_FALLBACK"]);
 
 Every function takes the orchestrator instance (`bot`) as first argument
 and mutates state directly. State ownership stays with the orchestrator.
@@ -125,38 +125,55 @@ def execute_p1_entry(bot, current_time: dt_time) -> bool:
             logger.warning(f"P1: qty <= 0 for {vehicle} budget=${budget:.2f} price={sizing_price:.4f}")
             return False
         
+        # Per-branch SL/TP from config
+        sl_tp_table = getattr(config, "ETF_SL_TP", {})
+        sl_tp = sl_tp_table.get("P1_FALLBACK", {})
+        sl_pct = sl_tp.get("sl")
+        tp_pct = sl_tp.get("tp")
+
         # Submit order
         slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
             order_type = "limit"
             logger.warning(
-                f"P1 BUY {vehicle} qty={qty} ask={ask} last={last} limit={limit_price:.4f}"
+                f"P1 BUY {vehicle} qty={qty} ask={ask} last={last} "
+                f"limit={limit_price:.4f} SL={sl_pct} TP={tp_pct}"
             )
-            order, error_type = bot.position_mgr.submit_buy_order(
-                vehicle, qty, order_type="limit", limit_price=limit_price, timeout=5
+            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+                vehicle, qty,
+                order_type="limit", limit_price=limit_price,
+                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
+                timeout=5,
             )
         else:
             order_type = "market"
-            order, error_type = bot.position_mgr.submit_buy_order(vehicle, qty, timeout=5)
-        
+            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+                vehicle, qty,
+                order_type="market",
+                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
+                fill_price_hint=float(last),
+                timeout=5,
+            )
+            limit_price = None
+
         if not order or not order.get("id"):
             logger.error(f"P1 buy failed for {vehicle}: {error_type}")
             return False
-        
+
         # Wait for fill
         fill = bot.position_mgr.get_order_fill(order["id"], max_wait=10)
         if not fill or int(fill.get("filled_qty", 0)) <= 0:
             logger.warning(f"P1 buy not filled for {vehicle}; canceling")
             bot.position_mgr._cancel_order(order["id"])
             return False
-        
+
         filled_qty = int(fill["filled_qty"])
         fill_price = float(fill.get("filled_avg_price", last))
-        
-        # P1 does NOT use trailing stop - simple time-based exit at 15:00
+
+        # P1 uses bracket order (SL/TP via submit_bracket_buy_order); hard time exit at 15:00 is fallback
         exit_t = _parse_hhmm(getattr(config, "P1_EXIT_TIME", "15:00"))
-        
+
         # Record position
         bot.etf_position = {
             "symbol": vehicle,
@@ -170,6 +187,9 @@ def execute_p1_entry(bot, current_time: dt_time) -> bool:
             "entry_limit_price": limit_price if order_type == "limit" else None,
             "trailing_stop_order_id": None,  # No trailing stop for P1
             "trail_percent": None,
+            "bracket_order_id": order.get("id") if (sl_pct or tp_pct) else None,
+            "sl_pct": sl_pct,
+            "tp_pct": tp_pct,
             "mr_blocking": False,  # P1 does NOT block MR
         }
         bot.p1_active = True

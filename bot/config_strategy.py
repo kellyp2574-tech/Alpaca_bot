@@ -113,16 +113,47 @@ V2_EVAL_INTERVAL_SECONDS = 10
 
 # MR subtypes that allow MR entries (router no-trade subtypes)
 # MR only runs on these subtypes that were profitable in backtest
+# LIVE_FLAT_CHOP included: router logs "MR allowed at 15:45" on no-trade days,
+# and LIVE_FLAT_CHOP is the default no-trade subtype on flat/range-bound days.
 MR_ALLOWED_SUBTYPES = [
     "LIVE_VOL_WARNING",
     "LIVE_MILD_RISK_OFF",
     "LIVE_BULLISH_MESSY",
     "LIVE_CRASH_WARNING",
+    "LIVE_FLAT_CHOP",
 ]
 
 V2_TRAIL_PCT = 1.50                # 1.5% trailing stop attached after V2 entry
 V2_LONG_VEHICLE = "TQQQ"
 V2_SHORT_VEHICLE = "SPXU"
+
+# ═══════════════════════════════════════════════════
+# Per-branch Stop-Loss / Take-Profit (bracket orders)
+# ═══════════════════════════════════════════════════
+# All values are fractions of fill price (e.g. 0.06 = 6%).
+# None = that leg is omitted (use OTO with only one side, or plain market).
+# Alpaca requires take_profit.limit_price > stop_loss.stop_price for buy orders.
+#
+# Sleeve          SL       TP     Notes
+# A++ long       -6%      +20%   Highest conviction; wide TP
+# A long         -6%      None   TP hurt this sleeve; stop only
+# A- long        None     None   Only 28 trades, leave baseline
+# A- weak        None     None   Only 17 trades, leave baseline
+# SQQQ Goldilocks None    +3%    TP only; no stop
+# P1 Sleeve      -4%      +5%    Strongest branch-specific result
+# V2 Long        None     None   Already has trailing stop; leave unchanged
+# V2 Short       -2%      +3%    Improve only if paper test confirms
+ETF_SL_TP: dict = {
+    "A_PLUS_PLUS_LONG":  {"sl": 0.06,  "tp": 0.20},
+    "A_LONG":            {"sl": 0.06,  "tp": None},
+    "A_MINUS_LONG":      {"sl": None,  "tp": None},
+    "A_MINUS_WEAK":      {"sl": None,  "tp": None},
+    "SQQQ_GOLDILOCKS":   {"sl": None,  "tp": 0.03},
+    "UVXY_CRASH":        {"sl": None,  "tp": None},
+    "P1_FALLBACK":       {"sl": 0.04,  "tp": 0.05},
+    "V2_LONG":           {"sl": None,  "tp": None},
+    "V2_SHORT":          {"sl": 0.02,  "tp": 0.03},
+}
 
 # ═══════════════════════════════════════════════════
 # P1 Fallback (lowest priority intraday)

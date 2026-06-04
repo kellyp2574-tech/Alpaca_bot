@@ -485,22 +485,37 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
 
         # Marketable limit (issue #6): bound slippage above the ask.
         slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
+
+        # Per-branch SL/TP from config
+        sl_tp_table = getattr(config, "ETF_SL_TP", {})
+        branch_key = decision.branch.value  # e.g. "A_PLUS_PLUS_LONG"
+        sl_tp = sl_tp_table.get(branch_key, {})
+        sl_pct = sl_tp.get("sl")   # None or float (e.g. 0.06)
+        tp_pct = sl_tp.get("tp")   # None or float (e.g. 0.20)
+
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
             order_type = "limit"
             logger.info(
                 f"ETF entry {symbol}: qty={qty}, bid={bid}, ask={ask}, "
                 f"last={last_price}, marketable_limit={limit_price:.4f} "
-                f"(ask + {slippage_pct:.2%})"
+                f"(ask + {slippage_pct:.2%}) SL={sl_pct} TP={tp_pct}"
             )
-            order, error_type = bot.position_mgr.submit_buy_order(
-                symbol, qty, order_type="limit", limit_price=limit_price,
+            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+                symbol, qty,
+                order_type="limit", limit_price=limit_price,
+                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
             )
         else:
             # No ask available — falls back to market order. Should be
             # rare after the execution gate, kept as a defensive path.
             logger.warning(f"ETF entry {symbol}: no ask after gate — using market order")
-            order, error_type = bot.position_mgr.submit_buy_order(symbol, qty)
+            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+                symbol, qty,
+                order_type="market",
+                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
+                fill_price_hint=float(last_price),
+            )
             limit_price = None
             order_type = "market"
 
@@ -520,8 +535,14 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
                     "branch": decision.branch.value,
                     "planned_exit_time": decision.exit_time.isoformat() if decision.exit_time else None,
                     "order_id": order.get("id"),
+                    "bracket_order_id": order.get("id"),  # same ID; legs are children
+                    "sl_pct": sl_pct,
+                    "tp_pct": tp_pct,
                 }
-                logger.info(f"ETF position opened: {symbol} {filled_qty} shares @ ${fill_price:.2f}")
+                logger.info(
+                    f"ETF position opened: {symbol} {filled_qty} shares @ ${fill_price:.2f} "
+                    f"SL={sl_pct} TP={tp_pct}"
+                )
             else:
                 logger.warning(f"ETF entry not filled for {symbol}; canceling and leaving flat")
                 bot.position_mgr._cancel_order(order["id"])
@@ -586,6 +607,24 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
     if not planned_exit:
         return
 
+    # Bracket early-exit detection: if a SL or TP leg already filled, the
+    # broker will show no position even before the scheduled exit time.
+    bracket_id = bot.etf_position.get("bracket_order_id")
+    if bracket_id:
+        try:
+            broker_pos = bot.position_mgr.get_broker_position(symbol)
+            if broker_pos is bot.position_mgr.BROKER_NOT_FOUND:
+                logger.info(
+                    f"ETF bracket: broker shows no {symbol} position — "
+                    f"SL/TP leg triggered. Clearing local state."
+                )
+                _clear_etf_sleeve_flags(bot)
+                bot.etf_position = None
+                bot._save_state()
+                return
+        except Exception as e:
+            logger.warning(f"ETF bracket position check failed: {e}")
+
     # Parse planned exit time
     try:
         if isinstance(planned_exit, str):
@@ -625,28 +664,16 @@ def _clear_etf_sleeve_flags(bot) -> None:
 
 
 def execute_etf_exit(bot) -> None:
-    """Execute ETF exit order with fill confirmation and duplicate guard.
-    
-    Issue 4: Cancel V2 trailing stop before manual market exit to prevent order conflicts.
-    """
+    """Execute ETF exit order with fill confirmation and duplicate guard."""
     if not bot.etf_position:
         return
 
     symbol = bot.etf_position.get("symbol")
     qty = bot.etf_position.get("qty", 0)
 
-    # Cancel V2 trailing stop if present (Issue 4)
-    trail_id = bot.etf_position.get("trailing_stop_order_id")
-    if trail_id:
-        logger.info(f"ETF exit: canceling trailing stop {trail_id} before market exit")
-        try:
-            bot.position_mgr._cancel_order(trail_id)
-            bot.etf_position["trailing_stop_order_id"] = None
-            bot._save_state()
-        except Exception as e:
-            logger.warning(f"ETF exit: failed to cancel trailing stop {trail_id}: {e}")
-
-    # Check if exit order already submitted (duplicate guard)
+    # ── Step 1: duplicate guard ──────────────────────────────────────────────
+    # Must come BEFORE the open-sell sweep. If we already submitted the exit
+    # order, we must not cancel it and then get confused by its absence.
     existing_exit_id = bot.etf_position.get("exit_order_id")
     exit_submitted_at = bot.etf_position.get("exit_submitted_at")
 
@@ -664,7 +691,7 @@ def execute_etf_exit(bot) -> None:
             else:
                 remaining = qty - filled_qty
                 bot.etf_position["qty"] = remaining
-                bot.etf_position["exit_order_id"] = None  # Clear to allow retry
+                bot.etf_position["exit_order_id"] = None
                 logger.warning(f"ETF exit partial fill: {symbol} {filled_qty}/{qty}, {remaining} remaining")
                 bot._save_state()
             return
@@ -691,6 +718,22 @@ def execute_etf_exit(bot) -> None:
         logger.info(f"ETF exit order {existing_exit_id} still pending; waiting for fill")
         return
 
+    # ── Step 2: cancel resting broker-side exit legs ─────────────────────────
+    # Only reached on the FIRST submission attempt (no exit_order_id yet).
+    # Sweeps all open sell orders for the symbol: trailing stops, bracket TP/SL
+    # legs, OTO legs — whatever Alpaca has resting. Safe because we have not yet
+    # submitted our own exit order, so nothing to accidentally self-cancel.
+    try:
+        cancelled = bot.position_mgr.cancel_open_sell_orders_for_symbol(symbol)
+        if cancelled:
+            logger.info(f"ETF exit: canceled {cancelled} open sell orders for {symbol} before scheduled exit")
+        bot.etf_position["trailing_stop_order_id"] = None
+        bot.etf_position["bracket_order_id"] = None
+        bot._save_state()
+    except Exception as e:
+        logger.warning(f"ETF exit: failed to cancel open sell orders for {symbol}: {e}")
+
+    # ── Step 3: submit the scheduled market sell ─────────────────────────────
     logger.info(f"Executing ETF exit: {symbol} {qty} shares")
 
     try:

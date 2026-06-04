@@ -255,13 +255,9 @@ def step_execute_entries(bot) -> None:
         return
 
     # Check MR subtype allowlist (Issue 2)
-    # MR only runs on specific router no-trade subtypes that were profitable in backtest
-    allowed_mr_subtypes = set(getattr(config, "MR_ALLOWED_SUBTYPES", [
-        "LIVE_VOL_WARNING",
-        "LIVE_MILD_RISK_OFF",
-        "LIVE_BULLISH_MESSY",
-        "LIVE_CRASH_WARNING",
-    ]))
+    # MR only runs on specific router no-trade subtypes that were profitable in backtest.
+    # Source of truth is MR_ALLOWED_SUBTYPES in config_strategy.py — do NOT hardcode here.
+    allowed_mr_subtypes = set(getattr(config, "MR_ALLOWED_SUBTYPES", []))
     subtype = getattr(bot, "router_no_trade_subtype", None)
     if subtype not in allowed_mr_subtypes:
         logger.info(f"MR entries skipped: subtype={subtype} not in allowed set {allowed_mr_subtypes}")
