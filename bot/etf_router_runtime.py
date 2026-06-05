@@ -391,11 +391,13 @@ def make_router_decision(bot) -> None:
     bot.mr_blocked_today = decision.mr_blocked()
 
     logger.info(f"Router decision: {decision.branch.value}")
-    logger.info(f"MR blocked today: {bot.mr_blocked_today}")
+    logger.info(
+        f"Router signal fired: mr_blocked_today={bot.mr_blocked_today} "
+        f"(MR will only be blocked if ETF entry actually fills)"
+    )
 
     if decision.symbol:
-        logger.info(f"Selected ETF: {decision.symbol}")
-        logger.info(f"Entry: {decision.entry_time}, Exit: {decision.exit_time}")
+        logger.info(f"Selected ETF: {decision.symbol} (planned exit: {decision.exit_time})")
         # Kill-switch gate (issue #5): block 10:00 ETF entry if the
         # daily-loss circuit breaker has tripped.
         if bot._check_daily_loss_kill_switch():
@@ -404,10 +406,16 @@ def make_router_decision(bot) -> None:
                 f"branch={decision.branch.value} would have bought {decision.symbol}"
             )
         else:
-            # In unified system, entry happens at ROUTER_ENTRY_TIME (10:05), not immediately
-            # Store the decision for later entry
+            # In unified system, entry happens ROUTER_ENTRY_DELAY_MINUTES after the decision.
             bot.router_entry_pending = True
-            logger.info(f"Router entry queued for 10:05: {decision.symbol}")
+            delay_min = int(getattr(config, "ROUTER_ENTRY_DELAY_MINUTES", 5))
+            entry_min = now.hour * 60 + now.minute + delay_min
+            queued_time_str = f"{entry_min // 60:02d}:{entry_min % 60:02d}"
+            logger.info(
+                f"Router entry queued: {decision.symbol} "
+                f"(decision={now.strftime('%H:%M')}, entry={queued_time_str}, "
+                f"delay={delay_min}min, planned_exit={decision.exit_time})"
+            )
     else:
         # No-trade path: classify subtype for V2/P1 fallback evaluation
         subtype = classify_no_trade_live_subtype(bot)
@@ -454,16 +462,37 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
         snap = snapshots.get(symbol, {}) or {}
 
         # Execution gate (issue #4): tight spread, fresh quote, require quote.
+        # ETF_ENTRY_MAX_STALE_SECONDS is 60s for router ETFs (IEX latency is normal).
+        # A quote age between ETF_ENTRY_WARN_STALE_SECONDS and the max is a warning, not a rejection.
         orderable, exec_rejected = filter_execution_ready(
             [symbol], snapshots,
             max_spread_pct=float(getattr(config, "ETF_ENTRY_MAX_SPREAD_PCT", 0.005)),
             require_quote=True,
-            max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 10.0)),
+            max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 60.0)),
         )
         if symbol not in orderable:
             reason = exec_rejected.get(symbol, "unknown")
             logger.warning(f"ETF entry REJECTED for {symbol}: {reason}")
             return
+
+        # Warn if quote is somewhat stale but still within the acceptance window
+        warn_stale = float(getattr(config, "ETF_ENTRY_WARN_STALE_SECONDS", 30.0))
+        ts_raw = snap.get("timestamp") or snap.get("last_trade_timestamp")
+        if ts_raw and warn_stale > 0:
+            try:
+                from datetime import timezone as _tz
+                ts_str = ts_raw.replace("Z", "+00:00") if isinstance(ts_raw, str) else None
+                ts = datetime.fromisoformat(ts_str) if ts_str else ts_raw
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_tz.utc)
+                age = (datetime.now(_tz.utc) - ts).total_seconds()
+                if age > warn_stale:
+                    logger.warning(
+                        f"ETF entry {symbol}: quote is {age:.0f}s old "
+                        f"(>{warn_stale:.0f}s warn threshold) — proceeding on IEX latency tolerance"
+                    )
+            except Exception:
+                pass
 
         ask = snap.get("ask")
         bid = snap.get("bid")

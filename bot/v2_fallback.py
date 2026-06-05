@@ -238,11 +238,26 @@ def execute_v2_entry(bot, direction: str, current_time: dt_time) -> bool:
             [vehicle], snapshots,
             max_spread_pct=float(getattr(config, "ETF_ENTRY_MAX_SPREAD_PCT", 0.005)),
             require_quote=True,
-            max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 10.0)),
+            max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 60.0)),
         )
         if vehicle not in orderable:
             logger.warning(f"V2 {direction} entry rejected for {vehicle}: {rejected.get(vehicle, 'unknown')}")
             return False
+
+        warn_stale = float(getattr(config, "ETF_ENTRY_WARN_STALE_SECONDS", 30.0))
+        ts_raw = snap.get("timestamp") or snap.get("last_trade_timestamp")
+        if ts_raw:
+            try:
+                from datetime import timezone as _tz
+                ts_str = ts_raw.replace("Z", "+00:00") if isinstance(ts_raw, str) else None
+                ts = datetime.fromisoformat(ts_str) if ts_str else ts_raw
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_tz.utc)
+                age = (datetime.now(_tz.utc) - ts).total_seconds()
+                if age > warn_stale:
+                    logger.warning(f"V2 {direction} {vehicle}: quote is {age:.0f}s old — proceeding on IEX latency tolerance")
+            except Exception:
+                pass
         
         ask = snap.get("ask")
         last = snap.get("last_price") or snap.get("close")

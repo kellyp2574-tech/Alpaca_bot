@@ -33,7 +33,7 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 # ═══════════════════════════════════════════════════
 ETF_ROUTER_ENABLED = True
 MR_OVERNIGHT_ENABLED = True
-MR_PERMISSION_MODE = "skip_if_router_traded"  # "skip_if_router_traded" or "all_regimes"
+MR_PERMISSION_MODE = "skip_if_router_position"  # "skip_if_router_position" = only block when ETF filled; "all_regimes" = never block
 
 # ═══════════════════════════════════════════════════
 # Capital allocation — LIVE CONSTANTS
@@ -55,6 +55,10 @@ ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"]
 
 # Tape recording cadence — once every N seconds.
 ETF_TAPE_UPDATE_INTERVAL_SECONDS = 5
+
+# How many minutes after the 10:00 decision to actually submit the entry order.
+# Keeps entry in a predictable place for logging and scheduling.
+ROUTER_ENTRY_DELAY_MINUTES = 5  # 10:00 decision → 10:05 entry
 
 # ═══════════════════════════════════════════════════
 # Position sizing (waterfall allocation)
@@ -84,7 +88,11 @@ ENTRY_MAX_SLIPPAGE_PCT = 0.02          # Marketable-limit cap above ask for low-
 # ETF router 10:00 entry uses tighter caps (highly-liquid universe)
 ETF_ENTRY_MAX_SPREAD_PCT = 0.005
 ETF_ENTRY_MAX_SLIPPAGE_PCT = 0.005
-ETF_ENTRY_MAX_STALE_SECONDS = 10.0
+# Staleness threshold for router/V2/P1 ETF entries (IEX can be 10-30s behind SIP).
+# A 12-second-old quote on UVXY is normal — do not reject liquid ETFs on IEX latency.
+ETF_ENTRY_MAX_STALE_SECONDS = 60.0
+# Log a warning when quote age exceeds this but still allow entry.
+ETF_ENTRY_WARN_STALE_SECONDS = 30.0
 
 # ═══════════════════════════════════════════════════
 # V2 Fallback (Router > V2 > P1 priority)

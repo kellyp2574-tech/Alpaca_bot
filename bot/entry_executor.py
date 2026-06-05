@@ -234,17 +234,18 @@ def step_execute_entries(bot) -> None:
         bot.entries_done = True
         bot._save_state()
 
-    # Check MR permission - blocked if ETF router signal fired today
-    # Note: MR is blocked even if ETF entry failed (regime protection)
-    if bot.mr_blocked_today or bot.router_traded_today:
+    # Check MR permission — block ONLY if router actually has/had a filled position.
+    # A router signal that was rejected (failed execution gate, stale quote, etc.)
+    # must NOT block MR.  Only a confirmed fill is a regime conflict.
+    has_etf_position = bot.etf_position is not None
+    intraday_etf_filled = getattr(bot, "intraday_etf_sleeve_filled", False)
+    if has_etf_position or intraday_etf_filled:
         branch = bot.router_branch or "unknown"
-        has_etf_position = bot.etf_position is not None
         logger.info(
-            "MR entries BLOCKED - ETF router signal fired today (branch=%s, has_position=%s)",
-            branch, has_etf_position,
+            "MR entries BLOCKED — router/V2/P1 has a live or filled intraday ETF position "
+            "(branch=%s, has_position=%s, sleeve_filled=%s)",
+            branch, has_etf_position, intraday_etf_filled,
         )
-        logger.info("MR blocked because router signal fired; ETF position may or may not have filled")
-        logger.info("Skipping MR candidate scan and entry")
         mark_entries_done_and_save()
         return
 
