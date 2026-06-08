@@ -113,6 +113,22 @@ def submit_open_exit_market_sells(bot) -> None:
         if not symbol or qty <= 0:
             continue
 
+        # Duplicate-sell guard: if a sell order already exists (e.g. bot
+        # restarted after submitting but before broker confirmed flat),
+        # skip re-submitting to avoid doubling the sell quantity.
+        try:
+            open_orders = bot.position_mgr.list_open_orders(symbols=[symbol])
+            if open_orders and any(
+                str(o.get("side", "")).lower() == "sell" for o in open_orders
+            ):
+                logger.warning(
+                    "OPEN_EXIT: sell already open for %s — skipping duplicate submit", symbol
+                )
+                bot.sold_today.add(symbol)
+                continue
+        except Exception:
+            logger.warning("OPEN_EXIT: could not check open orders for %s; submitting anyway", symbol, exc_info=True)
+
         submit_start = datetime.now(_ET)
         t0 = time.perf_counter()
         try:
@@ -163,6 +179,7 @@ def submit_open_exit_market_sells(bot) -> None:
         logger.warning("OPEN_EXIT: broker confirmed flat after batch submit")
         bot.position_mgr.positions.clear()
         bot.open_exit_plan = []
+        bot.overnight_etf_position = None
     elif remaining > 0:
         logger.warning("OPEN_EXIT: broker still shows %d positions after batch submit; failsafe will retry", remaining)
     else:
@@ -256,6 +273,7 @@ def run_failsafe_flatten(bot, label: str) -> None:
     remaining = bot.position_mgr.broker_position_count()
     if remaining == 0:
         bot.position_mgr.positions.clear()
+        bot.overnight_etf_position = None
         logger.warning(f"{label}: broker confirmed flat — local state cleared")
     elif remaining < 0:
         logger.error(f"{label}: broker API unreachable after failsafe — cannot confirm flat")

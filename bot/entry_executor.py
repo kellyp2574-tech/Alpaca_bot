@@ -242,7 +242,7 @@ def step_execute_entries(bot) -> None:
     if has_etf_position or intraday_etf_filled:
         branch = bot.router_branch or "unknown"
         logger.info(
-            "MR entries BLOCKED — router/V2/P1 has a live or filled intraday ETF position "
+            "MR entries BLOCKED — intraday ETF position confirmed "
             "(branch=%s, has_position=%s, sleeve_filled=%s)",
             branch, has_etf_position, intraday_etf_filled,
         )
@@ -252,23 +252,6 @@ def step_execute_entries(bot) -> None:
     # Check if MR is enabled in config
     if not getattr(config, "MR_OVERNIGHT_ENABLED", True):
         logger.info("MR entries DISABLED in config - skipping")
-        mark_entries_done_and_save()
-        return
-
-    # Check MR subtype allowlist (Issue 2)
-    # MR only runs on specific router no-trade subtypes that were profitable in backtest.
-    # Source of truth is MR_ALLOWED_SUBTYPES in config_strategy.py — do NOT hardcode here.
-    allowed_mr_subtypes = set(getattr(config, "MR_ALLOWED_SUBTYPES", []))
-    subtype = getattr(bot, "router_no_trade_subtype", None)
-    if subtype not in allowed_mr_subtypes:
-        logger.info(f"MR entries skipped: subtype={subtype} not in allowed set {allowed_mr_subtypes}")
-        mark_entries_done_and_save()
-        return
-
-    # Early close guard (Issue 5)
-    from bot.etf_router_runtime import is_early_close
-    if is_early_close() and getattr(config, "SKIP_MR_ON_EARLY_CLOSE", True):
-        logger.warning("MR entries skipped: early close day with SKIP_MR_ON_EARLY_CLOSE=True")
         mark_entries_done_and_save()
         return
 

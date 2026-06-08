@@ -82,11 +82,8 @@ def save_state(bot) -> None:
             "date": datetime.now(_ET).strftime("%Y-%m-%d"),
             "morning_exits_done": bot.morning_exits_done,
             "open_exit_plan": bot.open_exit_plan,
+            "open_exit_submitted": getattr(bot, "open_exit_submitted", False),
             "morning_open_orders_cancelled": bot.morning_open_orders_cancelled,
-            "premarket_dynamic_limits_done": bot.premarket_dynamic_limits_done,
-            "premarket_limit_order_ids": bot.premarket_limit_order_ids,
-            "premarket_decided_symbols": list(bot.premarket_decided_symbols),
-            "premarket_checkpoints_done": list(bot.premarket_checkpoints_done),
             "open_market_rescue_done": bot.open_market_rescue_done,
             "end_of_day_reports_done": bot.end_of_day_reports_done,
             "post_exit_failsafe_done": bot.post_exit_failsafe_done,
@@ -106,18 +103,13 @@ def save_state(bot) -> None:
             "startup_done": bot.startup_done,
             "tape_initialized": bot.tape_initialized,
             "router_decision_made": bot.router_decision_made,
-            # Unified System: Intraday ETF sleeve state
+            # Intraday ETF sleeve state
             "intraday_etf_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
-            "router_entry_pending": getattr(bot, "router_entry_pending", False),
-            "router_no_trade_subtype": getattr(bot, "router_no_trade_subtype", None),
-            "v2_active": getattr(bot, "v2_active", False),
-            "v2_direction": getattr(bot, "v2_direction", None),
-            "v2_trigger_price": getattr(bot, "v2_trigger_price", None),
-            "v2_trigger_high": getattr(bot, "v2_trigger_high", None),
-            "v2_trigger_low": getattr(bot, "v2_trigger_low", None),
-            "v2_trigger_range_pct": getattr(bot, "v2_trigger_range_pct", None),
-            "v2_hybrid_checkpoint_done": getattr(bot, "v2_hybrid_checkpoint_done", False),
-            "p1_active": getattr(bot, "p1_active", False),
+            "router_decision_1010_made": getattr(bot, "router_decision_1010_made", False),
+            # Overnight ETF sleeve state
+            "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
+            "overnight_etf_position": getattr(bot, "overnight_etf_position", None),
+            "overnight_etf_decision_made": getattr(bot, "overnight_etf_decision_made", False),
         }
         bot.state_mgr.save_bot_state(bot_state)
     except Exception as e:
@@ -141,18 +133,13 @@ def load_state(bot) -> None:
         bot.startup_done = False
         bot.tape_initialized = False
         bot.router_decision_made = False
-        # Unified System: reset intraday ETF sleeve state
+        # Intraday ETF sleeve state
         bot.intraday_etf_sleeve_filled = False
-        bot.router_entry_pending = False
-        bot.router_no_trade_subtype = None
-        bot.v2_active = False
-        bot.v2_direction = None
-        bot.v2_trigger_price = None
-        bot.v2_trigger_high = None
-        bot.v2_trigger_low = None
-        bot.v2_trigger_range_pct = None
-        bot.v2_hybrid_checkpoint_done = False
-        bot.p1_active = False
+        bot.router_decision_1010_made = False
+        # Overnight ETF sleeve state
+        bot.overnight_etf_fired = False
+        bot.overnight_etf_position = None
+        bot.overnight_etf_decision_made = False
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -175,11 +162,8 @@ def load_state(bot) -> None:
             f"{bot.kill_switch_reason}. All entries remain blocked."
         )
     bot.open_exit_plan = bot_state.get("open_exit_plan", [])
+    bot.open_exit_submitted = bot_state.get("open_exit_submitted", False)
     bot.morning_open_orders_cancelled = bot_state.get("morning_open_orders_cancelled", False)
-    bot.premarket_dynamic_limits_done = bot_state.get("premarket_dynamic_limits_done", False)
-    bot.premarket_limit_order_ids = bot_state.get("premarket_limit_order_ids", {})
-    bot.premarket_decided_symbols = set(bot_state.get("premarket_decided_symbols", []))
-    bot.premarket_checkpoints_done = set(bot_state.get("premarket_checkpoints_done", []))
     bot.open_market_rescue_done = bot_state.get("open_market_rescue_done", False)
     bot.end_of_day_reports_done = bot_state.get("end_of_day_reports_done", False)
 
@@ -193,18 +177,13 @@ def load_state(bot) -> None:
     bot.startup_done = bot_state.get("startup_done", False)
     bot.tape_initialized = bot_state.get("tape_initialized", False)
     bot.router_decision_made = bot_state.get("router_decision_made", False)
-    # Unified System: restore intraday ETF sleeve state
+    # Intraday ETF sleeve state
     bot.intraday_etf_sleeve_filled = bot_state.get("intraday_etf_sleeve_filled", False)
-    bot.router_entry_pending = bot_state.get("router_entry_pending", False)
-    bot.router_no_trade_subtype = bot_state.get("router_no_trade_subtype", None)
-    bot.v2_active = bot_state.get("v2_active", False)
-    bot.v2_direction = bot_state.get("v2_direction", None)
-    bot.v2_trigger_price = bot_state.get("v2_trigger_price", None)
-    bot.v2_trigger_high = bot_state.get("v2_trigger_high", None)
-    bot.v2_trigger_low = bot_state.get("v2_trigger_low", None)
-    bot.v2_trigger_range_pct = bot_state.get("v2_trigger_range_pct", None)
-    bot.v2_hybrid_checkpoint_done = bot_state.get("v2_hybrid_checkpoint_done", False)
-    bot.p1_active = bot_state.get("p1_active", False)
+    bot.router_decision_1010_made = bot_state.get("router_decision_1010_made", False)
+    # Overnight ETF sleeve state
+    bot.overnight_etf_fired = bot_state.get("overnight_etf_fired", False)
+    bot.overnight_etf_position = bot_state.get("overnight_etf_position", None)
+    bot.overnight_etf_decision_made = bot_state.get("overnight_etf_decision_made", False)
 
     saved = bot.state_mgr.load_positions()
     if saved:

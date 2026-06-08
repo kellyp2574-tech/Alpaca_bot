@@ -1,14 +1,16 @@
-"""ETF router runtime — extracted from integrated_main.py.
+"""ETF router runtime — 5-strategy intraday execution layer.
 
-Owns the morning ETF router workflow (Priority 1 in unified system):
-  - 09:30-10:00 tape updates (`update_tape`)
-  - 10:00 routing decision (`make_router_decision`) at 10:00
-  - 10:05 entry execution (`execute_etf_entry`) if router fires
-  - Exit checkpoints: 14:00 SQQQ, 15:00 TQQQ (`check_etf_exits`, `execute_etf_exit`)
+Owns the intraday ETF workflow:
+  - 09:30-10:10 tape updates (`update_tape`)
+  - 10:00 decision: strategies 1-3 (`make_router_decision`)
+  - 10:00 entry execution if strategy 1-3 fired (`execute_etf_entry`)
+  - 10:10 decision: strategies 4-5 (`make_router_decision_1010`)
+  - 10:10 entry execution if strategy 4-5 fired (`execute_etf_entry`)
+  - Exit checkpoints: 15:00 and 15:30 (`check_etf_exits`, `execute_etf_exit`)
   - EOD summary + artifact (`build_etf_router_summary`, `save_etf_router_artifact`)
 
-UVXY crash branch is DISABLED in unified system (Variant B).
-No-trade subtype is recorded for V2/P1 fallback evaluation.
+Only ONE strategy can be filled per day. Any fill blocks the overnight ETF
+sleeve AND the single-stock MR fallback.
 
 Every function takes the orchestrator instance (`bot`) as its first argument
 and mutates its state directly. State ownership stays with
@@ -26,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from bot import config
-from bot.etf_router import RouterBranch, RouterDecision
+from bot.etf_router import RouterBranch, RouterDecision, MarketTape
 from bot.universe_builder import filter_execution_ready
 
 logger = logging.getLogger(__name__)
@@ -35,25 +37,32 @@ _ET = ZoneInfo("America/New_York")
 
 
 # ────────────────────────────────────────────────────────────────────
-# Early close detection (Issue 5)
+# Bar helpers (shared with integrated_main for tape initialization)
 # ────────────────────────────────────────────────────────────────────
 
-def is_early_close() -> bool:
-    """Detect if today is an early close day (e.g., day before Thanksgiving, Christmas Eve).
-    
-    For now, this is a simple placeholder. In production, you would:
-    1. Query Alpaca's calendar API for today's session
-    2. Check if close time is earlier than 16:00 ET
-    3. Return True if early close
-    
-    Returns False by default (normal close day).
-    """
-    # TODO: Implement actual calendar API check
-    # For now, return False to avoid breaking existing behavior
-    # When implemented, check Alpaca calendar endpoint:
-    # GET /v2/calendar?start=YYYY-MM-DD&end=YYYY-MM-DD
-    # Compare session_close with "16:00"
-    return False
+def bar_dt(bar: dict) -> Optional[datetime]:
+    """Parse Alpaca bar timestamp into America/New_York datetime."""
+    raw = bar.get("t") or bar.get("timestamp") or bar.get("time")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_ET)
+        return parsed.astimezone(_ET)
+    except Exception:
+        return None
+
+
+def bar_float(bar: dict, *keys: str) -> Optional[float]:
+    """Read a float from Alpaca bar keys, supporting both short and long names."""
+    for key in keys:
+        if key in bar and bar.get(key) is not None:
+            try:
+                return float(bar.get(key))
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -61,13 +70,7 @@ def is_early_close() -> bool:
 # ────────────────────────────────────────────────────────────────────
 
 def build_etf_router_summary(bot) -> Dict[str, Any]:
-    """Compact ETF router summary for run_health + standalone artifact.
-
-    Captures what was decided, whether an entry actually fired, and
-    the realized fill price so a post-day review can be done from a
-    single JSON file. Returns ``{"enabled": False}`` when the router is
-    disabled (e.g. ``ETF_ROUTER_ENABLED=False``).
-    """
+    """Compact ETF router summary for run_health + standalone artifact."""
     if not getattr(config, "ETF_ROUTER_ENABLED", False):
         return {"enabled": False}
 
@@ -79,14 +82,8 @@ def build_etf_router_summary(bot) -> Dict[str, Any]:
         "branch": bot.router_branch,
         "mr_blocked_today": bot.mr_blocked_today,
         "router_traded_today": bot.router_traded_today,
-        "unified_system": {
-            "router_entry_pending": getattr(bot, "router_entry_pending", False),
-            "router_no_trade_subtype": getattr(bot, "router_no_trade_subtype", None),
-            "intraday_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
-            "v2_active": getattr(bot, "v2_active", False),
-            "v2_direction": getattr(bot, "v2_direction", None),
-            "p1_active": getattr(bot, "p1_active", False),
-        },
+        "intraday_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
+        "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
     }
     if decision is not None:
         try:
@@ -94,9 +91,6 @@ def build_etf_router_summary(bot) -> Dict[str, Any]:
         except Exception:
             logger.warning("ETF router decision.to_dict() failed", exc_info=True)
     if bot.etf_position:
-        # The exit path nulls out etf_position on a successful exit, so
-        # a non-null value here means we still have an open ETF
-        # position at EOD (which would be a bug — log it loud).
         logger.warning(f"ETF router EOD: still holding {bot.etf_position.get('symbol')}")
         summary["open_position_at_eod"] = bot.etf_position
     return summary
@@ -125,8 +119,8 @@ def run_startup_phase(bot) -> None:
 
     # Load and log config
     logger.info(f"ETF Router enabled: {getattr(config, 'ETF_ROUTER_ENABLED', False)}")
+    logger.info(f"Overnight ETF enabled: {getattr(config, 'OVERNIGHT_ETF_ENABLED', True)}")
     logger.info(f"MR Overnight enabled: {getattr(config, 'MR_OVERNIGHT_ENABLED', True)}")
-    logger.info(f"MR Permission mode: {getattr(config, 'MR_PERMISSION_MODE', 'skip_if_router_traded')}")
 
     # Reconcile account state
     try:
@@ -158,18 +152,11 @@ def run_startup_phase(bot) -> None:
 
 
 def cancel_stale_etf_orders(bot) -> None:
-    """Cancel only stale ETF router orders from a previous session.
-
-    IMPORTANT: must NOT touch overnight premarket limit sells placed
-    between 05:00 and 06:00 — those are on equity positions, never
-    on ETF router symbols. Earlier versions used
-    ``cancel_all_open_orders()`` here which wiped those limits before
-    they had any chance to fill in the 09:00-09:25 pre-open window.
-    """
+    """Cancel any stale ETF orders from a previous session."""
     etf_symbols = getattr(
         config,
         "ETF_ROUTER_SYMBOLS",
-        ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"],
+        ["QQQ", "SPY", "VXX", "SVIX", "TQQQ"],
     )
     logger.info(f"Cancelling any stale ETF-only orders for: {etf_symbols}")
     try:
@@ -211,7 +198,7 @@ def initialize_tape_recording(bot) -> None:
     etf_symbols = getattr(
         config,
         "ETF_ROUTER_SYMBOLS",
-        ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"],
+        ["QQQ", "SPY", "VXX", "SVIX", "TQQQ"],
     )
     now = datetime.now(_ET)
     today_iso = now.date().isoformat()
@@ -342,7 +329,7 @@ def update_tape(bot, force: bool = False) -> None:
     etf_symbols = getattr(
         config,
         "ETF_ROUTER_SYMBOLS",
-        ["QQQ", "SPY", "IWM", "XLK", "VXX", "SQQQ", "UVXY", "TQQQ"],
+        ["QQQ", "SPY", "VXX", "SVIX", "TQQQ"],
     )
 
     try:
@@ -366,61 +353,69 @@ def update_tape(bot, force: bool = False) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 def make_router_decision(bot) -> None:
-    """10:00 AM: Make ETF router decision and (maybe) enter.
-
-    The daily-loss kill switch is checked BEFORE the ETF entry. The
-    decision and ``mr_blocked_today`` flag are still recorded so the
-    EOD report reflects what the router would have done; we just
-    suppress the order submission.
-    """
+    """10:00 AM: Evaluate strategies 1-3 and enter immediately if one fires."""
     logger.info("=" * 60)
-    logger.info("ROUTER DECISION (10:00)")
+    logger.info("ROUTER DECISION (10:00) — strategies 1-3")
     logger.info("=" * 60)
 
-    bot.tape_recording_active = False
     now = datetime.now(_ET)
-
-    # Make decision
     decision = bot.etf_router.make_decision(now)
     bot.router_decision = decision
     bot.router_decision_made = True
-
-    # Update state
     bot.router_branch = decision.branch.value
-    bot.router_traded_today = decision.mr_blocked()
-    bot.mr_blocked_today = decision.mr_blocked()
-
-    logger.info(f"Router decision: {decision.branch.value}")
-    logger.info(
-        f"Router signal fired: mr_blocked_today={bot.mr_blocked_today} "
-        f"(MR will only be blocked if ETF entry actually fills)"
-    )
 
     if decision.symbol:
-        logger.info(f"Selected ETF: {decision.symbol} (planned exit: {decision.exit_time})")
-        # Kill-switch gate (issue #5): block 10:00 ETF entry if the
-        # daily-loss circuit breaker has tripped.
+        logger.info(f"Strategy fired: {decision.branch.value} → {decision.symbol} (exit {decision.exit_time})")
         if bot._check_daily_loss_kill_switch():
             logger.critical(
-                f"ETF entry BLOCKED by daily-loss kill switch — {bot.kill_switch_reason}; "
-                f"branch={decision.branch.value} would have bought {decision.symbol}"
+                f"ETF entry BLOCKED by kill switch — {bot.kill_switch_reason}; "
+                f"would have bought {decision.symbol}"
             )
         else:
-            # In unified system, entry happens ROUTER_ENTRY_DELAY_MINUTES after the decision.
-            bot.router_entry_pending = True
-            delay_min = int(getattr(config, "ROUTER_ENTRY_DELAY_MINUTES", 5))
-            entry_min = now.hour * 60 + now.minute + delay_min
-            queued_time_str = f"{entry_min // 60:02d}:{entry_min % 60:02d}"
-            logger.info(
-                f"Router entry queued: {decision.symbol} "
-                f"(decision={now.strftime('%H:%M')}, entry={queued_time_str}, "
-                f"delay={delay_min}min, planned_exit={decision.exit_time})"
-            )
+            execute_etf_entry(bot, decision)
+            if bot.etf_position:
+                bot.router_traded_today = True
+                bot.mr_blocked_today = True
+                bot.intraday_etf_sleeve_filled = True
+                bot.tape_recording_active = False
+                logger.info(f"Intraday sleeve filled ({decision.branch.value}) — overnight ETF + MR blocked")
     else:
-        # No-trade path: classify subtype for V2/P1 fallback evaluation
-        subtype = classify_no_trade_live_subtype(bot)
-        bot.router_no_trade_subtype = subtype
-        logger.info(f"No primary ETF router trade - MR allowed at 15:45 (subtype: {subtype})")
+        logger.info("10:00 no-trade — will check strategies 4-5 at 10:10")
+
+    bot._save_state()
+
+
+def make_router_decision_1010(bot) -> None:
+    """10:10 AM: Evaluate strategies 4-5 (only if no intraday trade yet)."""
+    if getattr(bot, "intraday_etf_sleeve_filled", False):
+        return
+
+    logger.info("=" * 60)
+    logger.info("ROUTER DECISION (10:10) — strategies 4-5")
+    logger.info("=" * 60)
+
+    now = datetime.now(_ET)
+    decision = bot.etf_router.make_decision_1010(now)
+
+    if decision.symbol:
+        logger.info(f"Strategy fired: {decision.branch.value} → {decision.symbol} (exit {decision.exit_time})")
+        if bot._check_daily_loss_kill_switch():
+            logger.critical(
+                f"ETF entry BLOCKED by kill switch — {bot.kill_switch_reason}; "
+                f"would have bought {decision.symbol}"
+            )
+        else:
+            execute_etf_entry(bot, decision)
+            if bot.etf_position:
+                bot.router_decision = decision
+                bot.router_branch = decision.branch.value
+                bot.router_traded_today = True
+                bot.mr_blocked_today = True
+                bot.intraday_etf_sleeve_filled = True
+                bot.tape_recording_active = False
+                logger.info(f"Intraday sleeve filled ({decision.branch.value}) — overnight ETF + MR blocked")
+    else:
+        logger.info("10:10 no-trade — no intraday position today")
 
     bot._save_state()
 
@@ -429,18 +424,11 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
     """Execute ETF entry after 10:00 decision.
 
     Adds (issue #4) a spread + staleness execution gate via
-    ``filter_execution_ready`` and a marketable-limit order (issue #6)
-    at ``ask * (1 + ETF_ENTRY_MAX_SLIPPAGE_PCT)`` so a momentary wide
+    ``filter_execution_ready`` and a marketable-limit order at
+    ``ask * (1 + ETF_ENTRY_MAX_SLIPPAGE_PCT)`` so a momentary wide
     quote cannot cost more than the configured slippage cap.
-    
-    Issue 5: Skip entry on early close days if configured.
     """
     if not decision.symbol:
-        return
-
-    # Early close guard (Issue 5)
-    if is_early_close() and getattr(config, "SKIP_INTRADAY_ETF_ON_EARLY_CLOSE", True):
-        logger.warning("ETF entry skipped: early close day with SKIP_INTRADAY_ETF_ON_EARLY_CLOSE=True")
         return
 
     symbol = decision.symbol
@@ -582,45 +570,6 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
         logger.error(f"Error executing ETF entry: {e}", exc_info=True)
 
 
-def execute_pending_router_entry(bot) -> bool:
-    """Execute router entry that was queued at 10:00 (runs at 10:05).
-    
-    Returns True if entry executed successfully.
-    """
-    if not getattr(bot, "router_entry_pending", False):
-        return False
-    
-    if not bot.router_decision or not bot.router_decision.symbol:
-        bot.router_entry_pending = False
-        return False
-    
-    # Check if intraday sleeve already filled (shouldn't happen, but guard)
-    if getattr(bot, "intraday_etf_sleeve_filled", False):
-        logger.warning("Router entry blocked: intraday sleeve already filled")
-        bot.router_entry_pending = False
-        return False
-    
-    # Check kill switch again (in case it tripped between 10:00 and 10:05)
-    if bot._check_daily_loss_kill_switch():
-        logger.critical(
-            f"Queued router entry BLOCKED by daily-loss kill switch — {bot.kill_switch_reason}; "
-            f"would have bought {bot.router_decision.symbol}"
-        )
-        bot.router_entry_pending = False
-        return False
-    
-    logger.info(f"Executing queued router entry at 10:05: {bot.router_decision.symbol}")
-    execute_etf_entry(bot, bot.router_decision)
-    bot.router_entry_pending = False
-    
-    # Mark intraday sleeve as filled if we got a position
-    if bot.etf_position:
-        bot.intraday_etf_sleeve_filled = True
-        bot._save_state()
-        return True
-    return False
-
-
 # ────────────────────────────────────────────────────────────────────
 # Exit checkpoints
 # ────────────────────────────────────────────────────────────────────
@@ -674,22 +623,20 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
 
 
 def _clear_etf_sleeve_flags(bot) -> None:
-    """Clear V2/P1 flags after a confirmed ETF exit.
-    
-    Issue 2 (follow-up): Reset sleeve state flags after full exit to prevent
-    stale EOD summaries and repeated logging.
+    """Log exit and mark sleeve flags so EOD state is accurate.
+
+    intraday_etf_sleeve_filled stays True (position WAS taken today — still
+    blocks overnight ETF and MR for the rest of the session).
+    etf_position is set to None by the caller immediately after this returns.
     """
     branch = bot.etf_position.get("branch", "") if bot.etf_position else ""
-    
-    if str(branch).startswith("V2_"):
-        bot.v2_active = False
-        bot.v2_direction = None
-        bot.v2_hybrid_checkpoint_done = True
-        logger.info(f"ETF exit: cleared V2 flags (branch={branch})")
-    
-    if branch == "P1_FALLBACK":
-        bot.p1_active = False
-        logger.info(f"ETF exit: cleared P1 flags (branch={branch})")
+    fill_pnl = ""
+    if bot.etf_position:
+        entry = float(bot.etf_position.get("entry_price") or 0)
+        qty   = int(bot.etf_position.get("qty") or 0)
+        if entry > 0 and qty > 0:
+            fill_pnl = f" entry=${entry:.2f} qty={qty}"
+    logger.info(f"ETF intraday exit confirmed: branch={branch}{fill_pnl} — sleeve flags preserved (blocks overnight ETF + MR)")
 
 
 def execute_etf_exit(bot) -> None:
@@ -806,52 +753,4 @@ def execute_etf_exit(bot) -> None:
         logger.error(f"Error executing ETF exit: {e}", exc_info=True)
 
 
-# ────────────────────────────────────────────────────────────────────
-# No-trade QQQ range-breakout fallback
-# ────────────────────────────────────────────────────────────────────
-
-def _parse_hhmm(value: str) -> dt_time:
-    parts = str(value).split(":")
-    return dt_time(int(parts[0]), int(parts[1]))
-
-
-def classify_no_trade_live_subtype(bot) -> str:
-    """Classify a primary-router NO_TRADE day into a live subtype.
-
-    The research files used precomputed live subtypes. The live bot did not
-    have that classifier wired in, so this runtime classifier intentionally
-    uses only the already-recorded 09:30-10:00 ETF tape. Keep this simple and
-    auditable; if you later recover the exact research classifier, swap it in
-    here without changing the execution plumbing.
-    """
-    returns = bot.etf_router.tape.get_returns_summary()
-    qqq = returns.get("QQQ")
-    spy = returns.get("SPY")
-    iwm = returns.get("IWM")
-    xlk = returns.get("XLK")
-    vxx = returns.get("VXX")
-    uvxy = returns.get("UVXY")
-
-    qqq = 0.0 if qqq is None else float(qqq)
-    spy = 0.0 if spy is None else float(spy)
-    iwm = 0.0 if iwm is None else float(iwm)
-    xlk = 0.0 if xlk is None else float(xlk)
-    vxx = 0.0 if vxx is None else float(vxx)
-    uvxy = 0.0 if uvxy is None else float(uvxy)
-
-    if vxx > 25 or uvxy > 75:
-        return "LIVE_VOL_WARNING"
-
-    if qqq > 5 and spy > -5:
-        if xlk > 0:
-            return "LIVE_BULLISH_MESSY"
-        return "LIVE_WEAK_GREEN"
-
-    if qqq < -10 or spy < -10:
-        return "LIVE_MILD_RISK_OFF"
-
-    if iwm < -15 and qqq > -10 and spy > -10:
-        return "LIVE_SMALL_CAP_WEAKNESS"
-
-    return "LIVE_FLAT_CHOP"
 
