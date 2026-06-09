@@ -490,7 +490,7 @@ class CombinedOvernightReboundBot:
                 if (self.etf_position
                         and current_time >= t_intraday_1500):
                     branch = (self.etf_position or {}).get("branch", "")
-                    if branch in ("MOMENTUM_SLEEVE", "ROUTER_LONG", "SVIX_LONG"):
+                    if branch in ("MOMENTUM_SLEEVE", "MOMENTUM_SLEEVE_ANTI", "ROUTER_LONG", "SVIX_LONG"):
                         logger.warning(f"15:00 hard exit for {branch}")
                         self._execute_etf_exit()
 

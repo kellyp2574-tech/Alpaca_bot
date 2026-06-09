@@ -94,6 +94,28 @@ def evaluate_overnight_etf_strategies(bot) -> None:
         _execute_overnight_etf_entry(bot, vxx_vehicle, "OVERNIGHT_VXX_MR", snapshots)
         return
 
+    # ── VXX Regime gate for Strategies B & C ─────────────────────────────────
+    # HIGH_RISK: VXX day return >= +2% OR current VXX price >= $400.
+    # Both B and C hold TQQQ overnight — high VXX indicates elevated gap-down
+    # risk so we skip them entirely. Strategy A (SVIX buy) is fine in HIGH_RISK.
+    vxx_snap = snapshots.get("VXX", {}) or {}
+    vxx_price_now = vxx_snap.get("last_price")
+    hr_ret_thresh   = float(getattr(config, "VXX_HIGH_RISK_RETURN_PCT", 2.0))
+    hr_price_thresh = float(getattr(config, "VXX_HIGH_RISK_PRICE", 400.0))
+    vxx_high_risk = (
+        (vxx_ret is not None and vxx_ret >= hr_ret_thresh)
+        or (vxx_price_now is not None and float(vxx_price_now) >= hr_price_thresh)
+    )
+    if vxx_high_risk:
+        logger.warning(
+            f"Overnight ETF HIGH_RISK regime: VXX={_fmt(vxx_ret)} price={vxx_price_now} "
+            f"(thresholds: ret>={hr_ret_thresh}% OR price>=${hr_price_thresh:.0f}) "
+            f"— skipping Strategies B & C (TQQQ overnight blocked)"
+        )
+        bot.overnight_etf_decision_made = True
+        bot._save_state()
+        return
+
     # ── Strategy B: Overnight Quality ────────────────────────────────────────
     spy_min     = float(getattr(config, "OVERNIGHT_QUALITY_SPY_MIN_PCT", 0.5))
     vxx_collapse= float(getattr(config, "OVERNIGHT_QUALITY_VXX_COLLAPSE_PCT", -2.0))

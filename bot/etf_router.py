@@ -5,7 +5,9 @@ Strategies evaluated in priority order (only ONE fires per day):
   At 10:00 AM (using 9:30-10:00 30-min returns):
     1. VXX Spike Recovery  — VXX 30min >= +2.5% AND QQQ range 0.3-0.8%  → BUY TQQQ, exit 15:30
     2. VXX Collapse        — VXX 30min <= -2.0% AND QQQ 30min >= -1.0%   → BUY TQQQ, exit 15:30
-    3. Momentum Sleeve     — QQQ 30min >= +0.5%                           → BUY TQQQ, exit 15:00
+    3. Momentum Sleeve     — QQQ 30min >= +0.5%
+                              NORMAL regime  → BUY TQQQ, exit 15:00
+                              HIGH_RISK regime (VXX >= +2% OR VXX price >= $400) → BUY SQQQ (anti-momentum)
 
   At 10:10 AM (using 9:30-10:10 40-min returns, only if no trade yet):
     4. Router Long         — QQQ-SPY 40min spread >= +0.2%               → BUY TQQQ, exit 15:00
@@ -25,12 +27,13 @@ logger = logging.getLogger(__name__)
 
 class RouterBranch(Enum):
     """Intraday strategy branches in priority order."""
-    VXX_SPIKE_RECOVERY = "VXX_SPIKE_RECOVERY"
-    VXX_COLLAPSE       = "VXX_COLLAPSE"
-    MOMENTUM_SLEEVE    = "MOMENTUM_SLEEVE"
-    ROUTER_LONG        = "ROUTER_LONG"
-    SVIX_LONG          = "SVIX_LONG"
-    NO_TRADE           = "NO_TRADE"
+    VXX_SPIKE_RECOVERY   = "VXX_SPIKE_RECOVERY"
+    VXX_COLLAPSE         = "VXX_COLLAPSE"
+    MOMENTUM_SLEEVE      = "MOMENTUM_SLEEVE"       # Normal regime: TQQQ
+    MOMENTUM_SLEEVE_ANTI = "MOMENTUM_SLEEVE_ANTI"  # HIGH_RISK regime: SQQQ
+    ROUTER_LONG          = "ROUTER_LONG"
+    SVIX_LONG            = "SVIX_LONG"
+    NO_TRADE             = "NO_TRADE"
 
 
 @dataclass
@@ -80,6 +83,7 @@ class MarketTape:
     vxx:  ETFTapeSnapshot = field(default_factory=lambda: ETFTapeSnapshot("VXX"))
     svix: ETFTapeSnapshot = field(default_factory=lambda: ETFTapeSnapshot("SVIX"))
     tqqq: ETFTapeSnapshot = field(default_factory=lambda: ETFTapeSnapshot("TQQQ"))
+    sqqq: ETFTapeSnapshot = field(default_factory=lambda: ETFTapeSnapshot("SQQQ"))
 
     snapshot_time: Optional[datetime] = None
 
@@ -90,6 +94,7 @@ class MarketTape:
             "VXX":  self.vxx.return_pct(),
             "SVIX": self.svix.return_pct(),
             "TQQQ": self.tqqq.return_pct(),
+            "SQQQ": self.sqqq.return_pct(),
         }
 
 
@@ -260,27 +265,56 @@ class ETFRouter:
             )
         return None
 
+    def _is_high_risk_regime(self) -> bool:
+        """True if VXX 30min return >= HIGH_RISK threshold OR VXX price >= HIGH_RISK price level."""
+        vxx_ret   = self.tape.vxx.return_pct()
+        vxx_price = self.tape.vxx.latest_price
+        hr_ret    = float(getattr(self.config, "VXX_HIGH_RISK_RETURN_PCT", 2.0))
+        hr_price  = float(getattr(self.config, "VXX_HIGH_RISK_PRICE", 400.0))
+        ret_trigger   = vxx_ret   is not None and vxx_ret   >= hr_ret
+        price_trigger = vxx_price is not None and vxx_price >= hr_price
+        return ret_trigger or price_trigger
+
     def _check_momentum_sleeve(self, timestamp: datetime) -> Optional[RouterDecision]:
-        """Strategy 3: QQQ 30min >= +0.5% → BUY TQQQ, exit 15:00."""
+        """Strategy 3: QQQ 30min >= +0.5%.
+
+        NORMAL regime  → BUY TQQQ (momentum follow-through).
+        HIGH_RISK regime → BUY SQQQ (anti-momentum: QQQ up but VXX spiking = fakeout).
+        """
         qqq_ret = self.tape.qqq.return_pct()
 
         min_qqq = float(getattr(self.config, "MOMENTUM_QQQ_MIN_RETURN_PCT", 0.5))
         exit_t  = _parse_hhmm(getattr(self.config, "MOMENTUM_EXIT_TIME", "15:00"))
-        vehicle = getattr(self.config, "MOMENTUM_VEHICLE", "TQQQ")
 
         conditions = {
             f"QQQ 30min >= +{min_qqq}%": qqq_ret is not None and qqq_ret >= min_qqq,
         }
         if all(conditions.values()):
-            logger.warning(f"STRATEGY 3 MOMENTUM SLEEVE FIRED: QQQ={qqq_ret:.2f}%")
+            high_risk = self._is_high_risk_regime()
+            vxx_ret   = self.tape.vxx.return_pct()
+            vxx_price = self.tape.vxx.latest_price
+            if high_risk:
+                vehicle = getattr(self.config, "MOMENTUM_ANTI_VEHICLE", "SQQQ")
+                branch  = RouterBranch.MOMENTUM_SLEEVE_ANTI
+                logger.warning(
+                    f"STRATEGY 3 MOMENTUM ANTI-MOMENTUM FIRED (HIGH_RISK): "
+                    f"QQQ={qqq_ret:.2f}% VXX={vxx_ret:.2f}% VXX_price={vxx_price} "
+                    f"→ BUY {vehicle}"
+                )
+            else:
+                vehicle = getattr(self.config, "MOMENTUM_VEHICLE", "TQQQ")
+                branch  = RouterBranch.MOMENTUM_SLEEVE
+                logger.warning(
+                    f"STRATEGY 3 MOMENTUM SLEEVE FIRED: QQQ={qqq_ret:.2f}% → BUY {vehicle}"
+                )
             return RouterDecision(
-                branch=RouterBranch.MOMENTUM_SLEEVE,
+                branch=branch,
                 symbol=vehicle,
                 entry_time=time(10, 0),
                 exit_time=exit_t,
                 decision_time=timestamp,
                 market_state=self.tape,
-                conditions_met=conditions,
+                conditions_met={**conditions, "high_risk_regime": high_risk},
             )
         return None
 

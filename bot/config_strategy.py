@@ -62,7 +62,7 @@ MR_ADV_CAP_PCT = 0.003             # 0.3% of 20-day ADV per symbol
 # Intraday ETF Router Configuration (9:30-10:10 AM)
 # ═══════════════════════════════════════════════════
 # ETF symbols for tape measurement (9:30 opens + 10:00/10:10 snapshots)
-ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "VXX", "SVIX", "TQQQ"]
+ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "VXX", "SVIX", "TQQQ", "SQQQ"]
 
 # Tape recording cadence — once every N seconds.
 ETF_TAPE_UPDATE_INTERVAL_SECONDS = 5
@@ -82,10 +82,17 @@ VXX_COLLAPSE_EXIT_TIME = "15:30"
 
 # ── Strategy 3: Momentum Sleeve (check at 10:00) ──
 MOMENTUM_QQQ_MIN_RETURN_PCT = 0.5    # QQQ 30min return >= +0.5%
-MOMENTUM_VEHICLE = "TQQQ"
+MOMENTUM_VEHICLE = "TQQQ"            # Normal regime: long TQQQ
+MOMENTUM_ANTI_VEHICLE = "SQQQ"       # HIGH_RISK regime: short via SQQQ (anti-momentum)
 MOMENTUM_EXIT_TIME = "15:00"
 MOMENTUM_TAKE_PROFIT_PCT = 0.02      # +2% TP
 MOMENTUM_STOP_LOSS_PCT = 0.01        # -1% SL
+
+# ── VXX Regime Classification (used by Momentum + Overnight filtering) ──
+# HIGH_RISK if VXX 30min return >= this threshold OR VXX price >= price threshold.
+# In HIGH_RISK: Momentum fires SQQQ (anti-momentum), Overnight TQQQ skipped.
+VXX_HIGH_RISK_RETURN_PCT = 2.0       # VXX 30min return >= +2.0% → HIGH_RISK
+VXX_HIGH_RISK_PRICE = 400.0          # VXX price >= $400 → HIGH_RISK (absolute level)
 
 # ── Strategy 4: Router Long (check at 10:10) ──
 ROUTER_LONG_SPREAD_MIN_PCT = 0.2     # QQQ-SPY 40min spread >= +0.2%
@@ -172,11 +179,12 @@ OVERNIGHT_ETF_EXIT_TIME = "09:30"
 # Router Long          -1%      +3%    Time exit 15:00 is fallback
 # SVIX Long            None     +3%    No SL per strategy rules
 ETF_SL_TP: dict = {
-    "VXX_SPIKE_RECOVERY": {"sl": None,  "tp": None},
-    "VXX_COLLAPSE":       {"sl": None,  "tp": None},
-    "MOMENTUM_SLEEVE":    {"sl": 0.01,  "tp": 0.02},
-    "ROUTER_LONG":        {"sl": 0.01,  "tp": 0.03},
-    "SVIX_LONG":          {"sl": None,  "tp": 0.03},
+    "VXX_SPIKE_RECOVERY":       {"sl": None,  "tp": None},
+    "VXX_COLLAPSE":             {"sl": None,  "tp": None},
+    "MOMENTUM_SLEEVE":          {"sl": 0.01,  "tp": 0.02},
+    "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.01,  "tp": 0.02},  # SQQQ anti-momentum, same SL/TP
+    "ROUTER_LONG":              {"sl": 0.01,  "tp": 0.03},
+    "SVIX_LONG":                {"sl": None,  "tp": 0.03},
 }
 
 # ═══════════════════════════════════════════════════
