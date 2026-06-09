@@ -353,40 +353,44 @@ def update_tape(bot, force: bool = False) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 def make_router_decision(bot) -> None:
-    """10:00 AM: Evaluate strategies 1-3 and enter immediately if one fires."""
+    """10:00 AM: Evaluate strategies 1-3 and enter ALL that qualify."""
     logger.info("=" * 60)
     logger.info("ROUTER DECISION (10:00) — strategies 1-3")
     logger.info("=" * 60)
 
     now = datetime.now(_ET)
-    decision = bot.etf_router.make_decision(now)
-    bot.router_decision = decision
+    decisions = bot.etf_router.make_decision(now)
     bot.router_decision_made = True
-    bot.router_branch = decision.branch.value
 
-    if decision.symbol:
-        logger.info(f"Strategy fired: {decision.branch.value} → {decision.symbol} (exit {decision.exit_time})")
-        if bot._check_daily_loss_kill_switch():
-            logger.critical(
-                f"ETF entry BLOCKED by kill switch — {bot.kill_switch_reason}; "
-                f"would have bought {decision.symbol}"
-            )
-        else:
-            execute_etf_entry(bot, decision)
-            if bot.etf_position:
-                bot.router_traded_today = True
-                bot.mr_blocked_today = True
-                bot.intraday_etf_sleeve_filled = True
-                bot.tape_recording_active = False
-                logger.info(f"Intraday sleeve filled ({decision.branch.value}) — overnight ETF + MR blocked")
-    else:
+    if not decisions:
         logger.info("10:00 no-trade — will check strategies 4-5 at 10:10")
+        bot._save_state()
+        return
+
+    if bot._check_daily_loss_kill_switch():
+        logger.critical(
+            f"ETF entries BLOCKED by kill switch — {bot.kill_switch_reason}; "
+            f"would have entered: {[d.branch.value for d in decisions]}"
+        )
+        bot._save_state()
+        return
+
+    _execute_all_etf_entries(bot, decisions)
+    if bot.etf_positions:
+        filled = list(bot.etf_positions.keys())
+        bot.router_decision = decisions[0]  # primary decision for state compat
+        bot.router_branch = ",".join(filled)
+        bot.router_traded_today = True
+        bot.mr_blocked_today = True
+        bot.intraday_etf_sleeve_filled = True
+        bot.tape_recording_active = False
+        logger.info(f"Intraday sleeve filled: {filled} — overnight ETF + MR blocked")
 
     bot._save_state()
 
 
 def make_router_decision_1010(bot) -> None:
-    """10:10 AM: Evaluate strategies 4-5 (only if no intraday trade yet)."""
+    """10:10 AM: Evaluate strategies 4-5 (only if no 10:00 trade fired)."""
     if getattr(bot, "intraday_etf_sleeve_filled", False):
         return
 
@@ -395,55 +399,85 @@ def make_router_decision_1010(bot) -> None:
     logger.info("=" * 60)
 
     now = datetime.now(_ET)
-    decision = bot.etf_router.make_decision_1010(now)
+    decisions = bot.etf_router.make_decision_1010(now)
 
-    if decision.symbol:
-        logger.info(f"Strategy fired: {decision.branch.value} → {decision.symbol} (exit {decision.exit_time})")
-        if bot._check_daily_loss_kill_switch():
-            logger.critical(
-                f"ETF entry BLOCKED by kill switch — {bot.kill_switch_reason}; "
-                f"would have bought {decision.symbol}"
-            )
-        else:
-            execute_etf_entry(bot, decision)
-            if bot.etf_position:
-                bot.router_decision = decision
-                bot.router_branch = decision.branch.value
-                bot.router_traded_today = True
-                bot.mr_blocked_today = True
-                bot.intraday_etf_sleeve_filled = True
-                bot.tape_recording_active = False
-                logger.info(f"Intraday sleeve filled ({decision.branch.value}) — overnight ETF + MR blocked")
-    else:
+    if not decisions:
         logger.info("10:10 no-trade — no intraday position today")
+        bot._save_state()
+        return
+
+    if bot._check_daily_loss_kill_switch():
+        logger.critical(
+            f"ETF entries BLOCKED by kill switch — {bot.kill_switch_reason}; "
+            f"would have entered: {[d.branch.value for d in decisions]}"
+        )
+        bot._save_state()
+        return
+
+    _execute_all_etf_entries(bot, decisions)
+    if bot.etf_positions:
+        filled = list(bot.etf_positions.keys())
+        bot.router_decision = decisions[0]
+        bot.router_branch = ",".join(filled)
+        bot.router_traded_today = True
+        bot.mr_blocked_today = True
+        bot.intraday_etf_sleeve_filled = True
+        bot.tape_recording_active = False
+        logger.info(f"Intraday sleeve filled (10:10): {filled} — overnight ETF + MR blocked")
 
     bot._save_state()
 
 
-def execute_etf_entry(bot, decision: RouterDecision) -> None:
-    """Execute ETF entry after 10:00 decision.
+def _execute_all_etf_entries(bot, decisions: list) -> None:
+    """Execute all fired strategy decisions, splitting 90% equity equally."""
+    n = len(decisions)
+    if n == 0:
+        return
 
-    Adds (issue #4) a spread + staleness execution gate via
-    ``filter_execution_ready`` and a marketable-limit order at
-    ``ask * (1 + ETF_ENTRY_MAX_SLIPPAGE_PCT)`` so a momentary wide
-    quote cannot cost more than the configured slippage cap.
+    try:
+        account = bot.position_mgr.get_account()
+        if not account:
+            logger.error("Cannot fetch account for ETF sizing")
+            return
+        equity = float(account.get("equity", 0))
+        total_pct = float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.90))
+        per_strategy_budget = (equity * total_pct) / n
+        logger.info(
+            f"ETF multi-entry: {n} strategies, equity=${equity:.0f}, "
+            f"total_pct={total_pct:.0%}, per_strategy=${per_strategy_budget:.0f}"
+        )
+    except Exception as e:
+        logger.error(f"ETF multi-entry: account fetch failed: {e}", exc_info=True)
+        return
+
+    for decision in decisions:
+        execute_etf_entry(bot, decision, budget_override=per_strategy_budget)
+
+
+def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[float] = None) -> None:
+    """Execute one ETF entry. Writes fill into bot.etf_positions[branch_value].
+
+    budget_override: pre-calculated per-strategy budget (equity * 90% / N).
+    If None, uses the full INTRADAY_ETF_ALLOCATION_PCT (single-strategy path).
     """
     if not decision.symbol:
         return
 
     symbol = decision.symbol
-    logger.info(f"Executing ETF entry: {symbol}")
+    branch_key = decision.branch.value
+    logger.info(f"Executing ETF entry: {symbol} ({branch_key})")
 
     try:
-        # Calculate position size
-        account = bot.position_mgr.get_account()
-        if not account:
-            logger.error("Cannot fetch account for ETF sizing")
-            return
-
-        equity = float(account.get("equity", 0))
-        etf_capital_pct = float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.90))
-        etf_budget = equity * etf_capital_pct
+        # Calculate position size — use pre-computed budget if provided.
+        if budget_override is not None:
+            etf_budget = budget_override
+        else:
+            account = bot.position_mgr.get_account()
+            if not account:
+                logger.error("Cannot fetch account for ETF sizing")
+                return
+            equity = float(account.get("equity", 0))
+            etf_budget = equity * float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.90))
 
         # Fresh snapshot for sizing AND for the execution gate.
         snapshots = bot.alpaca.get_snapshots([symbol]) or {}
@@ -544,12 +578,14 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
             if fill and int(fill.get("filled_qty", 0)) > 0:
                 filled_qty = int(fill["filled_qty"])
                 fill_price = float(fill.get("filled_avg_price", price))
-                bot.etf_position = {
+                if not hasattr(bot, "etf_positions") or bot.etf_positions is None:
+                    bot.etf_positions = {}
+                bot.etf_positions[branch_key] = {
                     "symbol": symbol,
                     "qty": filled_qty,
                     "entry_price": fill_price,
                     "entry_time": datetime.now(_ET).isoformat(),
-                    "branch": decision.branch.value,
+                    "branch": branch_key,
                     "planned_exit_time": decision.exit_time.isoformat() if decision.exit_time else None,
                     "order_id": order.get("id"),
                     "bracket_order_id": order.get("id"),  # same ID; legs are children
@@ -557,200 +593,180 @@ def execute_etf_entry(bot, decision: RouterDecision) -> None:
                     "tp_pct": tp_pct,
                 }
                 logger.info(
-                    f"ETF position opened: {symbol} {filled_qty} shares @ ${fill_price:.2f} "
+                    f"ETF position opened: {branch_key} {symbol} {filled_qty}sh @ ${fill_price:.2f} "
                     f"SL={sl_pct} TP={tp_pct}"
                 )
             else:
-                logger.warning(f"ETF entry not filled for {symbol}; canceling and leaving flat")
+                logger.warning(f"ETF entry not filled for {symbol} ({branch_key}); canceling and leaving flat")
                 bot.position_mgr._cancel_order(order["id"])
         else:
-            logger.error(f"Failed to submit ETF buy order for {symbol}: {error_type}")
+            logger.error(f"Failed to submit ETF buy order for {symbol} ({branch_key}): {error_type}")
 
     except Exception as e:
-        logger.error(f"Error executing ETF entry: {e}", exc_info=True)
+        logger.error(f"Error executing ETF entry {branch_key}: {e}", exc_info=True)
 
 
 # ────────────────────────────────────────────────────────────────────
-# Exit checkpoints
+# Exit checkpoints — iterate over all open etf_positions
 # ────────────────────────────────────────────────────────────────────
 
 def check_etf_exits(bot, current_time: dt_time) -> None:
-    """Check ETF exit checkpoints at 11:00, 14:00, 15:00."""
-    if not bot.etf_position:
+    """Check exit time and bracket SL/TP triggers for every open ETF position."""
+    positions = getattr(bot, "etf_positions", None) or {}
+    if not positions:
         return
 
-    symbol = bot.etf_position.get("symbol")
-    planned_exit = bot.etf_position.get("planned_exit_time")
+    for branch_key in list(positions.keys()):
+        pos = positions.get(branch_key)
+        if not pos:
+            continue
 
-    if not planned_exit:
-        return
+        symbol = pos.get("symbol")
+        planned_exit = pos.get("planned_exit_time")
+        if not symbol or not planned_exit:
+            continue
 
-    # Bracket early-exit detection: if a SL or TP leg already filled, the
-    # broker will show no position even before the scheduled exit time.
-    bracket_id = bot.etf_position.get("bracket_order_id")
-    if bracket_id:
+        # Bracket early-exit detection: SL/TP leg filled — broker shows no position
+        bracket_id = pos.get("bracket_order_id")
+        if bracket_id:
+            try:
+                broker_pos = bot.position_mgr.get_broker_position(symbol)
+                if broker_pos is bot.position_mgr.BROKER_NOT_FOUND:
+                    logger.info(
+                        f"ETF bracket ({branch_key}): broker shows no {symbol} — "
+                        f"SL/TP leg triggered. Clearing position."
+                    )
+                    _clear_one_etf_position(bot, branch_key)
+                    bot._save_state()
+                    continue
+            except Exception as e:
+                logger.warning(f"ETF bracket check failed ({branch_key}): {e}")
+
+        # Parse planned exit time
         try:
-            broker_pos = bot.position_mgr.get_broker_position(symbol)
-            if broker_pos is bot.position_mgr.BROKER_NOT_FOUND:
-                logger.info(
-                    f"ETF bracket: broker shows no {symbol} position — "
-                    f"SL/TP leg triggered. Clearing local state."
-                )
-                _clear_etf_sleeve_flags(bot)
-                bot.etf_position = None
-                bot._save_state()
-                return
-        except Exception as e:
-            logger.warning(f"ETF bracket position check failed: {e}")
+            if isinstance(planned_exit, str):
+                parts = planned_exit.split(":")
+                exit_h, exit_m = int(parts[0]), int(parts[1])
+            else:
+                exit_h, exit_m = planned_exit.hour, planned_exit.minute
+        except Exception:
+            continue
 
-    # Parse planned exit time
-    try:
-        if isinstance(planned_exit, str):
-            # Handle HH:MM:SS format
-            parts = planned_exit.split(":")
-            exit_h, exit_m = int(parts[0]), int(parts[1])
-        else:
-            exit_h, exit_m = planned_exit.hour, planned_exit.minute
-    except Exception:
-        return
-
-    exit_time = dt_time(exit_h, exit_m)
-
-    # Check if it's time to exit
-    if current_time >= exit_time:
-        logger.info(f"ETF exit time reached: {symbol} at {current_time}")
-        execute_etf_exit(bot)
+        if current_time >= dt_time(exit_h, exit_m):
+            logger.info(f"ETF exit time reached: {branch_key} {symbol} at {current_time}")
+            execute_etf_exit(bot, branch_key)
 
 
-def _clear_etf_sleeve_flags(bot) -> None:
-    """Log exit and mark sleeve flags so EOD state is accurate.
+def _clear_one_etf_position(bot, branch_key: str) -> None:
+    """Remove one position from etf_positions and log it.
 
-    intraday_etf_sleeve_filled stays True (position WAS taken today — still
-    blocks overnight ETF and MR for the rest of the session).
-    etf_position is set to None by the caller immediately after this returns.
+    intraday_etf_sleeve_filled stays True for the rest of the day.
     """
-    branch = bot.etf_position.get("branch", "") if bot.etf_position else ""
-    fill_pnl = ""
-    if bot.etf_position:
-        entry = float(bot.etf_position.get("entry_price") or 0)
-        qty   = int(bot.etf_position.get("qty") or 0)
-        if entry > 0 and qty > 0:
-            fill_pnl = f" entry=${entry:.2f} qty={qty}"
-    logger.info(f"ETF intraday exit confirmed: branch={branch}{fill_pnl} — sleeve flags preserved (blocks overnight ETF + MR)")
+    pos = (getattr(bot, "etf_positions", None) or {}).get(branch_key)
+    if pos:
+        entry = float(pos.get("entry_price") or 0)
+        qty   = int(pos.get("qty") or 0)
+        fill_info = f" entry=${entry:.2f} qty={qty}" if entry > 0 and qty > 0 else ""
+        logger.info(
+            f"ETF intraday exit confirmed: branch={branch_key}{fill_info} — "
+            f"sleeve flags preserved (blocks overnight ETF + MR)"
+        )
+    if hasattr(bot, "etf_positions") and bot.etf_positions:
+        bot.etf_positions.pop(branch_key, None)
 
 
-def execute_etf_exit(bot) -> None:
-    """Execute ETF exit order with fill confirmation and duplicate guard."""
-    if not bot.etf_position:
+def execute_etf_exit(bot, branch_key: str) -> None:
+    """Execute exit order for one ETF position (identified by branch_key)."""
+    positions = getattr(bot, "etf_positions", None) or {}
+    pos = positions.get(branch_key)
+    if not pos:
         return
 
-    symbol = bot.etf_position.get("symbol")
-    qty = bot.etf_position.get("qty", 0)
+    symbol = pos.get("symbol")
+    qty = pos.get("qty", 0)
 
     # ── Step 1: duplicate guard ──────────────────────────────────────────────
-    # Must come BEFORE the open-sell sweep. If we already submitted the exit
-    # order, we must not cancel it and then get confused by its absence.
-    existing_exit_id = bot.etf_position.get("exit_order_id")
-    exit_submitted_at = bot.etf_position.get("exit_submitted_at")
+    existing_exit_id = pos.get("exit_order_id")
+    exit_submitted_at = pos.get("exit_submitted_at")
 
     if existing_exit_id:
-        logger.info(f"ETF exit order already exists for {symbol}; checking fill status")
+        logger.info(f"ETF exit order already exists for {symbol} ({branch_key}); checking fill")
         fill = bot.position_mgr.get_order_fill(existing_exit_id, max_wait=2)
 
         if fill and int(fill.get("filled_qty", 0)) > 0:
             filled_qty = int(fill["filled_qty"])
             if filled_qty >= qty:
-                logger.info(f"ETF exit filled: {symbol} {filled_qty} shares")
-                _clear_etf_sleeve_flags(bot)
-                bot.etf_position = None
+                logger.info(f"ETF exit filled: {branch_key} {symbol} {filled_qty}sh")
+                _clear_one_etf_position(bot, branch_key)
                 bot._save_state()
             else:
                 remaining = qty - filled_qty
-                bot.etf_position["qty"] = remaining
-                bot.etf_position["exit_order_id"] = None
-                logger.warning(f"ETF exit partial fill: {symbol} {filled_qty}/{qty}, {remaining} remaining")
+                pos["qty"] = remaining
+                pos["exit_order_id"] = None
+                logger.warning(f"ETF exit partial: {branch_key} {symbol} {filled_qty}/{qty}, {remaining} remaining")
                 bot._save_state()
             return
 
-        # If exit has been pending too long, cancel and retry once
         if exit_submitted_at:
-            submitted_dt = datetime.fromisoformat(exit_submitted_at)
-            age_seconds = (datetime.now(_ET) - submitted_dt).total_seconds()
-
-            if age_seconds > 60:
-                logger.warning(
-                    f"ETF exit order {existing_exit_id} pending {age_seconds:.0f}s; canceling and retrying"
-                )
+            age = (datetime.now(_ET) - datetime.fromisoformat(exit_submitted_at)).total_seconds()
+            if age > 60:
+                logger.warning(f"ETF exit order {existing_exit_id} pending {age:.0f}s; canceling and retrying")
                 try:
                     bot.position_mgr._cancel_order(existing_exit_id)
                 except Exception:
                     logger.warning("ETF exit cancel failed", exc_info=True)
-
-                bot.etf_position["exit_order_id"] = None
-                bot.etf_position["exit_submitted_at"] = None
+                pos["exit_order_id"] = None
+                pos["exit_submitted_at"] = None
                 bot._save_state()
                 return
 
-        logger.info(f"ETF exit order {existing_exit_id} still pending; waiting for fill")
+        logger.info(f"ETF exit order {existing_exit_id} still pending ({branch_key}); waiting")
         return
 
     # ── Step 2: cancel resting broker-side exit legs ─────────────────────────
-    # Only reached on the FIRST submission attempt (no exit_order_id yet).
-    # Sweeps all open sell orders for the symbol: trailing stops, bracket TP/SL
-    # legs, OTO legs — whatever Alpaca has resting. Safe because we have not yet
-    # submitted our own exit order, so nothing to accidentally self-cancel.
     try:
         cancelled = bot.position_mgr.cancel_open_sell_orders_for_symbol(symbol)
         if cancelled:
-            logger.info(f"ETF exit: canceled {cancelled} open sell orders for {symbol} before scheduled exit")
-        bot.etf_position["trailing_stop_order_id"] = None
-        bot.etf_position["bracket_order_id"] = None
+            logger.info(f"ETF exit: canceled {cancelled} resting sell orders for {symbol} ({branch_key})")
+        pos["trailing_stop_order_id"] = None
+        pos["bracket_order_id"] = None
         bot._save_state()
     except Exception as e:
-        logger.warning(f"ETF exit: failed to cancel open sell orders for {symbol}: {e}")
+        logger.warning(f"ETF exit: failed to cancel resting orders for {symbol} ({branch_key}): {e}")
 
     # ── Step 3: submit the scheduled market sell ─────────────────────────────
-    logger.info(f"Executing ETF exit: {symbol} {qty} shares")
+    logger.info(f"Executing ETF exit: {branch_key} {symbol} {qty}sh")
 
     try:
-        # Submit sell order
         order = bot.position_mgr._submit_sell_order(
-            symbol,
-            qty,
-            order_type="market",
-            time_in_force="day",
-            extended_hours=False,
+            symbol, qty, order_type="market", time_in_force="day", extended_hours=False,
         )
 
         if order and order.get("id"):
-            # Record exit order id for duplicate guard
-            bot.etf_position["exit_order_id"] = order.get("id")
-            bot.etf_position["exit_submitted_at"] = datetime.now(_ET).isoformat()
+            pos["exit_order_id"] = order.get("id")
+            pos["exit_submitted_at"] = datetime.now(_ET).isoformat()
             bot._save_state()
 
-            # Wait for fill confirmation
             fill = bot.position_mgr.get_order_fill(order["id"], max_wait=10)
             if fill and int(fill.get("filled_qty", 0)) > 0:
                 filled_qty = int(fill["filled_qty"])
                 if filled_qty >= qty:
-                    logger.info(f"ETF exit filled: {symbol} {filled_qty} shares")
-                    _clear_etf_sleeve_flags(bot)
-                    bot.etf_position = None
+                    logger.info(f"ETF exit filled: {branch_key} {symbol} {filled_qty}sh")
+                    _clear_one_etf_position(bot, branch_key)
                     bot._save_state()
                 else:
-                    # Partial fill - update remaining qty
                     remaining = qty - filled_qty
-                    bot.etf_position["qty"] = remaining
-                    bot.etf_position["exit_order_id"] = None
-                    logger.warning(f"ETF exit partial fill: {symbol} {filled_qty}/{qty}, {remaining} remaining")
+                    pos["qty"] = remaining
+                    pos["exit_order_id"] = None
+                    logger.warning(f"ETF exit partial: {branch_key} {symbol} {filled_qty}/{qty}, {remaining} remaining")
                     bot._save_state()
             else:
-                logger.warning(f"ETF exit submitted but not filled yet for {symbol}; will retry on next tick")
+                logger.warning(f"ETF exit submitted but not yet filled: {branch_key} {symbol}; will retry")
         else:
-            logger.error(f"Failed to submit ETF sell order for {symbol}")
+            logger.error(f"Failed to submit ETF sell order: {branch_key} {symbol}")
 
     except Exception as e:
-        logger.error(f"Error executing ETF exit: {e}", exc_info=True)
+        logger.error(f"Error executing ETF exit ({branch_key}): {e}", exc_info=True)
 
 
 

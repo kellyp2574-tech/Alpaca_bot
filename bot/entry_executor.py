@@ -237,7 +237,7 @@ def step_execute_entries(bot) -> None:
     # Check MR permission — block ONLY if router actually has/had a filled position.
     # A router signal that was rejected (failed execution gate, stale quote, etc.)
     # must NOT block MR.  Only a confirmed fill is a regime conflict.
-    has_etf_position = bot.etf_position is not None
+    has_etf_position = bool(getattr(bot, "etf_positions", None))
     intraday_etf_filled = getattr(bot, "intraday_etf_sleeve_filled", False)
     if has_etf_position or intraday_etf_filled:
         branch = bot.router_branch or "unknown"

@@ -1,6 +1,6 @@
 """ETF Router — 5-strategy intraday decision system.
 
-Strategies evaluated in priority order (only ONE fires per day):
+All qualifying strategies fire simultaneously (uncorrelated — r≈0):
 
   At 10:00 AM (using 9:30-10:00 30-min returns):
     1. VXX Spike Recovery  — VXX 30min >= +2.5% AND QQQ range 0.3-0.8%  → BUY TQQQ, exit 15:30
@@ -9,10 +9,11 @@ Strategies evaluated in priority order (only ONE fires per day):
                               NORMAL regime  → BUY TQQQ, exit 15:00
                               HIGH_RISK regime (VXX >= +2% OR VXX price >= $400) → BUY SQQQ (anti-momentum)
 
-  At 10:10 AM (using 9:30-10:10 40-min returns, only if no trade yet):
+  At 10:10 AM (only if no 10:00 trade fired — using 9:30-10:10 40-min returns):
     4. Router Long         — QQQ-SPY 40min spread >= +0.2%               → BUY TQQQ, exit 15:00
     5. SVIX Long           — SVIX 40min >= +0.2%                         → BUY SVIX, exit 15:00
 
+Capital: 90% equity split equally across all strategies that fire.
 All returns are plain percentages (not bps).
 """
 
@@ -161,12 +162,13 @@ class ETFRouter:
 
     # ── 10:00 AM decision (strategies 1-3) ───────────────────────────────────
 
-    def make_decision(self, timestamp: datetime) -> RouterDecision:
-        """Evaluate strategies 1-3 at 10:00 AM."""
+    def make_decision(self, timestamp: datetime) -> List[RouterDecision]:
+        """Evaluate strategies 1-3 at 10:00 AM. Returns all that qualify."""
         self.tape.snapshot_time = timestamp
         returns = self.tape.get_returns_summary()
         logger.info(f"ETF router 10:00 returns (%): {returns}")
 
+        fired: List[RouterDecision] = []
         for check in (
             self._check_vxx_spike_recovery,
             self._check_vxx_collapse,
@@ -174,37 +176,36 @@ class ETFRouter:
         ):
             decision = check(timestamp)
             if decision:
-                return decision
+                fired.append(decision)
 
-        logger.info("ETF router 10:00: no strategy fired (strategies 1-3)")
-        return RouterDecision(
-            branch=RouterBranch.NO_TRADE,
-            decision_time=timestamp,
-            market_state=self.tape,
-        )
+        if not fired:
+            logger.info("ETF router 10:00: no strategy fired (strategies 1-3)")
+        else:
+            logger.info(f"ETF router 10:00: {len(fired)} strategies fired: {[d.branch.value for d in fired]}")
+        return fired
 
     # ── 10:10 AM decision (strategies 4-5) ───────────────────────────────────
 
-    def make_decision_1010(self, timestamp: datetime) -> RouterDecision:
-        """Evaluate strategies 4-5 at 10:10 AM (only if no trade yet)."""
+    def make_decision_1010(self, timestamp: datetime) -> List[RouterDecision]:
+        """Evaluate strategies 4-5 at 10:10 AM (only if no 10:00 trade fired)."""
         self.tape.snapshot_time = timestamp
         returns = self.tape.get_returns_summary()
         logger.info(f"ETF router 10:10 returns (%): {returns}")
 
+        fired: List[RouterDecision] = []
         for check in (
             self._check_router_long,
             self._check_svix_long,
         ):
             decision = check(timestamp)
             if decision:
-                return decision
+                fired.append(decision)
 
-        logger.info("ETF router 10:10: no strategy fired (strategies 4-5)")
-        return RouterDecision(
-            branch=RouterBranch.NO_TRADE,
-            decision_time=timestamp,
-            market_state=self.tape,
-        )
+        if not fired:
+            logger.info("ETF router 10:10: no strategy fired (strategies 4-5)")
+        else:
+            logger.info(f"ETF router 10:10: {len(fired)} strategies fired: {[d.branch.value for d in fired]}")
+        return fired
 
     # ── Strategy implementations ──────────────────────────────────────────────
 

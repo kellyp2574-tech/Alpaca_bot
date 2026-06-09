@@ -138,7 +138,7 @@ class CombinedOvernightReboundBot:
         self.router_traded_today = False
         self.router_branch: Optional[str] = None
         self.mr_blocked_today = False
-        self.etf_position: Optional[Dict[str, Any]] = None
+        self.etf_positions: Dict[str, Any] = {}  # keyed by branch value, e.g. {"MOMENTUM_SLEEVE": {...}}
         self.etf_opens_930: Dict[str, float] = {}
         self.tape_recording_active = False
         self._tape_last_update_monotonic: float = 0.0
@@ -482,23 +482,22 @@ class CombinedOvernightReboundBot:
                     self._make_router_decision_1010()
                     self.router_decision_1010_made = True
 
-                # ETF exit checkpoints (planned_exit_time from position)
-                if self.etf_position:
+                # ETF exit checkpoints (planned_exit_time per position)
+                if self.etf_positions:
                     self._check_etf_exits(current_time)
 
                 # 15:00 intraday hard exit guard (belt-and-suspenders for strats 3/4/5)
-                if (self.etf_position
-                        and current_time >= t_intraday_1500):
-                    branch = (self.etf_position or {}).get("branch", "")
-                    if branch in ("MOMENTUM_SLEEVE", "MOMENTUM_SLEEVE_ANTI", "ROUTER_LONG", "SVIX_LONG"):
-                        logger.warning(f"15:00 hard exit for {branch}")
-                        self._execute_etf_exit()
+                if self.etf_positions and current_time >= t_intraday_1500:
+                    for _bk in list(self.etf_positions.keys()):
+                        if _bk in ("MOMENTUM_SLEEVE", "MOMENTUM_SLEEVE_ANTI", "ROUTER_LONG", "SVIX_LONG"):
+                            logger.warning(f"15:00 hard exit for {_bk}")
+                            self._execute_etf_exit(_bk)
 
                 # 15:30 intraday hard flatten — all ETF must be flat before MR entries
-                if (self.etf_position
-                        and current_time >= t_intraday_flat):
-                    logger.critical("Intraday hard flatten at 15:30 — forcing ETF exit")
-                    self._execute_etf_exit()
+                if self.etf_positions and current_time >= t_intraday_flat:
+                    for _bk in list(self.etf_positions.keys()):
+                        logger.critical(f"Intraday hard flatten at 15:30 — forcing ETF exit ({_bk})")
+                        self._execute_etf_exit(_bk)
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions
@@ -690,8 +689,8 @@ class CombinedOvernightReboundBot:
     def _check_etf_exits(self, current_time):
         return etf_router_runtime.check_etf_exits(self, current_time)
 
-    def _execute_etf_exit(self):
-        return etf_router_runtime.execute_etf_exit(self)
+    def _execute_etf_exit(self, branch_key: str):
+        return etf_router_runtime.execute_etf_exit(self, branch_key)
 
     # ═══════════════════════════════════════════════════
     # Overnight ETF sleeve delegates

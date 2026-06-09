@@ -99,7 +99,7 @@ def save_state(bot) -> None:
             "router_traded_today": bot.router_traded_today,
             "router_branch": bot.router_branch,
             "mr_blocked_today": bot.mr_blocked_today,
-            "etf_position": bot.etf_position,
+            "etf_positions": getattr(bot, "etf_positions", {}),  # dict keyed by branch value
             "startup_done": bot.startup_done,
             "tape_initialized": bot.tape_initialized,
             "router_decision_made": bot.router_decision_made,
@@ -172,8 +172,15 @@ def load_state(bot) -> None:
     bot.router_traded_today = bot_state.get("router_traded_today", False)
     bot.router_branch = bot_state.get("router_branch", None)
     bot.mr_blocked_today = bot_state.get("mr_blocked_today", False)
-    raw_etf = bot_state.get("etf_position")
-    bot.etf_position = validate_loaded_etf_position(raw_etf)
+    raw_etf_positions = bot_state.get("etf_positions") or {}
+    if isinstance(raw_etf_positions, dict):
+        bot.etf_positions = {
+            k: validate_loaded_etf_position(v)
+            for k, v in raw_etf_positions.items()
+            if validate_loaded_etf_position(v) is not None
+        }
+    else:
+        bot.etf_positions = {}
     bot.startup_done = bot_state.get("startup_done", False)
     bot.tape_initialized = bot_state.get("tape_initialized", False)
     bot.router_decision_made = bot_state.get("router_decision_made", False)
