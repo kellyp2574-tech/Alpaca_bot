@@ -560,9 +560,9 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
             order_type = "limit"
-            # Conservative SL anchor: min(last_price, limit_price) avoids
-            # marketable-limit distortion (stop based on inflated limit price)
-            entry_ref_price = min(float(last_price), limit_price)
+            # Conservative SL anchor: min(last_price, ask) avoids marketable-limit
+            # distortion and crossed/stale quotes (use lower of last vs ask)
+            entry_ref_price = min(float(last_price), float(ask))
             logger.info(
                 f"ETF entry {symbol}: qty={qty}, bid={bid}, ask={ask}, "
                 f"last={last_price}, marketable_limit={limit_price:.4f} "

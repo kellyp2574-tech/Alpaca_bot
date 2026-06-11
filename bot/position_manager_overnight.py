@@ -260,7 +260,14 @@ class PositionManager:
             return None, "fill_price_hint_required_for_bracket_market_order"
 
         # Reference price for computing SL/TP legs
-        ref_price = float(limit_price) if order_type == "limit" else float(fill_price_hint)
+        # Prioritize fill_price_hint (conservative anchor) if provided;
+        # fall back to limit_price for limit orders only when hint is absent.
+        if fill_price_hint is not None and fill_price_hint > 0:
+            ref_price = float(fill_price_hint)
+        elif order_type == "limit" and limit_price is not None and limit_price > 0:
+            ref_price = float(limit_price)
+        else:
+            return None, "ref_price_required_for_bracket_order"
 
         url = f"{self.base_url}/v2/orders"
         order_data: dict = {
