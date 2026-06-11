@@ -550,39 +550,33 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
         # Marketable limit (issue #6): bound slippage above the ask.
         slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
 
-        # Per-branch SL/TP from config
+        # Per-branch SL config (SL armed later, no TP — timed exits only)
         sl_tp_table = getattr(config, "ETF_SL_TP", {})
-        branch_key = decision.branch.value  # e.g. "A_PLUS_PLUS_LONG"
+        branch_key = decision.branch.value
         sl_tp = sl_tp_table.get(branch_key, {})
-        sl_pct = sl_tp.get("sl")   # None or float (e.g. 0.06)
-        tp_pct = sl_tp.get("tp")   # None or float (e.g. 0.20)
+        sl_pct = sl_tp.get("sl")           # None or float (e.g. 0.005 = 0.5%)
+        sl_arm_time_str = sl_tp.get("sl_arm_time")  # "13:00" or None
+        exit_time_str = sl_tp.get("exit_time")     # "15:00", "15:30", etc.
 
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
             order_type = "limit"
-            # Conservative SL anchor: min(last_price, ask) avoids marketable-limit
-            # distortion and crossed/stale quotes (use lower of last vs ask)
-            entry_ref_price = min(float(last_price), float(ask))
             logger.info(
                 f"ETF entry {symbol}: qty={qty}, bid={bid}, ask={ask}, "
                 f"last={last_price}, marketable_limit={limit_price:.4f} "
-                f"(ask + {slippage_pct:.2%}) ref={entry_ref_price:.2f} SL={sl_pct} TP={tp_pct}"
+                f"(ask + {slippage_pct:.2%}) SL={sl_pct} (armed@{sl_arm_time_str}) EXIT={exit_time_str}"
             )
-            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+            order, error_type = bot.position_mgr.submit_buy_order(
                 symbol, qty,
                 order_type="limit", limit_price=limit_price,
-                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
-                fill_price_hint=entry_ref_price,
             )
         else:
             # No ask available — falls back to market order. Should be
             # rare after the execution gate, kept as a defensive path.
             logger.warning(f"ETF entry {symbol}: no ask after gate — using market order")
-            order, error_type = bot.position_mgr.submit_bracket_buy_order(
+            order, error_type = bot.position_mgr.submit_buy_order(
                 symbol, qty,
                 order_type="market",
-                stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
-                fill_price_hint=float(last_price),
             )
             limit_price = None
             order_type = "market"
@@ -603,15 +597,16 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
                     "entry_price": fill_price,
                     "entry_time": datetime.now(_ET).isoformat(),
                     "branch": branch_key,
-                    "planned_exit_time": decision.exit_time.isoformat() if decision.exit_time else None,
-                    "order_id": order.get("id"),
-                    "bracket_order_id": order.get("id"),  # same ID; legs are children
-                    "sl_pct": sl_pct,
-                    "tp_pct": tp_pct,
+                    "exit_time": exit_time_str,           # from config (e.g. "15:00")
+                    "sl_pct": sl_pct,                     # for SL calculation
+                    "sl_arm_time": sl_arm_time_str,       # when to submit SL (e.g. "13:00")
+                    "sl_order_id": None,                  # set when SL is armed
+                    "sl_armed": False,                    # flag to track if SL submitted
+                    "order_id": order.get("id"),          # entry order ID
                 }
                 logger.info(
                     f"ETF position opened: {branch_key} {symbol} {filled_qty}sh @ ${fill_price:.2f} "
-                    f"SL={sl_pct} TP={tp_pct}"
+                    f"SL={sl_pct} (armed@{sl_arm_time_str}) EXIT={exit_time_str}"
                 )
             else:
                 logger.warning(f"ETF entry not filled for {symbol} ({branch_key}); canceling and leaving flat")
@@ -628,7 +623,11 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
 # ────────────────────────────────────────────────────────────────────
 
 def check_etf_exits(bot, current_time: dt_time) -> None:
-    """Check exit time and bracket SL/TP triggers for every open ETF position."""
+    """Check SL arming times and timed exits for all open ETF positions.
+
+    SL orders are submitted at "sl_arm_time" (not bracket at entry).
+    Timed exits occur at "exit_time" from config (hard exit regardless of PnL).
+    """
     positions = getattr(bot, "etf_positions", None) or {}
     if not positions:
         return
@@ -639,39 +638,57 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
             continue
 
         symbol = pos.get("symbol")
-        planned_exit = pos.get("planned_exit_time")
-        if not symbol or not planned_exit:
+        qty = pos.get("qty", 0)
+        entry_price = pos.get("entry_price", 0)
+        sl_pct = pos.get("sl_pct")
+        sl_arm_time_str = pos.get("sl_arm_time")
+        exit_time_str = pos.get("exit_time")
+
+        if not symbol or qty <= 0:
             continue
 
-        # Bracket early-exit detection: SL/TP leg filled — broker shows no position
-        bracket_id = pos.get("bracket_order_id")
-        if bracket_id:
+        # ── Check if SL needs to be armed ────────────────────────────────────
+        if sl_pct and sl_arm_time_str and not pos.get("sl_armed"):
             try:
-                broker_pos = bot.position_mgr.get_broker_position(symbol)
-                if broker_pos is bot.position_mgr.BROKER_NOT_FOUND:
+                parts = sl_arm_time_str.split(":")
+                arm_h, arm_m = int(parts[0]), int(parts[1])
+                if current_time >= dt_time(arm_h, arm_m):
+                    # Submit stop-loss order now
+                    stop_price = round(entry_price * (1.0 - sl_pct), 2)
                     logger.info(
-                        f"ETF bracket ({branch_key}): broker shows no {symbol} — "
-                        f"SL/TP leg triggered. Clearing position."
+                        f"ETF SL arming: {branch_key} {symbol} stop=${stop_price:.2f} "
+                        f"(entry=${entry_price:.2f} sl_pct={sl_pct:.3f})"
                     )
-                    _clear_one_etf_position(bot, branch_key)
-                    bot._save_state()
-                    continue
+                    sl_order = bot.position_mgr.submit_stop_sell_order(symbol, qty, stop_price)
+                    if sl_order and sl_order.get("id"):
+                        pos["sl_order_id"] = sl_order.get("id")
+                        pos["sl_armed"] = True
+                        pos["sl_price"] = stop_price
+                        bot._save_state()
+                        logger.info(f"ETF SL armed: {branch_key} order={sl_order.get('id')}")
+                    else:
+                        logger.warning(f"ETF SL arm FAILED: {branch_key} {symbol}")
             except Exception as e:
-                logger.warning(f"ETF bracket check failed ({branch_key}): {e}")
+                logger.warning(f"ETF SL arm check failed ({branch_key}): {e}")
 
-        # Parse planned exit time
-        try:
-            if isinstance(planned_exit, str):
-                parts = planned_exit.split(":")
+        # ── Check if exit time reached ───────────────────────────────────────
+        if exit_time_str:
+            try:
+                parts = exit_time_str.split(":")
                 exit_h, exit_m = int(parts[0]), int(parts[1])
-            else:
-                exit_h, exit_m = planned_exit.hour, planned_exit.minute
-        except Exception:
-            continue
-
-        if current_time >= dt_time(exit_h, exit_m):
-            logger.info(f"ETF exit time reached: {branch_key} {symbol} at {current_time}")
-            execute_etf_exit(bot, branch_key)
+                if current_time >= dt_time(exit_h, exit_m):
+                    # Cancel any resting SL order first, then exit
+                    sl_order_id = pos.get("sl_order_id")
+                    if sl_order_id:
+                        try:
+                            bot.position_mgr._cancel_order(sl_order_id)
+                            logger.info(f"ETF exit: canceled SL order {sl_order_id} ({branch_key})")
+                        except Exception:
+                            pass
+                    logger.info(f"ETF exit time reached: {branch_key} {symbol} at {current_time}")
+                    execute_etf_exit(bot, branch_key)
+            except Exception as e:
+                logger.warning(f"ETF exit time check failed ({branch_key}): {e}")
 
 
 def _clear_one_etf_position(bot, branch_key: str) -> None:
@@ -740,13 +757,12 @@ def execute_etf_exit(bot, branch_key: str) -> None:
         logger.info(f"ETF exit order {existing_exit_id} still pending ({branch_key}); waiting")
         return
 
-    # ── Step 2: cancel resting broker-side exit legs ─────────────────────────
+    # ── Step 2: cancel resting SL or other sell orders ─────────────────────────
     try:
         cancelled = bot.position_mgr.cancel_open_sell_orders_for_symbol(symbol)
         if cancelled:
             logger.info(f"ETF exit: canceled {cancelled} resting sell orders for {symbol} ({branch_key})")
-        pos["trailing_stop_order_id"] = None
-        pos["bracket_order_id"] = None
+        pos["sl_order_id"] = None
         bot._save_state()
     except Exception as e:
         logger.warning(f"ETF exit: failed to cancel resting orders for {symbol} ({branch_key}): {e}")

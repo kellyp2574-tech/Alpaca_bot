@@ -524,6 +524,61 @@ class PositionManager:
             self._exit_failure_times[symbol] = datetime.now()
             return None
 
+    def submit_stop_sell_order(self, symbol: str, qty: int, stop_price: float,
+                               verify_broker_qty: bool = True) -> Optional[dict]:
+        """Submit a day stop sell order via POST /v2/orders.
+
+        Used by ETF router to arm stop-loss at specific times (not bracket).
+        Alpaca converts to a market sell when stop_price is touched.
+
+        Safety: same broker pre-check as ``_submit_sell_order``. If the broker
+        confirms no position, the order is refused (would create a short).
+        """
+        if verify_broker_qty:
+            safe_qty = self._verify_sell_qty(symbol, qty)
+            if safe_qty <= 0:
+                return None
+            qty = safe_qty
+        url = f"{self.base_url}/v2/orders"
+        stop_price = self.round_limit_price(stop_price)
+        decimals = 2 if stop_price >= 1.0 else 4
+        order_data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "stop",
+            "time_in_force": "day",
+            "stop_price": f"{stop_price:.{decimals}f}",
+        }
+
+        try:
+            response = self.session.post(url, json=order_data, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            order_id = data.get("id")
+            logger.info(
+                f"Stop sell submitted: {symbol} x{qty} stop=${stop_price:.{decimals}f} (ID: {order_id})"
+            )
+            self._exit_failures.pop(symbol, None)
+            self._exit_failure_times.pop(symbol, None)
+            return data
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "N/A"
+            try:
+                body = e.response.text[:500] if e.response is not None else ""
+            except Exception:
+                body = "<unreadable>"
+            logger.error(
+                f"Stop sell FAILED | symbol={symbol} | qty={qty} | stop={stop_price} | "
+                f"status={status_code} | body={body[:500]}"
+            )
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"Stop sell FAILED (network) | symbol={symbol} | qty={qty} | error={e}"
+            )
+            return None
+
     def _get_last_price(self, symbol: str) -> Optional[float]:
         """Get last trade price for a symbol (for limit sell fallback)."""
         try:

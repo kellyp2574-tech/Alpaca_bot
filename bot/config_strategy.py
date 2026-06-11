@@ -167,24 +167,25 @@ OVERNIGHT_GAP_BOUNCE_VEHICLE = "TQQQ"
 OVERNIGHT_ETF_EXIT_TIME = "09:30"
 
 # ═══════════════════════════════════════════════════
-# Per-strategy Stop-Loss / Take-Profit (bracket orders)
+# Per-strategy Stop-Loss / Take-Profit (timed exits, SL armed later)
 # ═══════════════════════════════════════════════════
-# All values are fractions of fill price (e.g. 0.02 = 2%).
-# None = that leg is omitted.
+# SL/TP values are fractions of fill price (e.g. 0.005 = 0.5%).
+# SL_ARM_TIME: When to submit the stop-loss order (not a bracket at entry).
+# EXIT_TIME: Hard timed exit regardless of PnL.
 #
-# Strategy              SL       TP     Notes
-# VXX Spike Recovery   None     None   No SL/TP — hard time exit at 15:30
-# VXX Collapse         None     None   No SL/TP — hard time exit at 15:30
-# Momentum Sleeve      -1%      +2%    Time exit 15:00 is fallback
-# Router Long          -1%      +3%    Time exit 15:00 is fallback
-# SVIX Long            None     +3%    No SL per strategy rules
+# Strategy              SL       SL_ARM_TIME   EXIT_TIME   Notes
+# Momentum_Sleeve      0.5%     13:00         15:00       Cut losers at 1pm, ride winners
+# Router_Long          0.5%     13:30         15:30       Cut losers at 1:30pm, late exit
+# SVIX_Long            0.5%     13:30         15:00       Cut losers at 1:30pm, 3pm exit
+# VXX_Collapse         1.0%     13:00         15:30       Catastrophe stop, ride vol crush
+# VXX_Spike_Recovery   None     None          15:30       No SL — hard time exit only
 ETF_SL_TP: dict = {
-    "VXX_SPIKE_RECOVERY":       {"sl": None,  "tp": None},
-    "VXX_COLLAPSE":             {"sl": None,  "tp": None},
-    "MOMENTUM_SLEEVE":          {"sl": 0.01,  "tp": 0.02},
-    "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.01,  "tp": 0.02},  # SQQQ anti-momentum, same SL/TP
-    "ROUTER_LONG":              {"sl": 0.01,  "tp": 0.03},
-    "SVIX_LONG":                {"sl": None,  "tp": 0.03},
+    "VXX_SPIKE_RECOVERY":       {"sl": None,       "tp": None, "sl_arm_time": None,     "exit_time": "15:30"},
+    "VXX_COLLAPSE":             {"sl": 0.01,       "tp": None, "sl_arm_time": "13:00",  "exit_time": "15:30"},  # 1% SL
+    "MOMENTUM_SLEEVE":          {"sl": 0.005,      "tp": None, "sl_arm_time": "13:00",  "exit_time": "15:00"},  # 0.5% SL
+    "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.005,      "tp": None, "sl_arm_time": "13:00",  "exit_time": "15:00"},  # SQQQ anti-momentum
+    "ROUTER_LONG":              {"sl": 0.005,      "tp": None, "sl_arm_time": "13:30",  "exit_time": "15:30"},  # 0.5% SL
+    "SVIX_LONG":                {"sl": 0.005,      "tp": None, "sl_arm_time": "13:30",  "exit_time": "15:00"},  # 0.5% SL
 }
 
 # ═══════════════════════════════════════════════════
