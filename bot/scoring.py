@@ -67,6 +67,44 @@ def step_score_and_rank(bot) -> None:
     logger.info("SCORING: Building MR candidates")
     logger.info("=" * 50)
 
+    # Free MR pipeline: Massive previous-day + Alpaca live snapshots
+    if getattr(config, "USE_FREE_MR_PIPELINE", False):
+        from bot.mr_free_data_pipeline import (
+            build_massive_prevday_watchlist,
+            build_live_mr_candidates_from_free_pipeline,
+            convert_live_to_existing_mr_candidate,
+            previous_weekday,
+        )
+
+        watchlist = build_massive_prevday_watchlist(
+            massive_api_key=config.MASSIVE_API_KEY,
+            trade_date=previous_weekday(),
+            min_prev_close=float(getattr(config, "MR_FREE_PREV_MIN_PRICE", 0.75)),
+            max_prev_close=float(getattr(config, "MR_FREE_PREV_MAX_PRICE", 3.00)),
+            min_prev_dollar_volume=float(getattr(config, "MR_FREE_PREV_MIN_DOLLAR_VOLUME", 500_000)),
+        )
+
+        live_candidates = build_live_mr_candidates_from_free_pipeline(
+            watchlist=watchlist,
+            alpaca_data_key=config.ALPACA_API_KEY,
+            alpaca_data_secret=config.ALPACA_SECRET_KEY,
+            feed=getattr(config, "DATA_FEED", "iex"),
+        )
+
+        bot.mr_candidates = [
+            convert_live_to_existing_mr_candidate(c)
+            for c in live_candidates
+        ]
+
+        bot.scoring_done = True
+        bot._save_state()
+
+        logger.info(
+            f"FREE MR PIPELINE: watchlist={len(watchlist)} "
+            f"passed={len(bot.mr_candidates)}"
+        )
+        return
+
     try:
         today = date.today().isoformat()
         signal_end = config.ENTRY_TIME  # usually 15:45 in current paper/live config

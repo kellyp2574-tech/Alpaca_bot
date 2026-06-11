@@ -205,6 +205,20 @@ MR_RANK_BY_CLOSE_LOCATION_ONLY = True
 MR_MIN_CANDIDATES = 2
 
 # ═══════════════════════════════════════════════════
+# MR free-data pipeline (replaces paid Massive live data)
+# ═══════════════════════════════════════════════════
+USE_FREE_MR_PIPELINE = False  # Set True to use Massive free + Alpaca snapshots
+
+# Stage 1: Massive previous-day grouped daily filters (broad watchlist)
+MR_FREE_PREV_MIN_PRICE = 0.75
+MR_FREE_PREV_MAX_PRICE = 3.00
+MR_FREE_PREV_MIN_DOLLAR_VOLUME = 500_000
+
+# Stage 2: Alpaca live snapshot scan settings
+MR_FREE_ALPACA_BATCH_SIZE = 200
+MR_FREE_ALPACA_BATCH_SLEEP_SECONDS = 0.25
+
+# ═══════════════════════════════════════════════════
 # MR regime sizing
 # ═══════════════════════════════════════════════════
 ENABLE_MR_ETF_REGIME_SIZING = True
