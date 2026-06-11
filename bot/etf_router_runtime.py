@@ -74,7 +74,11 @@ def build_etf_router_summary(bot) -> Dict[str, Any]:
     if not getattr(config, "ETF_ROUTER_ENABLED", False):
         return {"enabled": False}
 
-    decision = bot.router_decision
+    # All decisions (multi-strategy support)
+    decisions = getattr(bot, "router_decisions", None)
+    if decisions is None and bot.router_decision:
+        decisions = [bot.router_decision]
+
     summary: Dict[str, Any] = {
         "enabled": True,
         "tape_initialized": bot.tape_initialized,
@@ -85,14 +89,21 @@ def build_etf_router_summary(bot) -> Dict[str, Any]:
         "intraday_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
         "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
     }
-    if decision is not None:
+
+    # All decisions (new format requested by user)
+    if decisions:
         try:
-            summary["decision"] = decision.to_dict()
+            summary["decisions"] = [d.to_dict() for d in decisions]
         except Exception:
-            logger.warning("ETF router decision.to_dict() failed", exc_info=True)
-    if bot.etf_position:
-        logger.warning(f"ETF router EOD: still holding {bot.etf_position.get('symbol')}")
-        summary["open_position_at_eod"] = bot.etf_position
+            logger.warning("ETF router decisions.to_dict() failed", exc_info=True)
+
+    # All open positions (multi-strategy)
+    positions = getattr(bot, "etf_positions", {})
+    if positions:
+        open_symbols = [p.get("symbol") for p in positions.values()]
+        logger.warning(f"ETF router EOD: still holding {open_symbols}")
+        summary["open_positions_at_eod"] = positions
+
     return summary
 
 
@@ -378,7 +389,8 @@ def make_router_decision(bot) -> None:
     _execute_all_etf_entries(bot, decisions)
     if bot.etf_positions:
         filled = list(bot.etf_positions.keys())
-        bot.router_decision = decisions[0]  # primary decision for state compat
+        bot.router_decisions = decisions  # store ALL decisions for artifact
+        bot.router_decision = decisions[0]  # primary for backwards compat
         bot.router_branch = ",".join(filled)
         bot.router_traded_today = True
         bot.mr_blocked_today = True
@@ -417,6 +429,7 @@ def make_router_decision_1010(bot) -> None:
     _execute_all_etf_entries(bot, decisions)
     if bot.etf_positions:
         filled = list(bot.etf_positions.keys())
+        bot.router_decisions = decisions  # store ALL decisions
         bot.router_decision = decisions[0]
         bot.router_branch = ",".join(filled)
         bot.router_traded_today = True
@@ -547,15 +560,19 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
             order_type = "limit"
+            # Conservative SL anchor: min(last_price, limit_price) avoids
+            # marketable-limit distortion (stop based on inflated limit price)
+            entry_ref_price = min(float(last_price), limit_price)
             logger.info(
                 f"ETF entry {symbol}: qty={qty}, bid={bid}, ask={ask}, "
                 f"last={last_price}, marketable_limit={limit_price:.4f} "
-                f"(ask + {slippage_pct:.2%}) SL={sl_pct} TP={tp_pct}"
+                f"(ask + {slippage_pct:.2%}) ref={entry_ref_price:.2f} SL={sl_pct} TP={tp_pct}"
             )
             order, error_type = bot.position_mgr.submit_bracket_buy_order(
                 symbol, qty,
                 order_type="limit", limit_price=limit_price,
                 stop_loss_pct=sl_pct, take_profit_pct=tp_pct,
+                fill_price_hint=entry_ref_price,
             )
         else:
             # No ask available — falls back to market order. Should be

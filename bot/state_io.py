@@ -96,6 +96,7 @@ def save_state(bot) -> None:
             "kill_switch_reason": bot.kill_switch_reason,
             # ETF Router state
             "router_decision": bot.router_decision.to_dict() if bot.router_decision else None,
+            "router_decisions": [d.to_dict() for d in getattr(bot, "router_decisions", []) if d],
             "router_traded_today": bot.router_traded_today,
             "router_branch": bot.router_branch,
             "mr_blocked_today": bot.mr_blocked_today,
@@ -126,10 +127,11 @@ def load_state(bot) -> None:
         # Reset ETF router state for new day
         bot.etf_router.reset()
         bot.router_decision = None
+        bot.router_decisions = []
         bot.router_traded_today = False
         bot.router_branch = None
         bot.mr_blocked_today = False
-        bot.etf_position = None
+        bot.etf_positions = {}
         bot.startup_done = False
         bot.tape_initialized = False
         bot.router_decision_made = False
@@ -169,6 +171,8 @@ def load_state(bot) -> None:
 
     # ETF Router state
     bot.router_decision = parse_router_decision_from_dict(bot_state.get("router_decision"))
+    raw_decisions = bot_state.get("router_decisions") or []
+    bot.router_decisions = [parse_router_decision_from_dict(d) for d in raw_decisions if d]
     bot.router_traded_today = bot_state.get("router_traded_today", False)
     bot.router_branch = bot_state.get("router_branch", None)
     bot.mr_blocked_today = bot_state.get("mr_blocked_today", False)

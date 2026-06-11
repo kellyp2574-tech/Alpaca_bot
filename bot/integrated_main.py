@@ -135,6 +135,7 @@ class CombinedOvernightReboundBot:
 
         # ETF Router state
         self.router_decision: Optional[RouterDecision] = None
+        self.router_decisions: List[RouterDecision] = []  # all fired strategies (multi-strategy)
         self.router_traded_today = False
         self.router_branch: Optional[str] = None
         self.mr_blocked_today = False

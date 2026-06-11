@@ -77,9 +77,9 @@ class RateLimitedSession(requests.Session):
         return super().request(method, url, **kwargs)
 
 
-# Module-level shared limiter: 80 requests per 60 seconds across all Alpaca sessions
-# (20-call buffer under Alpaca's 100/min hard limit for retries and bursts)
-_alpaca_limiter = SlidingWindowLimiter(max_calls=80, window_seconds=60.0)
+# Module-level shared limiter: 60 requests per 60 seconds across all Alpaca sessions
+# (40-call buffer under Alpaca's 100/min hard limit; June 11 had 136 warnings @ 80)
+_alpaca_limiter = SlidingWindowLimiter(max_calls=60, window_seconds=60.0)
 
 
 def create_alpaca_session() -> RateLimitedSession:
