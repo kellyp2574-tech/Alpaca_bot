@@ -396,7 +396,10 @@ def make_router_decision(bot) -> None:
         bot.mr_blocked_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
-        logger.info(f"Intraday sleeve filled: {filled} — overnight ETF + MR blocked")
+        logger.info(
+            f"Intraday sleeve filled: {filled} — "
+            f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}; MR blocked"
+        )
 
     bot._save_state()
 
@@ -436,7 +439,10 @@ def make_router_decision_1010(bot) -> None:
         bot.mr_blocked_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
-        logger.info(f"Intraday sleeve filled (10:10): {filled} — overnight ETF + MR blocked")
+        logger.info(
+            f"Intraday sleeve filled (10:10): {filled} — "
+            f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}; MR blocked"
+        )
 
     bot._save_state()
 
@@ -600,6 +606,7 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
                     "exit_time": exit_time_str,           # from config (e.g. "15:00")
                     "sl_arm_time": sl_arm_time_str,       # when to check green/flat (e.g. "13:00")
                     "afternoon_gate_checked": False,      # True after green/flat decision made
+                    "blocks_overnight": blocks_overnight, # for audit/debug (day-level flag is what matters)
                     "order_id": order.get("id"),          # entry order ID
                 }
                 # Persistent day-level flag: blocking positions prevent overnight ETF even after exit
