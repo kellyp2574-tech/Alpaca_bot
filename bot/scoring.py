@@ -40,6 +40,16 @@ def step_collect_data(bot) -> None:
     logger.info("DATA COLLECTION: Building base universe (staged pipeline)")
     logger.info("=" * 50)
 
+    # Free MR pipeline: skip paid/live universe build - watchlist built at scoring time
+    if getattr(config, "USE_FREE_MR_PIPELINE", False):
+        logger.info("FREE MR PIPELINE enabled: skipping paid/live universe build at 15:30")
+        bot.universe = []
+        bot._universe_diag = None
+        bot._adv_cache = {}
+        bot.data_collected = True
+        bot._save_state()
+        return
+
     try:
         final, diag, adv_cache = build_universe(bot.massive, bot.alpaca)
 
@@ -98,6 +108,27 @@ def step_score_and_rank(bot) -> None:
 
         bot.scoring_done = True
         bot._save_state()
+
+        # Audit logging for debugging
+        def _free_mr_dict(c):
+            return {
+                "symbol": c.symbol,
+                "sleeve": "MR_FREE",
+                "selection_score": round(c.selection_score, 4),
+                "signal_price": round(c.signal_price, 4),
+                "day_return": round(c.day_return, 4),
+                "volume_ratio": round(c.volume_ratio, 2),
+                "close_position": round(c.close_position, 3),
+                "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
+                "adv_dollars": round(c.adv_dollars, 0),
+                "source": "massive_prevday_plus_alpaca_snapshot",
+            }
+
+        audit_dicts = {
+            "mr_selected": [_free_mr_dict(c) for c in bot.mr_candidates[:getattr(config, "MR_MAX_PRIMARY_POSITIONS", 3)]],
+            "mr_all_passed": [_free_mr_dict(c) for c in bot.mr_candidates],
+        }
+        save_candidates_audit(audit_dicts)
 
         logger.info(
             f"FREE MR PIPELINE: watchlist={len(watchlist)} "

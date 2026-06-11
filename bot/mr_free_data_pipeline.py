@@ -86,10 +86,26 @@ def build_massive_prevday_watchlist(
         "apiKey": massive_api_key,
     }
 
-    logger.info(f"Massive prevday watchlist: fetching grouped daily for {trade_date}")
-    resp = requests.get(url, params=params, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
+    # Holiday fallback: try up to 5 previous weekdays if no data
+    payload = None
+    for attempt in range(5):
+        logger.info(f"Massive prevday watchlist: fetching grouped daily for {trade_date} (attempt {attempt+1})")
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            results = payload.get("results") or []
+            if results:
+                break
+            logger.warning(f"No grouped data for {trade_date}, trying previous weekday")
+        except requests.RequestException as e:
+            logger.warning(f"Massive request failed for {trade_date}: {e}")
+
+        trade_date = previous_weekday(trade_date)
+        url = f"https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{trade_date.isoformat()}"
+    else:
+        logger.error("Massive prevday watchlist failed: no grouped data found after 5 attempts")
+        return []
 
     results = payload.get("results") or []
     watchlist: List[MRWatchSymbol] = []
@@ -420,8 +436,8 @@ def convert_live_to_existing_mr_candidate(c: LiveMRCandidate):
         high_930_to_signal=c.signal_price,  # placeholder - use day_high if available
         low_930_to_signal=c.signal_price,  # placeholder - use day_low if available
         volume_930_to_signal=int(c.volume_today or 0),
-        adv_20d=c.adv_dollars / 20.0,  # rough estimate from prev-day volume
-        adv_dollars=c.adv_dollars,
+        adv_20d=c.adv_dollars,      # proxy ADV from previous-day Massive dollar volume
+        adv_dollars=c.adv_dollars,  # do NOT multiply by 50 when source is Massive
         day_return=c.day_return,
         volume_ratio=1.0,  # placeholder unless you compute today's vol / ADV
         close_position=c.close_position,

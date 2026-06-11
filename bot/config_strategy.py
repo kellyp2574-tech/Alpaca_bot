@@ -207,7 +207,7 @@ MR_MIN_CANDIDATES = 2
 # ═══════════════════════════════════════════════════
 # MR free-data pipeline (replaces paid Massive live data)
 # ═══════════════════════════════════════════════════
-USE_FREE_MR_PIPELINE = False  # Set True to use Massive free + Alpaca snapshots
+USE_FREE_MR_PIPELINE = True   # ENABLED for paper test: Massive free + Alpaca snapshots
 
 # Stage 1: Massive previous-day grouped daily filters (broad watchlist)
 MR_FREE_PREV_MIN_PRICE = 0.75

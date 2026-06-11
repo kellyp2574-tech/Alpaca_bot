@@ -122,7 +122,7 @@ class CombinedOvernightReboundBot:
     """
 
     def __init__(self):
-        self.massive = MassiveClient()
+        self.massive = None if getattr(config, "USE_FREE_MR_PIPELINE", False) else MassiveClient()
         self.alpaca = AlpacaDataClient()
         self.position_mgr = PositionManager()
         self.state_mgr = StateManager()
