@@ -180,12 +180,13 @@ OVERNIGHT_ETF_EXIT_TIME = "09:30"
 # VXX_Collapse         1.0%     13:00         15:30       Catastrophe stop, ride vol crush
 # VXX_Spike_Recovery   None     None          15:30       No SL — hard time exit only
 ETF_SL_TP: dict = {
-    "VXX_SPIKE_RECOVERY":       {"sl": None,       "tp": None, "sl_arm_time": None,     "exit_time": "15:30"},
-    "VXX_COLLAPSE":             {"sl": 0.01,       "tp": None, "sl_arm_time": "13:00",  "exit_time": "15:30"},  # 1% SL
-    "MOMENTUM_SLEEVE":          {"sl": 0.005,      "tp": None, "sl_arm_time": "13:00",  "exit_time": "15:00"},  # 0.5% SL
-    "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.005,      "tp": None, "sl_arm_time": "13:00",  "exit_time": "15:00"},  # SQQQ anti-momentum
-    "ROUTER_LONG":              {"sl": 0.005,      "tp": None, "sl_arm_time": "13:30",  "exit_time": "15:30"},  # 0.5% SL
-    "SVIX_LONG":                {"sl": 0.005,      "tp": None, "sl_arm_time": "13:30",  "exit_time": "15:00"},  # 0.5% SL
+    #                                              blocks_overnight_etf = prevents 15:45 overnight ETF from firing
+    "VXX_SPIKE_RECOVERY":       {"sl": None,  "sl_arm_time": None,    "exit_time": "15:30", "blocks_overnight_etf": True},
+    "VXX_COLLAPSE":             {"sl": 0.01,   "sl_arm_time": "13:00", "exit_time": "15:30", "blocks_overnight_etf": True},   # 1% SL
+    "MOMENTUM_SLEEVE":          {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": True},   # 0.5% SL, blocks
+    "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": False},  # SQQQ — allows overnight ETF
+    "ROUTER_LONG":              {"sl": 0.005,  "sl_arm_time": "13:30", "exit_time": "15:30", "blocks_overnight_etf": True},   # 0.5% SL, blocks
+    "SVIX_LONG":                {"sl": 0.005,  "sl_arm_time": "13:30", "exit_time": "15:00", "blocks_overnight_etf": False},  # SVIX — allows overnight ETF
 }
 
 # ═══════════════════════════════════════════════════

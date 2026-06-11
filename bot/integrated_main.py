@@ -152,6 +152,7 @@ class CombinedOvernightReboundBot:
         self.overnight_etf_fired = False        # True if an overnight ETF strategy fired
         self.overnight_etf_position: Optional[Dict[str, Any]] = None
         self.overnight_etf_decision_made = False
+        self.overnight_etf_blocked_today = False  # True if any blocking intraday ETF fired
 
         # Stage flags
         self.startup_done = False
@@ -487,10 +488,11 @@ class CombinedOvernightReboundBot:
                 if self.etf_positions:
                     self._check_etf_exits(current_time)
 
-                # 15:00 intraday hard exit guard (belt-and-suspenders for strats 3/4/5)
+                # 15:00 intraday hard exit guard (belt-and-suspenders for strats 3/5)
+                # Router_Long exits at 15:30 per config, not here
                 if self.etf_positions and current_time >= t_intraday_1500:
                     for _bk in list(self.etf_positions.keys()):
-                        if _bk in ("MOMENTUM_SLEEVE", "MOMENTUM_SLEEVE_ANTI", "ROUTER_LONG", "SVIX_LONG"):
+                        if _bk in ("MOMENTUM_SLEEVE", "MOMENTUM_SLEEVE_ANTI", "SVIX_LONG"):
                             logger.warning(f"15:00 hard exit for {_bk}")
                             self._execute_etf_exit(_bk)
 
@@ -516,10 +518,12 @@ class CombinedOvernightReboundBot:
             if self.data_collected and not self.scoring_done and current_time >= t_scoring:
                 self._step_score_and_rank()
 
-            # 15:45 — Overnight ETF (strategies A/B/C) — only if no intraday trade today
+            # 15:45 — Overnight ETF (strategies A/B/C) — only if no blocking intraday position
+            # Some intraday positions (SVIX, SQQQ) don't block; others (TQQQ) do block
+            # Use persistent flag (not current positions) since blocking positions exit before 15:45
             if (self.scoring_done
                     and not self.overnight_etf_decision_made
-                    and not self.intraday_etf_sleeve_filled
+                    and not self.overnight_etf_blocked_today
                     and current_time >= t_entry
                     and getattr(config, "OVERNIGHT_ETF_ENABLED", True)):
                 self._evaluate_overnight_etf_strategies()

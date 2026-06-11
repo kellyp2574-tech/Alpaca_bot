@@ -111,6 +111,7 @@ def save_state(bot) -> None:
             "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
             "overnight_etf_position": getattr(bot, "overnight_etf_position", None),
             "overnight_etf_decision_made": getattr(bot, "overnight_etf_decision_made", False),
+            "overnight_etf_blocked_today": getattr(bot, "overnight_etf_blocked_today", False),
         }
         bot.state_mgr.save_bot_state(bot_state)
     except Exception as e:
@@ -142,6 +143,7 @@ def load_state(bot) -> None:
         bot.overnight_etf_fired = False
         bot.overnight_etf_position = None
         bot.overnight_etf_decision_made = False
+        bot.overnight_etf_blocked_today = False
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -195,6 +197,7 @@ def load_state(bot) -> None:
     bot.overnight_etf_fired = bot_state.get("overnight_etf_fired", False)
     bot.overnight_etf_position = bot_state.get("overnight_etf_position", None)
     bot.overnight_etf_decision_made = bot_state.get("overnight_etf_decision_made", False)
+    bot.overnight_etf_blocked_today = bot_state.get("overnight_etf_blocked_today", False)
 
     saved = bot.state_mgr.load_positions()
     if saved:

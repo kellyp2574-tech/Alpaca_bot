@@ -550,13 +550,13 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
         # Marketable limit (issue #6): bound slippage above the ask.
         slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
 
-        # Per-branch SL config (SL armed later, no TP — timed exits only)
+        # Per-branch config: green/flat gate time, hard exit time, overnight blocking
         sl_tp_table = getattr(config, "ETF_SL_TP", {})
         branch_key = decision.branch.value
         sl_tp = sl_tp_table.get(branch_key, {})
-        sl_pct = sl_tp.get("sl")           # None or float (e.g. 0.005 = 0.5%)
-        sl_arm_time_str = sl_tp.get("sl_arm_time")  # "13:00" or None
+        sl_arm_time_str = sl_tp.get("sl_arm_time")  # "13:00" or None (gate check time)
         exit_time_str = sl_tp.get("exit_time")     # "15:00", "15:30", etc.
+        blocks_overnight = sl_tp.get("blocks_overnight_etf", True)  # default blocks
 
         if ask:
             limit_price = float(ask) * (1.0 + slippage_pct)
@@ -564,7 +564,7 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
             logger.info(
                 f"ETF entry {symbol}: qty={qty}, bid={bid}, ask={ask}, "
                 f"last={last_price}, marketable_limit={limit_price:.4f} "
-                f"(ask + {slippage_pct:.2%}) SL={sl_pct} (armed@{sl_arm_time_str}) EXIT={exit_time_str}"
+                f"(ask + {slippage_pct:.2%}) GATE@{sl_arm_time_str} EXIT={exit_time_str}"
             )
             order, error_type = bot.position_mgr.submit_buy_order(
                 symbol, qty,
@@ -598,15 +598,17 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
                     "entry_time": datetime.now(_ET).isoformat(),
                     "branch": branch_key,
                     "exit_time": exit_time_str,           # from config (e.g. "15:00")
-                    "sl_pct": sl_pct,                     # for SL calculation
-                    "sl_arm_time": sl_arm_time_str,       # when to submit SL (e.g. "13:00")
-                    "sl_order_id": None,                  # set when SL is armed
-                    "sl_armed": False,                    # flag to track if SL submitted
+                    "sl_arm_time": sl_arm_time_str,       # when to check green/flat (e.g. "13:00")
+                    "afternoon_gate_checked": False,      # True after green/flat decision made
                     "order_id": order.get("id"),          # entry order ID
                 }
+                # Persistent day-level flag: blocking positions prevent overnight ETF even after exit
+                if blocks_overnight:
+                    bot.overnight_etf_blocked_today = True
+                block_str = "BLOCKS_ON" if blocks_overnight else "allows_overnight"
                 logger.info(
                     f"ETF position opened: {branch_key} {symbol} {filled_qty}sh @ ${fill_price:.2f} "
-                    f"SL={sl_pct} (armed@{sl_arm_time_str}) EXIT={exit_time_str}"
+                    f"GATE@{sl_arm_time_str} EXIT={exit_time_str} [{block_str}]"
                 )
             else:
                 logger.warning(f"ETF entry not filled for {symbol} ({branch_key}); canceling and leaving flat")
@@ -623,9 +625,12 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
 # ────────────────────────────────────────────────────────────────────
 
 def check_etf_exits(bot, current_time: dt_time) -> None:
-    """Check SL arming times and timed exits for all open ETF positions.
+    """Check early-afternoon green/flat gate and timed exits for ETF positions.
 
-    SL orders are submitted at "sl_arm_time" (not bracket at entry).
+    At sl_arm_time (e.g., 13:00 / 13:30):
+    - If position is positive vs entry: hold to timed exit (winners ride)
+    - If position is flat or negative: sell immediately (cut the weak)
+
     Timed exits occur at "exit_time" from config (hard exit regardless of PnL).
     """
     positions = getattr(bot, "etf_positions", None) or {}
@@ -640,36 +645,58 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
         symbol = pos.get("symbol")
         qty = pos.get("qty", 0)
         entry_price = pos.get("entry_price", 0)
-        sl_pct = pos.get("sl_pct")
         sl_arm_time_str = pos.get("sl_arm_time")
         exit_time_str = pos.get("exit_time")
 
         if not symbol or qty <= 0:
             continue
 
-        # ── Check if SL needs to be armed ────────────────────────────────────
-        if sl_pct and sl_arm_time_str and not pos.get("sl_armed"):
+        # ── Check if position already closed (SL fired or manual) ─────────────
+        try:
+            broker_pos = bot.position_mgr.get_broker_position(symbol)
+            if broker_pos is bot.position_mgr.BROKER_NOT_FOUND:
+                logger.info(
+                    f"ETF position closed: broker shows no {symbol}; clearing {branch_key}"
+                )
+                _clear_one_etf_position(bot, branch_key)
+                bot._save_state()
+                continue
+        except Exception as e:
+            logger.warning(f"ETF broker check failed ({branch_key}): {e}")
+
+        # ── Early-afternoon gate: green keeps riding, not-green gets cut ─────
+        if sl_arm_time_str and not pos.get("afternoon_gate_checked"):
             try:
                 parts = sl_arm_time_str.split(":")
                 arm_h, arm_m = int(parts[0]), int(parts[1])
                 if current_time >= dt_time(arm_h, arm_m):
-                    # Submit stop-loss order now
-                    stop_price = round(entry_price * (1.0 - sl_pct), 2)
-                    logger.info(
-                        f"ETF SL arming: {branch_key} {symbol} stop=${stop_price:.2f} "
-                        f"(entry=${entry_price:.2f} sl_pct={sl_pct:.3f})"
-                    )
-                    sl_order = bot.position_mgr.submit_stop_sell_order(symbol, qty, stop_price)
-                    if sl_order and sl_order.get("id"):
-                        pos["sl_order_id"] = sl_order.get("id")
-                        pos["sl_armed"] = True
-                        pos["sl_price"] = stop_price
-                        bot._save_state()
-                        logger.info(f"ETF SL armed: {branch_key} order={sl_order.get('id')}")
+                    # Get current price for green/flat check
+                    current_price = bot.position_mgr._get_last_price(symbol)
+                    if current_price and current_price > 0:
+                        pnl_pct = (current_price - entry_price) / entry_price
+                        if pnl_pct > 0:
+                            logger.info(
+                                f"ETF afternoon gate: {branch_key} {symbol} GREEN "
+                                f"({pnl_pct:.2%} @ ${current_price:.2f}) — holding to timed exit"
+                            )
+                            pos["afternoon_gate_checked"] = True
+                            bot._save_state()
+                        else:
+                            logger.info(
+                                f"ETF afternoon gate: {branch_key} {symbol} FLAT/RED "
+                                f"({pnl_pct:.2%} @ ${current_price:.2f}) — cutting now"
+                            )
+                            execute_etf_exit(bot, branch_key)
+                            continue
                     else:
-                        logger.warning(f"ETF SL arm FAILED: {branch_key} {symbol}")
+                        # Can't get price - be conservative and cut
+                        logger.warning(
+                            f"ETF afternoon gate: {branch_key} {symbol} no price data — cutting"
+                        )
+                        execute_etf_exit(bot, branch_key)
+                        continue
             except Exception as e:
-                logger.warning(f"ETF SL arm check failed ({branch_key}): {e}")
+                logger.warning(f"ETF afternoon gate check failed ({branch_key}): {e}")
 
         # ── Check if exit time reached ───────────────────────────────────────
         if exit_time_str:
@@ -677,14 +704,6 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
                 parts = exit_time_str.split(":")
                 exit_h, exit_m = int(parts[0]), int(parts[1])
                 if current_time >= dt_time(exit_h, exit_m):
-                    # Cancel any resting SL order first, then exit
-                    sl_order_id = pos.get("sl_order_id")
-                    if sl_order_id:
-                        try:
-                            bot.position_mgr._cancel_order(sl_order_id)
-                            logger.info(f"ETF exit: canceled SL order {sl_order_id} ({branch_key})")
-                        except Exception:
-                            pass
                     logger.info(f"ETF exit time reached: {branch_key} {symbol} at {current_time}")
                     execute_etf_exit(bot, branch_key)
             except Exception as e:
@@ -757,12 +776,11 @@ def execute_etf_exit(bot, branch_key: str) -> None:
         logger.info(f"ETF exit order {existing_exit_id} still pending ({branch_key}); waiting")
         return
 
-    # ── Step 2: cancel resting SL or other sell orders ─────────────────────────
+    # ── Step 2: cancel any resting sell orders ─────────────────────────────
     try:
         cancelled = bot.position_mgr.cancel_open_sell_orders_for_symbol(symbol)
         if cancelled:
             logger.info(f"ETF exit: canceled {cancelled} resting sell orders for {symbol} ({branch_key})")
-        pos["sl_order_id"] = None
         bot._save_state()
     except Exception as e:
         logger.warning(f"ETF exit: failed to cancel resting orders for {symbol} ({branch_key}): {e}")
