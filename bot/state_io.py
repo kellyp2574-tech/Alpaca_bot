@@ -28,6 +28,100 @@ from bot.universe_builder import (
     save_universe_audit,
 )
 
+
+def _serialise_pending_orders(pending: dict) -> dict:
+    """JSON-safe representation of intraday_mr_pending_orders (drop IntradayMRCandidate obj)."""
+    out = {}
+    for sym, p in pending.items():
+        cand = p.get("cand")
+        out[sym] = {
+            "order_id":              p.get("order_id"),
+            "qty":                   p.get("qty"),
+            "cancel_requested":      bool(p.get("cancel_requested", False)),
+            "accounted_filled_qty":  int(p.get("accounted_filled_qty", 0)),
+            "cand_entry_time":       getattr(cand, "entry_time",    None),
+            "cand_exit_time":        getattr(cand, "exit_time",     None),
+            "cand_tp_pct":           getattr(cand, "tp_pct",        None),
+            "cand_sl_pct":           getattr(cand, "sl_pct",        None),
+            "cand_theme":            getattr(cand, "theme",         None),
+            "cand_sleeve_name":      getattr(cand, "sleeve_name",   None),
+            "cand_signal_price":     getattr(cand, "signal_price",  None),
+        }
+    return out
+
+
+def _deserialise_pending_orders(raw: dict) -> dict:
+    """Reconstruct pending_orders from JSON.  cand is a lightweight namespace."""
+    from types import SimpleNamespace
+    out = {}
+    for sym, p in raw.items():
+        cand = SimpleNamespace(
+            entry_time   = p.get("cand_entry_time"),
+            exit_time    = p.get("cand_exit_time"),
+            tp_pct       = p.get("cand_tp_pct"),
+            sl_pct       = p.get("cand_sl_pct"),
+            theme        = p.get("cand_theme"),
+            sleeve_name  = p.get("cand_sleeve_name"),
+            signal_price = p.get("cand_signal_price"),
+        )
+        out[sym] = {
+            "order_id":             p.get("order_id"),
+            "qty":                  p.get("qty"),
+            "cancel_requested":     bool(p.get("cancel_requested",    False)),
+            "accounted_filled_qty": int( p.get("accounted_filled_qty", 0)),
+            "cand":                 cand,
+        }
+    return out
+
+
+def _serialise_candidates(candidates: list) -> list:
+    """Convert list of IntradayMRCandidate dataclass instances to JSON-safe dicts."""
+    out = []
+    for c in candidates:
+        try:
+            out.append({
+                "symbol":        c.symbol,
+                "theme":         c.theme,
+                "sleeve_name":   c.sleeve_name,
+                "regime":        c.regime,
+                "prior_ret":     c.prior_ret,
+                "pm_ret":        c.pm_ret,
+                "severity_score":c.severity_score,
+                "signal_price":  c.signal_price,
+                "entry_time":    c.entry_time,
+                "exit_time":     c.exit_time,
+                "tp_pct":        c.tp_pct,
+                "sl_pct":        c.sl_pct,
+            })
+        except Exception:
+            pass
+    return out
+
+
+def _deserialise_candidates(raw: list) -> list:
+    """Reconstruct candidates list from JSON dicts as lightweight namespaces."""
+    from types import SimpleNamespace
+    out = []
+    for d in raw:
+        try:
+            out.append(SimpleNamespace(
+                symbol        = d.get("symbol", ""),
+                theme         = d.get("theme", ""),
+                sleeve_name   = d.get("sleeve_name", ""),
+                regime        = d.get("regime", ""),
+                prior_ret     = float(d.get("prior_ret", 0)),
+                pm_ret        = float(d.get("pm_ret", 0)),
+                severity_score= float(d.get("severity_score", 0)),
+                signal_price  = float(d.get("signal_price", 0)),
+                entry_time    = d.get("entry_time", ""),
+                exit_time     = d.get("exit_time", "15:50"),
+                tp_pct        = d.get("tp_pct"),
+                sl_pct        = d.get("sl_pct"),
+            ))
+        except Exception:
+            pass
+    return out
+
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
@@ -80,6 +174,7 @@ def save_state(bot) -> None:
 
         bot_state = {
             "date": datetime.now(_ET).strftime("%Y-%m-%d"),
+            "morning_liquidation_confirmed": getattr(bot, "morning_liquidation_confirmed", False),
             "morning_exits_done": bot.morning_exits_done,
             "open_exit_plan": bot.open_exit_plan,
             "open_exit_submitted": getattr(bot, "open_exit_submitted", False),
@@ -112,6 +207,18 @@ def save_state(bot) -> None:
             "overnight_etf_position": getattr(bot, "overnight_etf_position", None),
             "overnight_etf_decision_made": getattr(bot, "overnight_etf_decision_made", False),
             "overnight_etf_blocked_today": getattr(bot, "overnight_etf_blocked_today", False),
+            # Intraday MR sleeve state
+            "intraday_mr_universe_built": getattr(bot, "intraday_mr_universe_built", False),
+            "intraday_mr_watchlist_built": getattr(bot, "intraday_mr_watchlist_built", False),
+            "intraday_mr_router_exit_checked": getattr(bot, "intraday_mr_router_exit_checked", False),
+            "intraday_mr_router_action": getattr(bot, "intraday_mr_router_action", None),
+            "intraday_mr_positions": getattr(bot, "intraday_mr_positions", {}),
+            "intraday_mr_entered_symbols": list(getattr(bot, "intraday_mr_entered_symbols", set())),
+            "intraday_mr_pending_orders": _serialise_pending_orders(getattr(bot, "intraday_mr_pending_orders", {})),
+            "intraday_mr_universe_list": getattr(bot, "intraday_mr_universe_list", []),
+            "intraday_mr_symbol_cache": getattr(bot, "intraday_mr_symbol_cache", {}),
+            "intraday_mr_vix_open": getattr(bot, "intraday_mr_vix_open", None),
+            "intraday_mr_candidates": _serialise_candidates(getattr(bot, "intraday_mr_candidates", [])),
         }
         bot.state_mgr.save_bot_state(bot_state)
     except Exception as e:
@@ -144,6 +251,19 @@ def load_state(bot) -> None:
         bot.overnight_etf_position = None
         bot.overnight_etf_decision_made = False
         bot.overnight_etf_blocked_today = False
+        # Intraday MR sleeve state
+        bot.morning_liquidation_confirmed   = False
+        bot.intraday_mr_universe_built      = False
+        bot.intraday_mr_watchlist_built     = False
+        bot.intraday_mr_router_exit_checked = False
+        bot.intraday_mr_router_action       = None
+        bot.intraday_mr_positions           = {}
+        bot.intraday_mr_candidates          = []
+        bot.intraday_mr_entered_symbols     = set()
+        bot.intraday_mr_pending_orders      = {}
+        bot.intraday_mr_universe_list       = []
+        bot.intraday_mr_symbol_cache        = {}
+        bot.intraday_mr_vix_open            = None
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -198,6 +318,26 @@ def load_state(bot) -> None:
     bot.overnight_etf_position = bot_state.get("overnight_etf_position", None)
     bot.overnight_etf_decision_made = bot_state.get("overnight_etf_decision_made", False)
     bot.overnight_etf_blocked_today = bot_state.get("overnight_etf_blocked_today", False)
+    bot.morning_liquidation_confirmed     = bot_state.get("morning_liquidation_confirmed", False)
+    # Intraday MR sleeve state
+    bot.intraday_mr_universe_built        = bot_state.get("intraday_mr_universe_built", False)
+    bot.intraday_mr_watchlist_built       = bot_state.get("intraday_mr_watchlist_built", False)
+    bot.intraday_mr_router_exit_checked   = bot_state.get("intraday_mr_router_exit_checked", False)
+    bot.intraday_mr_router_action         = bot_state.get("intraday_mr_router_action", None)
+    bot.intraday_mr_positions             = bot_state.get("intraday_mr_positions", {})
+    bot.intraday_mr_entered_symbols       = set(bot_state.get("intraday_mr_entered_symbols", []))
+    bot.intraday_mr_pending_orders        = _deserialise_pending_orders(bot_state.get("intraday_mr_pending_orders", {}))
+    bot.intraday_mr_universe_list         = bot_state.get("intraday_mr_universe_list", [])
+    bot.intraday_mr_symbol_cache          = bot_state.get("intraday_mr_symbol_cache", {})
+    bot.intraday_mr_vix_open              = bot_state.get("intraday_mr_vix_open", None)
+    bot.intraday_mr_candidates            = _deserialise_candidates(bot_state.get("intraday_mr_candidates", []))
+    # Safety: if watchlist flag is set but candidates list is empty, force rebuild
+    if bot.intraday_mr_watchlist_built and not bot.intraday_mr_candidates:
+        logger.warning(
+            "Intraday MR: watchlist_built=True but candidates empty after restore — "
+            "resetting to force Stage 2 rebuild"
+        )
+        bot.intraday_mr_watchlist_built = False
 
     saved = bot.state_mgr.load_positions()
     if saved:

@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 from bot import config
 from bot import entry_executor
 from bot import etf_router_runtime
+from bot import intraday_mr_runtime
 from bot import morning_exits
 from bot import overnight_etf_runner
 from bot import scoring
@@ -93,7 +94,8 @@ def _parse_config_time(time_str: str) -> dt_time:
 # budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
 _HOT_WINDOWS_HHMM = (
     (9, 24, 9, 32),   # Order cancel, 09:30 batch sells, 09:31 rescue
-    (9, 58, 10, 12),  # ETF tape final, 10:00 strat 1-3, 10:10 strat 4-5
+    (9, 27, 9, 48),   # Intraday MR watchlist build + 9:32-9:47 entries
+    (9, 58, 10, 12),  # ETF tape final, 10:00 strat 1-3, 10:10 strat 4-5, MR router exit
     (14, 58, 15, 2),  # 15:00 intraday exit (strats 3/4/5)
     (15, 28, 15, 32), # 15:30 intraday hard flatten (strats 1/2)
     (15, 44, 16, 1),  # Overnight ETF + MR selection, entry, EOD
@@ -147,6 +149,23 @@ class CombinedOvernightReboundBot:
         # Intraday sleeve
         self.intraday_etf_sleeve_filled = False
         self.router_decision_1010_made = False  # 10:10 check done flag
+
+        # Morning liquidation latch — set once when broker confirms zero positions.
+        # Persisted so a restart mid-session does not re-allow entries without proof.
+        self.morning_liquidation_confirmed = False
+
+        # Intraday MR sleeve (Morning Momentum)
+        self.intraday_mr_candidates: List[Any] = []
+        self.intraday_mr_positions: Dict[str, Any] = {}
+        self.intraday_mr_entered_symbols: set = set()
+        self.intraday_mr_pending_orders: Dict[str, Any] = {}  # awaiting fill confirmation
+        self.intraday_mr_watchlist_built = False         # Stage 2 complete
+        self.intraday_mr_universe_built = False          # Stage 1 complete
+        self.intraday_mr_router_exit_checked = False
+        self.intraday_mr_router_action: Optional[str] = None  # latched at 10:00
+        self.intraday_mr_universe_list: List[str] = []  # symbols from Stage 1
+        self.intraday_mr_symbol_cache: Dict[str, Any] = {}  # T-1/T-2 bar cache
+        self.intraday_mr_vix_open: Optional[float] = None   # actual VIX — set in Stage 1
 
         # Overnight ETF sleeve (precedence over single-stock MR)
         self.overnight_etf_fired = False        # True if an overnight ETF strategy fired
@@ -284,8 +303,7 @@ class CombinedOvernightReboundBot:
             self.position_mgr.reconcile_local_positions_from_broker()
             self._save_state()
         else:
-            logger.info("No overnight positions — skipping morning exits")
-            self.morning_exits_done = True
+            self._confirm_morning_flat("startup: broker confirmed flat (no overnight positions)")
 
         # Pre-compute schedule times from config
         t_exit_all     = _parse_config_time(config.MORNING_EXIT_TIME)       # 09:30 batched market sells
@@ -306,7 +324,8 @@ class CombinedOvernightReboundBot:
         ):
             logger.warning("Started after morning failsafe during regular session — flattening immediately")
             self._run_failsafe_flatten("late-start flatten")
-            self.morning_exits_done = True
+            # Do NOT set morning_exits_done=True here — broker has not confirmed flat yet.
+            # The normal polling loop will confirm and set both flags via _confirm_morning_flat.
 
         if current_time >= t_market_close:
             logger.info("Started after market close — nothing to do until next market day")
@@ -339,8 +358,7 @@ class CombinedOvernightReboundBot:
                     # Verify with broker
                     bc = self.position_mgr.broker_position_count()
                     if bc == 0:
-                        logger.info("Morning exits complete — no positions remaining")
-                        self.morning_exits_done = True
+                        self._confirm_morning_flat("no local positions + broker confirmed flat")
                     elif bc > 0:
                         # Broker has positions we don't know about locally
                         logger.warning(f"Local empty but broker has {bc} positions — reconciling")
@@ -372,36 +390,37 @@ class CombinedOvernightReboundBot:
                             logger.warning(f"09:31 rescue: broker still has {bc} positions, running broker-native rescue")
                             self._run_broker_native_rescue()
                         elif bc == 0:
-                            logger.info("09:31 rescue: broker confirmed flat")
+                            self._confirm_morning_flat("09:31 rescue: broker confirmed flat")
                         self.open_market_rescue_done = True
                         self._save_state()
 
                     # 09:45 post-exit failsafe — force-flatten if broker still holds anything.
+                    # post_exit_failsafe_done gates the *submission*; morning_exits_done is
+                    # set only after broker confirms flat (prevents premature entry unblocking).
                     if (not self.post_exit_failsafe_done
                             and current_time >= t_failsafe):
                         bc = self.position_mgr.broker_position_count()
                         if bc > 0:
                             logger.warning(f"Post-exit failsafe: broker still has {bc} positions")
                             self._run_failsafe_flatten(f"{t_failsafe.strftime('%H:%M')} post-exit failsafe")
+                            # Do NOT confirm flat yet — sell orders may still be pending.
+                            # Early-completion block below will confirm once broker is flat.
                         elif bc == 0:
-                            logger.info("Post-exit failsafe: broker confirmed flat")
                             self.position_mgr.reconcile_local_positions_from_broker()
+                            self._confirm_morning_flat("post-exit failsafe: broker confirmed flat")
                         self.post_exit_failsafe_done = True
-                        self.morning_exits_done = True
                         self._save_state()
 
                     # Early completion: after 09:30 submit, when broker confirmed flat.
                     if current_time >= t_exit_all and not self.morning_exits_done:
                         bc = self.position_mgr.broker_position_count()
                         if bc == 0:
-                            logger.info("All exits complete — broker confirmed flat")
                             self.position_mgr.positions.clear()
-                            self.morning_exits_done = True
-                            self._save_state()
+                            self._confirm_morning_flat("early completion: broker confirmed flat after sell batch")
 
             # ════════════════════════════════════════════
             # INTRADAY ETF Sleeve (5 strategies, one per day)
-            # 90% of equity; any fill blocks overnight ETF + MR
+            # Up to 50% of equity (see INTRADAY_ETF_ALLOCATION_PCT); fill blocks overnight ETF + MR
             # ════════════════════════════════════════════
 
             if getattr(config, "ETF_ROUTER_ENABLED", False):
@@ -461,8 +480,11 @@ class CombinedOvernightReboundBot:
                     self._update_tape()
 
                 # 10:00 — strategies 1-3 (enter immediately if fired)
+                # Gated on morning_liquidation_confirmed to prevent entering
+                # before overnight positions are broker-confirmed closed.
                 if (self.tape_initialized
                         and not self.router_decision_made
+                        and self.morning_liquidation_confirmed
                         and current_time >= t_router_dec):
                     self._update_tape(force=True)
                     self._make_router_decision()
@@ -479,6 +501,7 @@ class CombinedOvernightReboundBot:
                 if (self.router_decision_made
                         and not self.router_decision_1010_made
                         and not self.intraday_etf_sleeve_filled
+                        and self.morning_liquidation_confirmed
                         and current_time >= t_router_1010):
                     self._update_tape(force=True)
                     self._make_router_decision_1010()
@@ -501,6 +524,63 @@ class CombinedOvernightReboundBot:
                     for _bk in list(self.etf_positions.keys()):
                         logger.critical(f"Intraday hard flatten at 15:30 — forcing ETF exit ({_bk})")
                         self._execute_etf_exit(_bk)
+
+            # ════════════════════════════════════════════
+            # INTRADAY MR Sleeve (Morning Momentum)
+            # Runs in parallel with ETF router on active days
+            # ════════════════════════════════════════════
+
+            if getattr(config, "INTRADAY_MR_ENABLED", False):
+                t_mr_stage1  = _parse_config_time(getattr(config, "INTRADAY_MR_STAGE1_TIME",    "09:00"))
+                t_mr_stage2  = _parse_config_time(getattr(config, "INTRADAY_MR_STAGE2_TIME",    "09:30"))
+                t_mr_flatten = _parse_config_time(getattr(config, "INTRADAY_MR_HARD_FLATTEN_TIME", "15:55"))
+
+                # 09:00 — Stage 1: build universe + T-1/T-2 bar cache
+                if (not self.intraday_mr_universe_built
+                        and current_time >= t_mr_stage1):
+                    self._build_intraday_mr_universe()
+
+                # 09:30:05 — Stage 2: fetch official opens, get VIX, finalize candidates
+                if (self.intraday_mr_universe_built
+                        and not self.intraday_mr_watchlist_built
+                        and current_time >= t_mr_stage2):
+                    self._build_intraday_mr_finalize()
+
+                # 09:32-09:47 — submit all due-minute candidates concurrently
+                # Blocked until overnight liquidation is broker-confirmed complete.
+                if (self.intraday_mr_watchlist_built
+                        and self.morning_liquidation_confirmed
+                        and current_time >= dt_time(9, 32)
+                        and current_time < dt_time(9, 50)):
+                    self._execute_intraday_mr_entries(current_time)
+                elif (self.intraday_mr_watchlist_built
+                        and not self.morning_liquidation_confirmed
+                        and current_time >= dt_time(9, 32)
+                        and current_time < dt_time(9, 50)):
+                    logger.warning(
+                        "Intraday MR entries blocked: overnight liquidation not "
+                        "broker-confirmed complete (morning_liquidation_confirmed=False)"
+                    )
+
+                # Each tick after entries: reconcile pending buy fills
+                if self.intraday_mr_pending_orders:
+                    self._reconcile_intraday_mr_pending_fills()
+
+                # 10:00 — router exit rule: exit non-Theme-A if router SHORT
+                _t_router_1000 = _parse_config_time(getattr(config, "ROUTER_DECISION_TIME", "10:00"))
+                if (self.router_decision_made
+                        and not self.intraday_mr_router_exit_checked
+                        and current_time >= _t_router_1000):
+                    self._apply_intraday_mr_router_exit()
+
+                # Throughout day — TP/SL + timed exit monitoring
+                if (self.intraday_mr_positions
+                        and current_time >= dt_time(9, 34)):
+                    self._check_intraday_mr_exits(current_time)
+
+                # 15:55 — hard flatten any remaining intraday MR positions
+                if current_time >= t_mr_flatten:
+                    self._flatten_all_intraday_mr_positions()
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions
@@ -703,6 +783,38 @@ class CombinedOvernightReboundBot:
     def _evaluate_overnight_etf_strategies(self):
         return overnight_etf_runner.evaluate_overnight_etf_strategies(self)
 
+    def _confirm_morning_flat(self, reason: str) -> None:
+        """One-way latch: set both morning_exits_done and morning_liquidation_confirmed."""
+        self.morning_exits_done = True
+        if not self.morning_liquidation_confirmed:
+            self.morning_liquidation_confirmed = True
+            logger.info(f"morning_liquidation_confirmed latched True ({reason})")
+        self._save_state()
+
+    # ═══════════════════════════════════════════════════
+    # Intraday MR sleeve delegates (Morning Momentum)
+    # ═══════════════════════════════════════════════════
+
+    def _build_intraday_mr_universe(self):
+        return intraday_mr_runtime.build_intraday_mr_universe(self)
+
+    def _build_intraday_mr_finalize(self):
+        return intraday_mr_runtime.build_intraday_mr_finalize(self)
+
+    def _execute_intraday_mr_entries(self, current_time):
+        return intraday_mr_runtime.execute_intraday_mr_entries(self, current_time)
+
+    def _reconcile_intraday_mr_pending_fills(self):
+        return intraday_mr_runtime.reconcile_intraday_mr_pending_fills(self)
+
+    def _apply_intraday_mr_router_exit(self):
+        return intraday_mr_runtime.apply_router_exit_at_1000(self)
+
+    def _check_intraday_mr_exits(self, current_time):
+        return intraday_mr_runtime.check_intraday_mr_exits(self, current_time)
+
+    def _flatten_all_intraday_mr_positions(self):
+        return intraday_mr_runtime.flatten_all_intraday_mr_positions(self)
 
 
 def main():

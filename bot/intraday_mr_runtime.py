@@ -1,0 +1,834 @@
+"""
+Intraday MR Runtime — Morning Momentum execution layer.
+
+Two-stage pre-market build:
+  Stage 1 (~09:00):  Build universe from Massive free grouped daily.
+                     Fetch T-1 and T-2 daily bars for all symbols.
+                     Cache prior_ret and liquidity per symbol.
+                     VIX is NOT fetched here — today's bar doesn't exist yet.
+
+  Stage 2 (09:30:10+):
+                     Fetch actual ^VIX open (today's bar, date-validated).
+                     Fetch official regular-session opens for the universe.
+                     Compute pm_ret = open / prev_close - 1.
+                     Compute SPY/QQQ gaps.
+                     Run classifier -> bot.intraday_mr_candidates.
+
+Entry execution (09:32–09:47):
+  All candidates scheduled for the same minute are submitted CONCURRENTLY.
+  Each order tracked via pending_order dict until fill confirmed.
+  Only mark a symbol as entered after fill is confirmed.
+
+Exit states per position:
+  OPEN         — live, monitoring TP/SL
+  EXIT_PENDING — sell order submitted, awaiting fill confirmation
+  CLOSED       — fill confirmed, done
+  EXIT_FAILED  — sell rejected/cancelled; retry at next loop tick
+
+15:55 failsafe reconciles against actual broker positions —
+  anything still held is force-flattened regardless of local state.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from datetime import datetime, date as dt_date
+from typing import Any, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo
+
+from bot import config
+from bot.intraday_mr_classifier import (
+    IntradayMRCandidate,
+    build_intraday_mr_candidates,
+    apply_router_exit_rule,
+)
+
+logger = logging.getLogger(__name__)
+_ET = ZoneInfo("America/New_York")
+
+# Exit state constants
+_STATE_OPEN          = "OPEN"
+_STATE_EXIT_PENDING  = "EXIT_PENDING"
+_STATE_CLOSED        = "CLOSED"
+_STATE_EXIT_FAILED   = "EXIT_FAILED"
+
+# Symbols always fetched for regime classification
+_REGIME_SYMBOLS = ["SPY", "QQQ"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 (~09:00): build universe + cache T-1/T-2 daily data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_intraday_mr_universe(bot) -> None:
+    """
+    Stage 1 — called at ~09:00.
+    Builds universe, fetches T-1/T-2 daily bars, and fetches actual VIX.
+    Aborts entirely (does NOT mark universe_built) if VIX is unavailable —
+    missing VIX is not evidence the day is low-volatility.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+    if getattr(bot, "intraday_mr_universe_built", False):
+        return
+
+    logger.info("Intraday MR Stage 1: building universe and daily bar cache")
+    try:
+        # ── Build universe (VIX fetch deferred to Stage 2 after market open) ──────
+        universe = _build_universe_from_massive(bot)
+        if not universe:
+            logger.warning("Intraday MR Stage 1: empty universe from Massive — will retry")
+            return
+
+        for sym in _REGIME_SYMBOLS:
+            if sym not in universe:
+                universe.append(sym)
+
+        # ── Fetch T-1/T-2 daily bars, select by market date ──────────────────
+        logger.info(f"Intraday MR: fetching daily bars for {len(universe)} symbols")
+        daily_bars = bot.alpaca.get_daily_bars(universe, days=7)
+        today_str = datetime.now(_ET).strftime("%Y-%m-%d")
+        symbol_cache: Dict[str, dict] = {}
+        for symbol, bars in daily_bars.items():
+            t1, t2 = _select_t1_t2_bars(bars, today_str)
+            if t1 is None or t2 is None:
+                continue
+            symbol_cache[symbol] = {
+                "prev_close":  float(t1.get("c") or t1.get("close") or 0),
+                "prev2_close": float(t2.get("c") or t2.get("close") or 0),
+                "prev_volume": float(t1.get("v") or t1.get("volume") or 0),
+            }
+
+        bot.intraday_mr_symbol_cache = symbol_cache
+        bot.intraday_mr_universe_list = universe
+        bot.intraday_mr_universe_built = True
+        logger.info(
+            f"Intraday MR Stage 1 done: {len(universe)} symbols, "
+            f"{len(symbol_cache)} with valid T-1/T-2 bars"
+        )
+        bot._save_state()
+    except Exception as e:
+        logger.error(f"Intraday MR Stage 1 error: {e}", exc_info=True)
+
+
+def _select_t1_t2_bars(bars: List[dict], today_str: str):
+    """
+    Return (t1_bar, t2_bar) where t1 = most recent completed session before today,
+    t2 = session before t1. Selects by date stamp, not list position, to avoid
+    partial today-bar issues.
+    """
+    completed = [
+        b for b in bars
+        if (b.get("t") or b.get("date") or "")[:10] < today_str
+    ]
+    completed.sort(key=lambda b: (b.get("t") or b.get("date") or ""))
+    if len(completed) < 2:
+        return None, None
+    return completed[-1], completed[-2]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 (09:30:05–09:31): fetch opens, finalize regime + candidates
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STAGE2_MIN_OPEN_RATIO = 0.50  # at least 50% of universe must have valid opens
+_STAGE2_EARLIEST_SECONDS = 10  # do not run before 09:30:10
+
+
+def build_intraday_mr_finalize(bot) -> None:
+    """
+    Stage 2 — called after 09:30:10 (guard ensures official opens are populated).
+
+    Completeness requirements before setting watchlist_built=True:
+      - now >= 09:30:10
+      - VIX available (fetched in Stage 1)
+      - SPY and QQQ official opens available
+      - >= 50% of candidate universe has official opens
+    If any requirement fails, returns without marking complete so the loop retries.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+    if getattr(bot, "intraday_mr_watchlist_built", False):
+        return
+    if not getattr(bot, "intraday_mr_universe_built", False):
+        logger.warning("Intraday MR Stage 2: Stage 1 not complete — skipping")
+        return
+
+    # ── Early-time guard: ensure official opens are actually populated ────────
+    now = datetime.now(_ET)
+    open_cutoff = now.replace(hour=9, minute=30, second=_STAGE2_EARLIEST_SECONDS, microsecond=0)
+    if now < open_cutoff:
+        logger.debug(f"Intraday MR Stage 2: too early ({now.strftime('%H:%M:%S')} < 09:30:{_STAGE2_EARLIEST_SECONDS:02d}) — retry")
+        return
+
+    # ── Fetch today's ^VIX open (date-validated; retries until today's bar available) ──
+    vix_result = bot.alpaca.get_vix_open()  # returns (float, bar_date) or None
+    if vix_result is None:
+        # get_vix_open already logged the reason; stale bar = retry, error = abort
+        # We cannot distinguish stale from error here without changing the API further,
+        # so we simply retry (watchlist_built stays False) and let the 09:30-09:31
+        # retry window sort it out. If still None at 09:31+, caller loop stops trying.
+        return
+    vix_open, vix_bar_date = vix_result
+    bot.intraday_mr_vix_open = vix_open
+    logger.info(f"Intraday MR Stage 2: VIX open = {vix_open:.2f} (bar_date={vix_bar_date})")
+
+    logger.info("Intraday MR Stage 2: fetching official opens")
+    try:
+        feed = getattr(config, "DATA_FEED", "iex")
+        universe = getattr(bot, "intraday_mr_universe_list", [])
+        symbol_cache = getattr(bot, "intraday_mr_symbol_cache", {})
+
+        snapshots = bot.alpaca.get_snapshots(universe, feed=feed)
+        if not snapshots:
+            logger.warning("Intraday MR Stage 2: empty snapshots — will retry")
+            return
+
+        # ── Validate SPY/QQQ official opens (required for regime gaps) ────────
+        spy_snap = snapshots.get("SPY", {})
+        qqq_snap = snapshots.get("QQQ", {})
+        spy_open = spy_snap.get("open")
+        qqq_open = qqq_snap.get("open")
+        if not spy_open or not qqq_open:
+            logger.warning(
+                f"Intraday MR Stage 2: SPY open={spy_open}, QQQ open={qqq_open} — "
+                f"official opens not yet available, retrying"
+            )
+            return
+
+        # ── Build enriched dict; only use official dailyBar.open (no last_price fallback) ──
+        enriched: Dict[str, dict] = {}
+        n_with_open = 0
+        n_missing_open = 0
+        missing_open_syms: List[str] = []
+
+        for symbol, snap in snapshots.items():
+            cached = symbol_cache.get(symbol)
+            if cached is None and symbol not in _REGIME_SYMBOLS:
+                continue
+
+            open_px = snap.get("open")  # official regular-session open only — NO fallback
+            if not open_px:
+                n_missing_open += 1
+                if symbol not in _REGIME_SYMBOLS:
+                    missing_open_syms.append(symbol)
+                continue
+
+            prev_close  = (cached or {}).get("prev_close")  or snap.get("prev_close")
+            prev2_close = (cached or {}).get("prev2_close")
+            prev_volume = (cached or {}).get("prev_volume")  or snap.get("prev_volume") or 0
+
+            enriched[symbol] = {
+                "open":        float(open_px),
+                "prev_close":  prev_close,
+                "prev2_close": prev2_close,
+                "prev_volume": prev_volume,
+            }
+            if symbol not in _REGIME_SYMBOLS:
+                n_with_open += 1
+
+        # ── Completeness check ────────────────────────────────────────────────
+        n_universe = max(len(symbol_cache), 1)
+        open_ratio = n_with_open / n_universe
+        if open_ratio < _STAGE2_MIN_OPEN_RATIO:
+            logger.warning(
+                f"Intraday MR Stage 2: only {n_with_open}/{n_universe} ({open_ratio:.0%}) "
+                f"symbols have official opens — below {_STAGE2_MIN_OPEN_RATIO:.0%} threshold, "
+                f"retrying (missing e.g.: {missing_open_syms[:5]})"
+            )
+            return
+
+        enriched["_vix_open"] = float(vix_open)
+
+        candidates = build_intraday_mr_candidates(enriched)
+
+        bot.intraday_mr_candidates = candidates
+        bot.intraday_mr_watchlist_built = True
+        bot._save_state()
+
+        _save_intraday_mr_artifact(
+            bot, candidates,
+            meta={
+                "vix_open": vix_open,
+                "vix_bar_date": vix_bar_date,
+                "universe_size": len(universe),
+                "symbols_with_t1t2": len(symbol_cache),
+                "symbols_with_open": n_with_open,
+                "symbols_missing_open": n_missing_open,
+                "open_ratio": round(open_ratio, 3),
+                "spy_open": spy_open,
+                "qqq_open": qqq_open,
+                "stage2_time": now.strftime("%H:%M:%S"),
+            }
+        )
+        logger.info(
+            f"Intraday MR Stage 2 done: {len(candidates)} candidates, "
+            f"VIX={vix_open:.2f}, opens={n_with_open}/{n_universe}"
+        )
+    except Exception as e:
+        logger.error(f"Intraday MR Stage 2 error: {e}", exc_info=True)
+
+
+def _build_universe_from_massive(bot) -> List[str]:
+    """Build the intraday MR universe from Massive free grouped daily. Price $2-$100, ADV $1M+."""
+    try:
+        from bot.mr_free_data_pipeline import build_massive_prevday_watchlist, previous_weekday
+        symbols = build_massive_prevday_watchlist(
+            massive_api_key=config.MASSIVE_API_KEY,
+            trade_date=previous_weekday(),
+            min_prev_close=float(getattr(config, "INTRADAY_MR_UNIVERSE_MIN_PRICE", 2.0)),
+            max_prev_close=float(getattr(config, "INTRADAY_MR_UNIVERSE_MAX_PRICE", 100.0)),
+            min_prev_dollar_volume=float(getattr(config, "INTRADAY_MR_MIN_ADV_DOLLARS", 1_000_000)),
+        )
+        logger.info(f"Intraday MR: Massive universe: {len(symbols)} symbols")
+        return symbols
+    except Exception as e:
+        logger.warning(f"Intraday MR: Massive universe build failed: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 09:32–09:47: Concurrent entry execution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_intraday_mr_entries(bot, current_time) -> None:
+    """
+    Submit all candidates whose entry_time <= current_time in a single batch.
+    Uses non-blocking submission: orders are recorded in bot.intraday_mr_pending_orders
+    and reconciled in reconcile_intraday_mr_pending_fills() each loop tick.
+    A symbol is only marked entered after a confirmed fill.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+
+    candidates: List[IntradayMRCandidate] = getattr(bot, "intraday_mr_candidates", [])
+    if not candidates:
+        return
+
+    if not hasattr(bot, "intraday_mr_positions"):
+        bot.intraday_mr_positions = {}
+    if not hasattr(bot, "intraday_mr_entered_symbols"):
+        bot.intraday_mr_entered_symbols = set()
+    if not hasattr(bot, "intraday_mr_pending_orders"):
+        bot.intraday_mr_pending_orders = {}  # symbol -> {order_id, qty, cand}
+
+    try:
+        account = bot.position_mgr.get_account()
+        equity = float(account.get("equity") or account.get("buying_power") or 0)
+    except Exception:
+        logger.warning("Intraday MR: could not fetch account for sizing")
+        return
+
+    budget_pct = float(getattr(config, "INTRADAY_MR_BUDGET_PCT", 0.50))
+    total_budget = equity * budget_pct
+    n_cands = len(candidates)
+    per_pos = total_budget / n_cands if n_cands > 0 else 0
+
+    # Determine which candidates are due this tick, respecting max entry delay
+    _MAX_ENTRY_DELAY_SECONDS = int(getattr(config, "INTRADAY_MR_MAX_ENTRY_DELAY_S", 60))
+    due = []
+    from datetime import time as dtime
+    for cand in candidates:
+        if cand.symbol in bot.intraday_mr_entered_symbols:
+            continue
+        if cand.symbol in bot.intraday_mr_pending_orders:
+            continue
+        h, m = cand.entry_time.split(":")
+        sched = dtime(int(h), int(m))
+        if current_time < sched:
+            continue
+        # Compute seconds past scheduled entry time
+        now_dt = datetime.now(_ET)
+        sched_dt = now_dt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        elapsed = (now_dt - sched_dt).total_seconds()
+        if elapsed > _MAX_ENTRY_DELAY_SECONDS:
+            logger.warning(
+                f"Intraday MR: skipping {cand.symbol} [{cand.sleeve_name}] — "
+                f"entry time {cand.entry_time} passed {elapsed:.0f}s ago "
+                f"(max delay={_MAX_ENTRY_DELAY_SECONDS}s)"
+            )
+            bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry
+            continue
+        due.append(cand)
+
+    if not due:
+        return
+
+    # Submit all due candidates concurrently (fire-and-forget; reconcile later)
+    for cand in due:
+        if per_pos <= 0 or cand.signal_price <= 0:
+            logger.warning(f"Intraday MR: skipping {cand.symbol} — budget/price invalid")
+            bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry
+            continue
+
+        qty = int(per_pos / cand.signal_price)
+        if qty <= 0:
+            logger.warning(f"Intraday MR: qty=0 for {cand.symbol} @ ${cand.signal_price:.2f}")
+            bot.intraday_mr_entered_symbols.add(cand.symbol)
+            continue
+
+        try:
+            order, error_type = bot.position_mgr.submit_buy_order(
+                symbol=cand.symbol, qty=qty, order_type="market",
+            )
+            if error_type or not order:
+                logger.error(f"Intraday MR: buy rejected for {cand.symbol}: {error_type}")
+                bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry rejected order
+                continue
+
+            order_id = order.get("id")
+            bot.intraday_mr_pending_orders[cand.symbol] = {
+                "order_id": order_id, "qty": qty, "cand": cand,
+            }
+            logger.info(
+                f"Intraday MR order submitted: {cand.symbol} [{cand.sleeve_name}] "
+                f"x{qty} @ mkt  (order_id={order_id})"
+            )
+        except Exception as e:
+            logger.error(f"Intraday MR: submission error for {cand.symbol}: {e}", exc_info=True)
+            bot.intraday_mr_entered_symbols.add(cand.symbol)
+
+    bot._save_state()
+
+
+def reconcile_intraday_mr_pending_fills(bot) -> None:
+    """
+    Poll pending orders for fill confirmation.
+    Called each main loop tick after entries have been submitted.
+    Moves confirmed fills into intraday_mr_positions (state=OPEN).
+    Only marks symbol as entered after confirmed fill.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+
+    pending: dict = getattr(bot, "intraday_mr_pending_orders", {})
+    if not pending:
+        return
+
+    confirmed = []
+    still_pending = []
+
+    # Retrieve the router action latch set at 10:00 (if any)
+    router_action_latch = getattr(bot, "intraday_mr_router_action", None)
+    _ROUTER_SHORT_ACTIONS = getattr(
+        config, "ROUTER_SHORT_ACTIONS",
+        ["sqqq_goldilocks", "uvxy_crash", "anti", "sqqq"]
+    )
+    router_is_short = (
+        router_action_latch is not None
+        and any(s in router_action_latch.lower() for s in _ROUTER_SHORT_ACTIONS)
+    )
+
+    for symbol, pend in list(pending.items()):
+        order_id = pend["order_id"]
+        qty      = pend["qty"]
+        cand     = pend["cand"]
+        try:
+            url  = f"{bot.position_mgr.base_url}/v2/orders/{order_id}"
+            resp = bot.position_mgr.session.get(url, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            status     = data.get("status")
+            filled_avg = data.get("filled_avg_price")
+            filled_qty = int(float(data.get("filled_qty") or 0))
+
+            # Handle any filled quantity first (full fill, partial-then-terminal, etc.)
+            already_accounted = int(pend.get("accounted_filled_qty", 0))
+            new_filled = filled_qty - already_accounted
+
+            if new_filled > 0 and filled_avg:
+                fill_price = float(filled_avg)
+                theme = getattr(cand, "theme", None)
+
+                # Register / update position so 15:55 failsafe can always see it
+                bot.intraday_mr_positions[symbol] = {
+                    "symbol":      symbol,
+                    "theme":       theme,
+                    "sleeve_name": getattr(cand, "sleeve_name", ""),
+                    "entry_price": fill_price,
+                    "qty":         filled_qty,
+                    "entry_time":  getattr(cand, "entry_time", ""),
+                    "exit_time":   getattr(cand, "exit_time", "15:50"),
+                    "tp_pct":      getattr(cand, "tp_pct", None),
+                    "sl_pct":      getattr(cand, "sl_pct", None),
+                    "order_id":    order_id,
+                    "exit_state":  _STATE_OPEN,
+                    "exit_order_id": None,
+                    "exit_reason": None,
+                }
+                logger.info(
+                    f"Intraday MR fill: {symbol} [{getattr(cand,'sleeve_name','')}/ "
+                    f"Theme-{theme}] x{filled_qty} @ ${fill_price:.2f}  "
+                    f"TP={getattr(cand,'tp_pct',None)}  SL={getattr(cand,'sl_pct',None)}  "
+                    f"EXIT={getattr(cand,'exit_time','')}  status={status}"
+                )
+                # If router already latched SHORT and this is a non-A fill, exit immediately
+                if router_is_short and theme != "A":
+                    logger.warning(
+                        f"Intraday MR late fill after router-short: "
+                        f"{symbol} [Theme-{theme}] — submitting immediate exit"
+                    )
+                    _submit_intraday_mr_exit(bot, symbol, reason="late_fill_after_router_short")
+
+            # Now decide whether to remove from pending
+            if status == "filled":
+                bot.intraday_mr_entered_symbols.add(symbol)
+                confirmed.append(symbol)
+            elif status in ("canceled", "expired", "rejected"):
+                if filled_qty > 0:
+                    logger.warning(
+                        f"Intraday MR order {status} with partial fill: {symbol} "
+                        f"x{filled_qty} shares registered as position"
+                    )
+                else:
+                    logger.warning(
+                        f"Intraday MR order {status}: {symbol} (order_id={order_id}) — no fill"
+                    )
+                bot.intraday_mr_entered_symbols.add(symbol)
+                confirmed.append(symbol)
+            elif status == "partially_filled":
+                # Still active; track how many shares we've already accounted for
+                pend["accounted_filled_qty"] = filled_qty
+                still_pending.append(symbol)
+            else:
+                still_pending.append(symbol)
+
+        except Exception as e:
+            logger.warning(f"Intraday MR fill poll error for {symbol}: {e}")
+            still_pending.append(symbol)
+
+    for sym in confirmed:
+        pending.pop(sym, None)
+
+    if confirmed:
+        bot._save_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10:00: Router exit rule
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_router_exit_at_1000(bot) -> None:
+    """
+    At 10:00: if router is SHORT, exit non-Theme-A.
+    Also cancels pending buy orders for non-A symbols so they don't fill
+    after the check and stay open. Sets bot.intraday_mr_router_action so
+    that any late fills can be immediately exited by reconcile_intraday_mr_pending_fills.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+    if getattr(bot, "intraday_mr_router_exit_checked", False):
+        return
+
+    bot.intraday_mr_router_exit_checked = True
+    router_action = _get_router_action(bot)
+    bot.intraday_mr_router_action = router_action  # persist for late-fill reconciliation
+
+    # Reconcile pending fills first so confirmed positions are included
+    reconcile_intraday_mr_pending_fills(bot)
+
+    # Cancel pending non-A buy orders
+    pending: dict = getattr(bot, "intraday_mr_pending_orders", {})
+    _ROUTER_SHORT_ACTIONS = getattr(
+        config, "ROUTER_SHORT_ACTIONS",
+        ["sqqq_goldilocks", "uvxy_crash", "anti", "sqqq"]
+    )
+    is_short = any(s in router_action.lower() for s in _ROUTER_SHORT_ACTIONS)
+
+    if is_short:
+        for symbol, pend in list(pending.items()):
+            cand = pend.get("cand")
+            theme = getattr(cand, "theme", None)
+            if theme == "A":
+                continue
+            if pend.get("cancel_requested"):
+                continue  # already requested; keep polling in reconcile
+            order_id = pend.get("order_id")
+            logger.info(
+                f"Intraday MR router cancel pending buy: {symbol} "
+                f"[Theme-{theme}] order_id={order_id}"
+            )
+            try:
+                bot.position_mgr._cancel_order(order_id)
+            except Exception as e:
+                logger.warning(f"Intraday MR: cancel order failed for {symbol}: {e}")
+            # Mark cancel requested but KEEP in pending so fill reconciliation
+            # can detect a race-condition fill and exit it immediately.
+            pend["cancel_requested"] = True
+
+    # Exit confirmed non-A positions
+    positions = list(getattr(bot, "intraday_mr_positions", {}).values())
+    to_exit = apply_router_exit_rule(positions, router_action)
+    for symbol in to_exit:
+        logger.info(f"Intraday MR router exit (10:00): {symbol} (router={router_action})")
+        _submit_intraday_mr_exit(bot, symbol, reason="router_short_10am")
+
+    bot._save_state()
+
+
+def _get_router_action(bot) -> str:
+    """Extract router action string from bot state."""
+    decision = getattr(bot, "router_decision", None)
+    if decision is None:
+        return "none"
+    branch = getattr(decision, "branch", None)
+    if branch is None:
+        return "none"
+    branch_str = branch.value if hasattr(branch, "value") else str(branch)
+    branch_lower = branch_str.lower()
+    if "sqqq" in branch_lower or "anti" in branch_lower:
+        return "sqqq_goldilocks"
+    if "vxx" in branch_lower and "collapse" not in branch_lower:
+        return "uvxy_crash"
+    return branch_lower
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Throughout day: TP/SL + timed exits, pending exit reconciliation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_intraday_mr_exits(bot, current_time) -> None:
+    """
+    Called each main loop tick.
+    1. Reconcile any EXIT_PENDING orders (check if they filled or failed).
+    2. Check open positions for timed exit or TP/SL breach.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+
+    positions = getattr(bot, "intraday_mr_positions", {})
+    if not positions:
+        return
+
+    _reconcile_exit_orders(bot)
+
+    feed = getattr(config, "DATA_FEED", "iex")
+    open_symbols = [
+        sym for sym, p in positions.items()
+        if p.get("exit_state") in (_STATE_OPEN, _STATE_EXIT_FAILED)
+    ]
+    if not open_symbols:
+        return
+
+    try:
+        snaps = bot.alpaca.get_snapshots(open_symbols, feed=feed)
+    except Exception as e:
+        logger.warning(f"Intraday MR exit check: snapshot error: {e}")
+        return
+
+    from datetime import time as dtime
+    for symbol in open_symbols:
+        pos = positions.get(symbol)
+        if not pos:
+            continue
+        if pos.get("exit_state") not in (_STATE_OPEN, _STATE_EXIT_FAILED):
+            continue
+
+        # Timed exit
+        h, m = pos["exit_time"].split(":")
+        if current_time >= dtime(int(h), int(m)):
+            logger.info(f"Intraday MR timed exit: {symbol} (exit_time={pos['exit_time']})")
+            _submit_intraday_mr_exit(bot, symbol, reason="timed_exit")
+            continue
+
+        # TP / SL
+        snap = snaps.get(symbol, {})
+        last_price = snap.get("last_price") or snap.get("last") or snap.get("open")
+        if not last_price:
+            continue
+
+        ret = float(last_price) / float(pos["entry_price"]) - 1.0
+        tp_pct = pos.get("tp_pct")
+        sl_pct = pos.get("sl_pct")
+
+        if tp_pct and ret >= tp_pct:
+            logger.info(f"Intraday MR TP: {symbol} ret={ret:.2%} >= tp={tp_pct:.2%}")
+            _submit_intraday_mr_exit(bot, symbol, reason="tp_hit")
+        elif sl_pct and ret <= -sl_pct:
+            logger.info(f"Intraday MR SL: {symbol} ret={ret:.2%} <= -sl={sl_pct:.2%}")
+            _submit_intraday_mr_exit(bot, symbol, reason="sl_hit")
+
+    bot._save_state()
+
+
+def _submit_intraday_mr_exit(bot, symbol: str, reason: str = "exit") -> None:
+    """
+    Submit a market sell for an intraday MR position.
+    Transitions state: OPEN/EXIT_FAILED -> EXIT_PENDING.
+    Does not change state if already EXIT_PENDING or CLOSED.
+    """
+    positions = getattr(bot, "intraday_mr_positions", {})
+    pos = positions.get(symbol)
+    if not pos:
+        return
+
+    if pos.get("exit_state") in (_STATE_EXIT_PENDING, _STATE_CLOSED):
+        logger.debug(f"Intraday MR exit: {symbol} already {pos['exit_state']} — skipping")
+        return
+
+    qty = int(pos.get("qty", 0))
+    if qty <= 0:
+        pos["exit_state"] = _STATE_CLOSED
+        return
+
+    try:
+        ok = bot.position_mgr._submit_sell_order(symbol, qty, order_type="market")
+        if ok:
+            # _submit_sell_order returns Optional[dict]; dict has "id" key.
+            exit_order_id = ok.get("id") if isinstance(ok, dict) else None
+            pos["exit_state"]    = _STATE_EXIT_PENDING
+            pos["exit_order_id"] = exit_order_id
+            pos["exit_reason"]   = reason
+            logger.info(
+                f"Intraday MR exit submitted: {symbol} x{qty} reason={reason} "
+                f"order_id={exit_order_id}"
+            )
+        else:
+            pos["exit_state"] = _STATE_EXIT_FAILED
+            logger.error(f"Intraday MR exit FAILED (rejected): {symbol} x{qty}")
+    except Exception as e:
+        pos["exit_state"] = _STATE_EXIT_FAILED
+        logger.error(f"Intraday MR exit error for {symbol}: {e}", exc_info=True)
+
+
+def _reconcile_exit_orders(bot) -> None:
+    """
+    Poll EXIT_PENDING orders; move to CLOSED on fill or EXIT_FAILED on rejection.
+    Called at the start of check_intraday_mr_exits each tick.
+    """
+    positions = getattr(bot, "intraday_mr_positions", {})
+    pending_exits = [
+        (sym, pos) for sym, pos in positions.items()
+        if pos.get("exit_state") == _STATE_EXIT_PENDING
+    ]
+    if not pending_exits:
+        return
+
+    for symbol, pos in pending_exits:
+        order_id = pos.get("exit_order_id")
+
+        # ── ID-less EXIT_PENDING: reconcile via broker position count ──────────────
+        if not order_id:
+            broker_pos = bot.position_mgr.get_broker_position(symbol)
+            if broker_pos is bot.position_mgr.BROKER_NOT_FOUND:
+                # Broker confirms no position — treat as filled/closed
+                pos["exit_state"] = _STATE_CLOSED
+                logger.info(
+                    f"Intraday MR exit (ID-less): {symbol} no longer at broker — marking CLOSED"
+                )
+            elif broker_pos is None:
+                logger.warning(
+                    f"Intraday MR exit (ID-less): {symbol} broker API error — will retry"
+                )
+            else:
+                # Position still held; re-submit exit
+                logger.warning(
+                    f"Intraday MR exit (ID-less): {symbol} still at broker — re-submitting exit"
+                )
+                _submit_intraday_mr_exit(bot, symbol, reason=pos.get("exit_reason", "retry"))
+            continue
+
+        # ── Normal EXIT_PENDING with order ID ────────────────────────────────────
+        try:
+            url  = f"{bot.position_mgr.base_url}/v2/orders/{order_id}"
+            resp = bot.position_mgr.session.get(url, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status")
+
+            if status == "filled":
+                pos["exit_state"] = _STATE_CLOSED
+                fill_px = data.get("filled_avg_price")
+                logger.info(f"Intraday MR exit filled: {symbol} @ ${fill_px}")
+            elif status in ("canceled", "expired", "rejected"):
+                pos["exit_state"] = _STATE_EXIT_FAILED
+                logger.warning(
+                    f"Intraday MR exit order {status}: {symbol} — "
+                    f"will retry next tick"
+                )
+        except Exception as e:
+            logger.warning(f"Intraday MR exit poll error for {symbol}: {e}")
+
+
+def flatten_all_intraday_mr_positions(bot) -> None:
+    """
+    15:55 failsafe: reconcile against actual broker positions.
+    Any intraday MR symbol still held at the broker is force-flattened,
+    regardless of local exit_state. This catches EXIT_FAILED, EXIT_PENDING
+    orders that were silently dropped, and any state tracking bugs.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+
+    positions = getattr(bot, "intraday_mr_positions", {})
+
+    # Fetch actual broker positions for ground truth
+    try:
+        broker_positions = bot.position_mgr.get_broker_positions()  # returns list of dicts or None
+        broker_held = {p.get("symbol") for p in (broker_positions or []) if p.get("symbol")}
+    except Exception as e:
+        logger.error(f"Intraday MR failsafe: could not fetch broker positions: {e}")
+        broker_held = set()
+
+    tracked_symbols = set(positions.keys())
+    to_flatten = set()
+
+    # Any locally tracked position not yet CLOSED
+    for symbol, pos in positions.items():
+        if pos.get("exit_state") != _STATE_CLOSED:
+            to_flatten.add(symbol)
+
+    # Any broker-held position we track (catches missed EXIT_PENDING fills)
+    to_flatten |= (tracked_symbols & broker_held)
+
+    for symbol in to_flatten:
+        logger.warning(f"Intraday MR hard flatten: {symbol}")
+        pos = positions.get(symbol)
+        if pos:
+            pos["exit_state"] = _STATE_OPEN  # reset so _submit_intraday_mr_exit will run
+        _submit_intraday_mr_exit(bot, symbol, reason="hard_flatten_failsafe")
+
+    bot._save_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact logger
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _save_intraday_mr_artifact(bot, candidates: list, meta: Optional[Dict] = None) -> None:
+    """Save daily intraday MR candidate log + data quality metadata for forensic review."""
+    try:
+        log_dir = getattr(config, "LOG_DIR", "logs")
+        today   = datetime.now(_ET).strftime("%Y-%m-%d")
+        path    = os.path.join(log_dir, f"intraday_mr_{today}.json")
+        data = {
+            "date": today,
+            "meta": meta or {},
+            "candidate_count": len(candidates),
+            "candidates": [
+                {
+                    "symbol":        c.symbol,
+                    "theme":         c.theme,
+                    "sleeve":        c.sleeve_name,
+                    "regime":        c.regime,
+                    "prior_ret":     round(c.prior_ret, 4),
+                    "pm_ret":        round(c.pm_ret, 4),
+                    "severity_score":round(c.severity_score, 4),
+                    "signal_price":  round(c.signal_price, 4),
+                    "entry_time":    c.entry_time,
+                    "exit_time":     c.exit_time,
+                    "tp_pct":        c.tp_pct,
+                    "sl_pct":        c.sl_pct,
+                }
+                for c in candidates
+            ],
+        }
+        os.makedirs(log_dir, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Intraday MR artifact saved: {path}")
+    except Exception as e:
+        logger.warning(f"Intraday MR artifact save failed: {e}")

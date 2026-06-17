@@ -21,7 +21,7 @@ Overnight single-stock MR sleeve (priority 3, fallback):
     Max 3 positions, 30% equity each.
 
 Live constants (single source of truth):
-    INTRADAY_ETF_ALLOCATION_PCT  = 0.90    # 90% of equity for the intraday ETF sleeve
+    INTRADAY_ETF_ALLOCATION_PCT  = 0.50    # 50% of equity for the intraday ETF sleeve (50/50 split with MR)
     MR_ALLOC_PER_POSITION_PCT    = 0.30    # 30% of equity per MR position
     MR_MAX_PRIMARY_POSITIONS     = 3       # Top 3 MR candidates only
     MR_MAX_TOTAL_ALLOCATION_PCT  = 0.90    # Max 90% of equity in the MR sleeve
@@ -49,8 +49,9 @@ MR_OVERNIGHT_ENABLED = True    # Single-stock MR fallback
 # ═══════════════════════════════════════════════════
 # Capital allocation — LIVE CONSTANTS
 # ═══════════════════════════════════════════════════
-# 90% of equity for intraday ETF sleeve (only one strategy fills per day)
-INTRADAY_ETF_ALLOCATION_PCT = 0.90
+# 50% of equity for intraday ETF sleeve.
+# Combined with INTRADAY_MR_BUDGET_PCT=0.50, max overlap-day exposure = 100% equity.
+INTRADAY_ETF_ALLOCATION_PCT = 0.50
 
 # MR sleeve sizing
 MR_ALLOC_PER_POSITION_PCT = 0.30   # 30% of equity per MR position
@@ -229,6 +230,56 @@ MR_ETF_POSITIVE_SIZE_MULT = 0.5
 # Daily-loss circuit breaker (vs yesterday's close equity).
 # 0.05 = abort 15:45 entries AND 10:00 ETF entry if today's PnL < -5%.
 DAILY_LOSS_LIMIT_PCT = 0.05
+
+# ═══════════════════════════════════════════════════
+# Sleeve: Intraday Mean Reversion (Morning Momentum)
+# ═══════════════════════════════════════════════════
+# Gap-reversal longs, entered 9:32-9:47, flat same day.
+# Validated: 26.4x equity, Sharpe 2.39, 641/1263 active days.
+# Capital: 50% of equity split equally across candidates.
+# Router exit rule at 10:00: if SHORT → keep Theme A only, exit B/C/D/UL.
+
+INTRADAY_MR_ENABLED = False            # Toggle to enable. Start with paper test.
+
+# Regime classification (VIX >= 15 validated vs VIX >= 20 original)
+INTRADAY_MR_VIX_THRESHOLD = 15.0      # Active day if VIX >= this
+INTRADAY_MR_GAP_THRESHOLD = 0.01      # Active day if |SPY gap| > 1% AND |QQQ gap| > 1%
+
+# Candidate caps (validated min=1, max=8)
+INTRADAY_MR_MIN_CANDIDATES = 1
+INTRADAY_MR_MAX_CANDIDATES = 8
+
+# ADV filter — previous day dollar volume minimum
+INTRADAY_MR_MIN_ADV_DOLLARS = 1_000_000
+
+# Capital allocation: 50% of equity split equally across all candidates
+INTRADAY_MR_BUDGET_PCT = 0.50
+
+# Universe pre-filter for pre-market snapshot fetch
+# Price range intentionally wider than Theme bins to allow all themes
+INTRADAY_MR_UNIVERSE_MIN_PRICE = 2.00
+INTRADAY_MR_UNIVERSE_MAX_PRICE = 100.0
+
+# Two-stage build timing
+INTRADAY_MR_STAGE1_TIME      = "09:00"  # Universe + T-1/T-2 bar cache
+INTRADAY_MR_STAGE2_TIME      = "09:30"  # Official opens + VIX + finalize candidates
+
+# Maximum seconds past a candidate's scheduled entry_time before skipping it.
+# Backtest used exact entry times; entries delayed beyond this are stale.
+INTRADAY_MR_MAX_ENTRY_DELAY_S = 60
+
+# Hard flatten time (failsafe — reconciles against broker positions)
+INTRADAY_MR_HARD_FLATTEN_TIME = "15:55"
+
+# ── Allocation note ──────────────────────────────────────────────────────────
+# On overlap days (MR + ETF router both active):
+#   INTRADAY_MR_BUDGET_PCT  = 0.50  (MR buys up to 50% equity pre-10:00)
+#   INTRADAY_ETF_ALLOCATION_PCT = 0.50  (router buys up to 50% at 10:00)
+# Combined max = 100% equity (no double-spend).
+# On non-overlap days (only one sleeve active), its half of capital is idle.
+# Explicit reallocation to the other sleeve is NOT implemented — that is a
+# future enhancement requiring its own backtest validation.
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════
 # Afternoon timeline (T-1 entry day)

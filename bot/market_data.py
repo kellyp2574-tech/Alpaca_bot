@@ -141,6 +141,72 @@ class AlpacaDataClient:
             "timestamp": latest_trade.get("t"),
         }
 
+    def get_vix_open(self) -> Optional[tuple]:
+        """
+        Fetch today's VIX opening value from the Alpaca indices endpoint (^VIX).
+
+        Returns ``(vix_open: float, bar_date: str)`` on success, ``None`` on failure.
+        The bar_date is validated to equal today's market date; stale bars return None
+        so the caller retries rather than using yesterday's regime value.
+
+        Called in Stage 2 (after 09:30) so today's bar should exist.
+        VIXY share price is NOT used as a fallback — it is not VIX.
+        """
+        try:
+            today_str = date.today().isoformat()
+            start_str = (date.today() - timedelta(days=5)).isoformat()
+            url = f"{self.data_url}/v1beta3/indices/bars"
+            params = {
+                "symbols": "^VIX",
+                "timeframe": "1Day",
+                "start": start_str,
+                "end": today_str,
+                "limit": 5,
+            }
+            resp = self.session.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.debug(f"^VIX index bar: HTTP {resp.status_code}")
+                logger.error(
+                    "Actual ^VIX open unavailable (indices endpoint non-200). "
+                    "Intraday MR will be skipped for today."
+                )
+                return None
+
+            data = resp.json()
+            bars = (data.get("bars") or {}).get("^VIX") or []
+            if not bars:
+                logger.error("^VIX index bar endpoint returned empty bars list.")
+                return None
+
+            latest = sorted(bars, key=lambda b: b.get("t", ""))[-1]
+            open_val = latest.get("o")
+            if open_val is None:
+                logger.error("^VIX latest bar has no open field.")
+                return None
+
+            # Validate bar belongs to today — if Alpaca hasn't published today's
+            # bar yet, the most recent bar is yesterday's; using it would apply the
+            # wrong regime value.  Stage 2 retries until this check passes.
+            bar_ts   = str(latest.get("t", ""))
+            bar_date = bar_ts[:10]  # "YYYY-MM-DD"
+            if bar_date != today_str:
+                logger.warning(
+                    f"^VIX latest bar is stale: bar_date={bar_date}, "
+                    f"expected={today_str}. Retrying next tick."
+                )
+                return None
+
+            logger.info(f"VIX open from ^VIX index bar: {open_val:.2f} ({bar_date})")
+            return (float(open_val), bar_date)
+
+        except Exception as e:
+            logger.debug(f"^VIX index bar fetch failed: {e}")
+            logger.error(
+                "Actual ^VIX open unavailable (exception). "
+                "Intraday MR will be skipped for today."
+            )
+            return None
+
     def get_tradable_assets_full(self) -> List[dict]:
         """
         Get full asset dicts from Alpaca API (symbol, name, exchange, class, etc.).
