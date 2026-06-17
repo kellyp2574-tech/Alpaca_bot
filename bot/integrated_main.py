@@ -94,7 +94,7 @@ def _parse_config_time(time_str: str) -> dt_time:
 # budget. Each entry is (HH, MM_start, HH, MM_end) in ET.
 _HOT_WINDOWS_HHMM = (
     (9, 24, 9, 32),   # Order cancel, 09:30 batch sells, 09:31 rescue
-    (9, 27, 9, 48),   # Intraday MR watchlist build + 9:32-9:47 entries
+    (9, 27, 10, 0),   # Intraday MR watchlist build + 9:32-10:00 entries (extended for delayed entries)
     (9, 58, 10, 12),  # ETF tape final, 10:00 strat 1-3, 10:10 strat 4-5, MR router exit
     (14, 58, 15, 2),  # 15:00 intraday exit (strats 3/4/5)
     (15, 28, 15, 32), # 15:30 intraday hard flatten (strats 1/2)
@@ -548,17 +548,18 @@ class CombinedOvernightReboundBot:
                         and current_time >= t_mr_stage2):
                     self._build_intraday_mr_finalize()
 
-                # 09:32-09:47 — submit all due-minute candidates concurrently
+                # 09:32 — entry cutoff — submit all due-minute candidates concurrently
                 # Blocked until overnight liquidation is broker-confirmed complete.
+                _t_mr_entry_cutoff = _parse_config_time(getattr(config, "INTRADAY_MR_ENTRY_CUTOFF", "10:00"))
                 if (self.intraday_mr_watchlist_built
                         and self.morning_liquidation_confirmed
                         and current_time >= dt_time(9, 32)
-                        and current_time < dt_time(9, 50)):
+                        and current_time < _t_mr_entry_cutoff):
                     self._execute_intraday_mr_entries(current_time)
                 elif (self.intraday_mr_watchlist_built
                         and not self.morning_liquidation_confirmed
                         and current_time >= dt_time(9, 32)
-                        and current_time < dt_time(9, 50)):
+                        and current_time < _t_mr_entry_cutoff):
                     logger.warning(
                         "Intraday MR entries blocked: overnight liquidation not "
                         "broker-confirmed complete (morning_liquidation_confirmed=False)"
@@ -613,34 +614,56 @@ class CombinedOvernightReboundBot:
             if self.data_collected and not self.scoring_done and current_time >= t_scoring:
                 self._step_score_and_rank()
 
-            # 15:45 — Overnight ETF (strategies A/B/C) — only if no blocking intraday position
-            # Some intraday positions (SVIX, SQQQ) don't block; others (TQQQ) do block
-            # Use persistent flag (not current positions) since blocking positions exit before 15:45
+            # ════════════════════════════════════════════
+            # 15:45 — Overnight entries (ETF then single-stock MR)
+            # Both require intraday MR positions to be flat first
+            # ════════════════════════════════════════════
+
+            # Check if intraday MR positions are closed (local state + broker confirmation)
+            intraday_positions_open = any(
+                p.get("exit_state") != "CLOSED"
+                for p in getattr(self, "intraday_mr_positions", {}).values()
+            )
+            if intraday_positions_open:
+                logger.warning(
+                    "Overnight entries waiting: intraday MR positions still open; "
+                    "waiting for 15:40 hard flatten to complete"
+                )
+
+            # 15:45 — Overnight ETF (strategies A/B/C)
+            # Gate on intraday positions being flat to avoid buying power conflicts
             if (self.scoring_done
                     and not self.overnight_etf_decision_made
                     and not self.overnight_etf_blocked_today
+                    and not intraday_positions_open
                     and current_time >= t_entry
                     and getattr(config, "OVERNIGHT_ETF_ENABLED", True)):
                 self._evaluate_overnight_etf_strategies()
                 self.overnight_etf_decision_made = True
                 self._save_state()
 
-            # 15:45 — Single-stock MR — only if neither intraday nor overnight ETF fired
+            # 15:45 — Single-stock MR
+            # Separate temporary waiting (intraday open) from permanent blocking
             if (self.scoring_done
                     and not self.entries_done
-                    and not self.mr_blocked_today
-                    and not self.overnight_etf_fired
                     and current_time >= t_entry):
-                self._step_execute_entries()
-            elif (self.scoring_done
-                    and not self.entries_done
-                    and (self.mr_blocked_today or self.overnight_etf_fired)
-                    and current_time >= t_entry):
-                logger.info(
-                    f"Single-stock MR skipped: mr_blocked_today={self.mr_blocked_today} "
-                    f"overnight_etf_fired={self.overnight_etf_fired}"
-                )
-                self.entries_done = True
+                if self.mr_blocked_today or self.overnight_etf_fired:
+                    # Permanent block - do not retry
+                    logger.info(
+                        f"Single-stock MR skipped permanently: "
+                        f"mr_blocked_today={self.mr_blocked_today} "
+                        f"overnight_etf_fired={self.overnight_etf_fired}"
+                    )
+                    self.entries_done = True
+                elif intraday_positions_open:
+                    # Temporary wait - retry next tick, do NOT set entries_done
+                    logger.warning(
+                        "Single-stock MR waiting: intraday MR positions are not yet "
+                        "broker-confirmed closed"
+                    )
+                else:
+                    # All clear - execute
+                    self._step_execute_entries()
 
             # ════════════════════════════════════════════
             # Day completion check

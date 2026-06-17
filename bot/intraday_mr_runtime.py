@@ -277,13 +277,15 @@ def _build_universe_from_massive(bot) -> List[str]:
     """Build the intraday MR universe from Massive free grouped daily. Price $2-$100, ADV $1M+."""
     try:
         from bot.mr_free_data_pipeline import build_massive_prevday_watchlist, previous_weekday
-        symbols = build_massive_prevday_watchlist(
+        watchlist = build_massive_prevday_watchlist(
             massive_api_key=config.MASSIVE_API_KEY,
             trade_date=previous_weekday(),
             min_prev_close=float(getattr(config, "INTRADAY_MR_UNIVERSE_MIN_PRICE", 2.0)),
             max_prev_close=float(getattr(config, "INTRADAY_MR_UNIVERSE_MAX_PRICE", 100.0)),
             min_prev_dollar_volume=float(getattr(config, "INTRADAY_MR_MIN_ADV_DOLLARS", 1_000_000)),
+            apply_prior_ret_filter=False,  # Intraday MR does NOT use prior-day return filter
         )
+        symbols = [w.symbol for w in watchlist]
         logger.info(f"Intraday MR: Massive universe: {len(symbols)} symbols")
         return symbols
     except Exception as e:
@@ -353,6 +355,21 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
             )
             bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry
             continue
+
+        # Check minimum remaining hold time before exit
+        exit_h, exit_m = cand.exit_time.split(":")
+        exit_dt = now_dt.replace(hour=int(exit_h), minute=int(exit_m), second=0, microsecond=0)
+        remaining_hold_s = (exit_dt - now_dt).total_seconds()
+        min_remaining = int(getattr(config, "INTRADAY_MR_MIN_REMAINING_HOLD_S", 120))
+        if remaining_hold_s < min_remaining:
+            logger.warning(
+                f"Intraday MR: skipping {cand.symbol} [{cand.sleeve_name}] — "
+                f"only {remaining_hold_s:.0f}s remain before exit {cand.exit_time} "
+                f"(min required={min_remaining}s)"
+            )
+            bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry
+            continue
+
         due.append(cand)
 
     if not due:
@@ -1073,17 +1090,25 @@ def _reconcile_exit_orders(bot) -> None:
 
 def flatten_all_intraday_mr_positions(bot) -> None:
     """
-    15:55 failsafe: reconcile against actual broker positions.
+    15:40 failsafe: reconcile against actual broker positions.
     Any intraday MR symbol still held at the broker is force-flattened,
     regardless of local exit_state. This catches EXIT_FAILED, EXIT_PENDING
     orders that were silently dropped, and any state tracking bugs.
+    
+    NOTE: Reconciles pending exits first, skips symbols already EXIT_PENDING,
+    and only resubmits for OPEN or EXIT_FAILED positions.
     """
     if not getattr(config, "INTRADAY_MR_ENABLED", False):
         return
 
     positions = getattr(bot, "intraday_mr_positions", {})
+    if not positions:
+        return
 
-    # Fetch actual broker positions for ground truth
+    # Step 1: Reconcile any pending exits to avoid duplicate sells
+    _reconcile_exit_orders(bot)
+
+    # Step 2: Fetch actual broker positions for ground truth
     try:
         broker_positions = bot.position_mgr.get_broker_positions()  # returns list of dicts or None
         broker_held = {p.get("symbol") for p in (broker_positions or []) if p.get("symbol")}
@@ -1094,19 +1119,38 @@ def flatten_all_intraday_mr_positions(bot) -> None:
     tracked_symbols = set(positions.keys())
     to_flatten = set()
 
-    # Any locally tracked position not yet CLOSED
+    # Step 3: Find positions that need flattening
     for symbol, pos in positions.items():
-        if pos.get("exit_state") != _STATE_CLOSED:
+        state = pos.get("exit_state")
+        # Include: OPEN, EXIT_FAILED, and broker-held positions
+        # Exclude: EXIT_PENDING (already have live order), CLOSED
+        if state == _STATE_EXIT_PENDING:
+            # Already have a live exit order - don't duplicate
+            continue
+        if state != _STATE_CLOSED:
             to_flatten.add(symbol)
 
     # Any broker-held position we track (catches missed EXIT_PENDING fills)
     to_flatten |= (tracked_symbols & broker_held)
 
+    # Step 4: Submit exits only for positions not already EXIT_PENDING
     for symbol in to_flatten:
-        logger.warning(f"Intraday MR hard flatten: {symbol}")
         pos = positions.get(symbol)
-        if pos:
-            pos["exit_state"] = _STATE_OPEN  # reset so _submit_intraday_mr_exit will run
+        if not pos:
+            continue
+        
+        state = pos.get("exit_state")
+        if state == _STATE_EXIT_PENDING:
+            # Double-check: skip if somehow now EXIT_PENDING after reconcile
+            continue
+        
+        logger.warning(f"Intraday MR hard flatten: {symbol} (state={state})")
+        
+        # Reset EXIT_FAILED to OPEN so _submit_intraday_mr_exit will run
+        # Leave EXIT_PENDING alone (shouldn't reach here due to check above)
+        if state == _STATE_EXIT_FAILED:
+            pos["exit_state"] = _STATE_OPEN
+        
         _submit_intraday_mr_exit(bot, symbol, reason="hard_flatten_failsafe")
 
     bot._save_state()
