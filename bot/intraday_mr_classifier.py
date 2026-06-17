@@ -6,12 +6,12 @@ source of truth). Do not change values without re-running the backtest.
 
 Regime:
   ACTIVE    — VIX >= 15 (README validated threshold) AND |SPY gap| > 1% AND |QQQ gap| > 1%
-                -> run Themes A, B, C  (and always UL alongside)
+                -> Themes A, B, C only (no UL fallback on active days)
   DEAD_ZONE — anything else
-                -> run Theme D  (and always UL alongside)
+                -> Theme D; UL fills slots only when D is empty
 
-UL sleeves fire on ALL days (not just dead zone fallback).
-UL candidates only fill a slot if regime candidates don't.
+UL is a dead-zone-only fallback — it is never used on ACTIVE days.
+This matches the router-exit portfolio version producing the 26.37x / Sharpe 2.39 baseline.
 
 Sorting: (sleeve_rank ASC, |pm_ret| DESC) — severity ranking for tie-breaking.
 Caps: min=1, max=8 per day.

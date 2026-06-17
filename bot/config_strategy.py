@@ -239,7 +239,7 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 # Capital: 50% of equity split equally across candidates.
 # Router exit rule at 10:00: if SHORT → keep Theme A only, exit B/C/D/UL.
 
-INTRADAY_MR_ENABLED = False            # Toggle to enable. Start with paper test.
+INTRADAY_MR_ENABLED = True             # Paper testing enabled.
 
 # Regime classification (VIX >= 15 validated vs VIX >= 20 original)
 INTRADAY_MR_VIX_THRESHOLD = 15.0      # Active day if VIX >= this

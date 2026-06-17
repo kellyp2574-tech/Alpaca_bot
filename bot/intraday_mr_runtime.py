@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date as dt_date
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
@@ -357,26 +358,36 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
     if not due:
         return
 
-    # Submit all due candidates concurrently (fire-and-forget; reconcile later)
-    for cand in due:
+    # Submit all due candidates CONCURRENTLY via a thread pool.
+    # Each thread fires one market-buy REST call; results are collected below.
+    # This mirrors the backtest assumption that all same-minute entries happen
+    # at the open of that minute rather than sequentially over several seconds.
+    def _submit_one(cand: IntradayMRCandidate):
+        """Returns (cand, order, error_type, qty) or raises."""
         if per_pos <= 0 or cand.signal_price <= 0:
-            logger.warning(f"Intraday MR: skipping {cand.symbol} — budget/price invalid")
-            bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry
-            continue
-
+            return (cand, None, "invalid_budget_or_price", 0)
         qty = int(per_pos / cand.signal_price)
         if qty <= 0:
-            logger.warning(f"Intraday MR: qty=0 for {cand.symbol} @ ${cand.signal_price:.2f}")
-            bot.intraday_mr_entered_symbols.add(cand.symbol)
-            continue
+            return (cand, None, "qty_zero", 0)
+        order, error_type = bot.position_mgr.submit_buy_order(
+            symbol=cand.symbol, qty=qty, order_type="market",
+        )
+        return (cand, order, error_type, qty)
 
-        try:
-            order, error_type = bot.position_mgr.submit_buy_order(
-                symbol=cand.symbol, qty=qty, order_type="market",
-            )
+    with ThreadPoolExecutor(max_workers=len(due)) as pool:
+        futures = {pool.submit(_submit_one, cand): cand for cand in due}
+        for future in as_completed(futures):
+            cand = futures[future]
+            try:
+                cand_out, order, error_type, qty = future.result()
+            except Exception as e:
+                logger.error(f"Intraday MR: submission error for {cand.symbol}: {e}", exc_info=True)
+                bot.intraday_mr_entered_symbols.add(cand.symbol)
+                continue
+
             if error_type or not order:
                 logger.error(f"Intraday MR: buy rejected for {cand.symbol}: {error_type}")
-                bot.intraday_mr_entered_symbols.add(cand.symbol)  # don't retry rejected order
+                bot.intraday_mr_entered_symbols.add(cand.symbol)
                 continue
 
             order_id = order.get("id")
@@ -387,9 +398,6 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
                 f"Intraday MR order submitted: {cand.symbol} [{cand.sleeve_name}] "
                 f"x{qty} @ mkt  (order_id={order_id})"
             )
-        except Exception as e:
-            logger.error(f"Intraday MR: submission error for {cand.symbol}: {e}", exc_info=True)
-            bot.intraday_mr_entered_symbols.add(cand.symbol)
 
     bot._save_state()
 
