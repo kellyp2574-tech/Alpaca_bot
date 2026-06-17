@@ -215,6 +215,16 @@ MR_FREE_PREV_MIN_PRICE = 0.75
 MR_FREE_PREV_MAX_PRICE = 3.00
 MR_FREE_PREV_MIN_DOLLAR_VOLUME = 500_000
 
+# Prior-day return filter (T-2 to T-1) - morning pre-filter for overnight MR
+# Based on backtest: stocks with prior-day returns in [-20%, +5%] perform best
+# (0-5% bucket: +0.60% avg, 5-10% bucket: -0.66% avg, so boundary is +5%)
+MR_FREE_PRIOR_RET_MIN = -0.20   # Reject stocks that crashed >20% prior day
+MR_FREE_PRIOR_RET_MAX = 0.05    # Reject stocks that surged >5% prior day
+
+# If True, fail closed when T-2 data is unavailable (return empty watchlist)
+# If False, proceed without prior_ret filtering when T-2 data is missing
+MR_FREE_PRIOR_RET_REQUIRE_DATA = False
+
 # Stage 2: Alpaca live snapshot scan settings
 MR_FREE_ALPACA_BATCH_SIZE = 200
 MR_FREE_ALPACA_BATCH_SLEEP_SECONDS = 0.25
@@ -265,11 +275,20 @@ INTRADAY_MR_STAGE1_TIME      = "09:00"  # Universe + T-1/T-2 bar cache
 INTRADAY_MR_STAGE2_TIME      = "09:30"  # Official opens + VIX + finalize candidates
 
 # Maximum seconds past a candidate's scheduled entry_time before skipping it.
+# Extended to 15 minutes (900s) to accommodate Alpaca paper delays.
 # Backtest used exact entry times; entries delayed beyond this are stale.
-INTRADAY_MR_MAX_ENTRY_DELAY_S = 60
+INTRADAY_MR_MAX_ENTRY_DELAY_S = 900
+
+# Entry cutoff time — no new entries after this time regardless of delay
+INTRADAY_MR_ENTRY_CUTOFF = "10:00"
+
+# Minimum remaining hold time in seconds required to enter a position
+# Prevents entering positions too close to exit time
+INTRADAY_MR_MIN_REMAINING_HOLD_S = 120
 
 # Hard flatten time (failsafe — reconciles against broker positions)
-INTRADAY_MR_HARD_FLATTEN_TIME = "15:55"
+# MUST be before 15:45 overnight entry time to avoid position conflicts
+INTRADAY_MR_HARD_FLATTEN_TIME = "15:40"
 
 # ── Allocation note ──────────────────────────────────────────────────────────
 # On overlap days (MR + ETF router both active):

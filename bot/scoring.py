@@ -92,6 +92,7 @@ def step_score_and_rank(bot) -> None:
             min_prev_close=float(getattr(config, "MR_FREE_PREV_MIN_PRICE", 0.75)),
             max_prev_close=float(getattr(config, "MR_FREE_PREV_MAX_PRICE", 3.00)),
             min_prev_dollar_volume=float(getattr(config, "MR_FREE_PREV_MIN_DOLLAR_VOLUME", 500_000)),
+            apply_prior_ret_filter=True,  # Apply prior-day return filter for overnight MR
         )
 
         live_candidates = build_live_mr_candidates_from_free_pipeline(
@@ -121,6 +122,7 @@ def step_score_and_rank(bot) -> None:
                 "close_position": round(c.close_position, 3),
                 "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
                 "adv_dollars": round(c.adv_dollars, 0),
+                "prior_ret": round(c.prior_ret, 4) if c.prior_ret is not None else None,
                 "source": "massive_prevday_plus_alpaca_snapshot",
             }
 

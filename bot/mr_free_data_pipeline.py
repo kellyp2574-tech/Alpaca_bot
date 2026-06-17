@@ -32,6 +32,7 @@ class MRWatchSymbol:
     prev_close: float
     prev_volume: int
     prev_dollar_volume: float
+    prior_ret: Optional[float] = None  # T-2 to T-1 return (prior day return)
 
 
 @dataclass
@@ -46,6 +47,7 @@ class LiveMRCandidate:
     spread_pct: Optional[float]
     volume_today: Optional[float]
     selection_score: float
+    prior_ret: Optional[float] = None  # T-2 to T-1 return for audit/diagnostics
 
 
 def chunked(items: List[str], size: int) -> Iterable[List[str]]:
@@ -62,55 +64,120 @@ def previous_weekday(d: Optional[date] = None) -> date:
     return d
 
 
+def _fetch_massive_grouped(
+    trade_date: date,
+    massive_api_key: str,
+    timeout: int = 30,
+) -> Optional[List[dict]]:
+    """Fetch grouped daily data from Massive for a specific date."""
+    url = f"https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{trade_date.isoformat()}"
+    params = {"adjusted": "true", "apiKey": massive_api_key}
+    
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload.get("results") or []
+    except requests.RequestException as e:
+        logger.warning(f"Massive request failed for {trade_date}: {e}")
+        return None
+
+
+def _fetch_latest_grouped_on_or_before(
+    start_date: date,
+    massive_api_key: str,
+    max_lookback: int = 7,
+    timeout: int = 30,
+) -> Tuple[Optional[date], Optional[List[dict]]]:
+    """
+    Find the latest available grouped session on or before start_date.
+    Returns (actual_date, rows) or (None, None) if no data found.
+    """
+    d = start_date
+    for _ in range(max_lookback):
+        rows = _fetch_massive_grouped(d, massive_api_key, timeout)
+        if rows:
+            return d, rows
+        d = previous_weekday(d)
+    return None, None
+
+
 def build_massive_prevday_watchlist(
     massive_api_key: str,
     trade_date: Optional[date] = None,
     min_prev_close: float = 0.75,
     max_prev_close: float = 3.00,
     min_prev_dollar_volume: float = 500_000,
+    apply_prior_ret_filter: bool = False,  # True for overnight MR, False for intraday MR
+    prior_ret_min: Optional[float] = None,  # Defaults to config.MR_FREE_PRIOR_RET_MIN
+    prior_ret_max: Optional[float] = None,   # Defaults to config.MR_FREE_PRIOR_RET_MAX
+    require_t2_data: Optional[bool] = None,  # Defaults to config.MR_FREE_PRIOR_RET_REQUIRE_DATA
     timeout: int = 30,
 ) -> List[MRWatchSymbol]:
     """
     Build broad MR watchlist from previous-day Massive grouped daily data.
-
-    This is only a prefilter:
-      - cheap enough to maybe be $1-$2 today
-      - liquid enough to be worth live checking
-      - not making final MR decision here
+    
+    Args:
+        apply_prior_ret_filter: If True, fetches T-2 and filters by prior-day return.
+                               If False, returns all T-1 symbols (for intraday MR).
+        
+    NOTE: T-1 and T-2 are fetched SEQUENTIALLY to ensure correct pairing:
+      1. Find actual T-1 (latest available session before today)
+      2. Find actual T-2 (latest available session before actual T-1)
+    This prevents holiday misalignment issues.
     """
-    trade_date = trade_date or previous_weekday()
-    url = f"https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{trade_date.isoformat()}"
-
-    params = {
-        "adjusted": "true",
-        "apiKey": massive_api_key,
-    }
-
-    # Holiday fallback: try up to 5 previous weekdays if no data
-    payload = None
-    for attempt in range(5):
-        logger.info(f"Massive prevday watchlist: fetching grouped daily for {trade_date} (attempt {attempt+1})")
-        try:
-            resp = requests.get(url, params=params, timeout=timeout)
-            resp.raise_for_status()
-            payload = resp.json()
-            results = payload.get("results") or []
-            if results:
-                break
-            logger.warning(f"No grouped data for {trade_date}, trying previous weekday")
-        except requests.RequestException as e:
-            logger.warning(f"Massive request failed for {trade_date}: {e}")
-
-        trade_date = previous_weekday(trade_date)
-        url = f"https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{trade_date.isoformat()}"
-    else:
-        logger.error("Massive prevday watchlist failed: no grouped data found after 5 attempts")
+    # Use config defaults if not provided
+    if prior_ret_min is None:
+        prior_ret_min = float(getattr(config, "MR_FREE_PRIOR_RET_MIN", -0.20))
+    if prior_ret_max is None:
+        prior_ret_max = float(getattr(config, "MR_FREE_PRIOR_RET_MAX", 0.05))  # +5% per backtest
+    if require_t2_data is None:
+        require_t2_data = bool(getattr(config, "MR_FREE_PRIOR_RET_REQUIRE_DATA", False))
+    
+    # Step 1: Find actual T-1 (latest available grouped session)
+    search_start = trade_date or previous_weekday()
+    actual_t1, results_t1 = _fetch_latest_grouped_on_or_before(search_start, massive_api_key, timeout=timeout)
+    
+    if not results_t1 or not actual_t1:
+        logger.error("Massive prevday watchlist failed: no T-1 grouped data found")
         return []
-
-    results = payload.get("results") or []
+    
+    # Step 2: Find actual T-2 (session before actual T-1) - ONLY if applying filter
+    actual_t2 = None
+    results_t2 = None
+    t2_close_by_symbol = {}
+    
+    if apply_prior_ret_filter:
+        # Start searching from the day before actual T-1
+        t2_search_start = previous_weekday(actual_t1)
+        actual_t2, results_t2 = _fetch_latest_grouped_on_or_before(t2_search_start, massive_api_key, timeout=timeout)
+        
+        if not results_t2:
+            msg = f"No T-2 data available (T-1={actual_t1}, searched back from {t2_search_start})"
+            if require_t2_data:
+                logger.error(f"Massive prevday watchlist: {msg}; failing closed (require_t2_data=True)")
+                return []
+            else:
+                logger.warning(f"Massive prevday watchlist: {msg}; prior_ret filtering disabled")
+        else:
+            # Build T-2 close lookup
+            for row in results_t2:
+                symbol = row.get("T") or row.get("ticker")
+                close = row.get("c")
+                if symbol and close is not None:
+                    try:
+                        t2_close_by_symbol[symbol] = float(close)
+                    except (TypeError, ValueError):
+                        pass
+            logger.info(f"T-2 data found: actual_t2={actual_t2}, symbols={len(t2_close_by_symbol)}")
+    
+    # Process T-1 results and optionally apply prior_ret filter
     watchlist: List[MRWatchSymbol] = []
-
-    for row in results:
+    filtered_crashed = 0   # prior_ret < -20%
+    filtered_surged = 0    # prior_ret > +5%
+    filtered_missing_t2 = 0  # T-2 data unavailable for symbol
+    
+    for row in results_t1:
         symbol = row.get("T") or row.get("ticker")
         close = row.get("c")
         volume = row.get("v")
@@ -136,9 +203,31 @@ def build_massive_prevday_watchlist(
         if prev_dollar_volume < min_prev_dollar_volume:
             continue
 
-        # Lightweight symbol exclusions. Your existing universe_builder may already do more.
+        # Lightweight symbol exclusions.
         if should_exclude_symbol_basic(symbol):
             continue
+
+        # Calculate prior-day return (T-2 to T-1) if applying filter and T-2 data available
+        prior_ret = None
+        if apply_prior_ret_filter and t2_close_by_symbol:
+            t2_close = t2_close_by_symbol.get(symbol)
+            if t2_close and t2_close > 0:
+                prior_ret = (prev_close - t2_close) / t2_close
+                
+                # Apply filter: reject crashed stocks (< -20%)
+                if prior_ret < prior_ret_min:
+                    filtered_crashed += 1
+                    continue
+                
+                # Apply filter: reject surged stocks (> +5%)
+                if prior_ret > prior_ret_max:
+                    filtered_surged += 1
+                    continue
+            else:
+                # Symbol in T-1 but not in T-2 (e.g., new listing)
+                filtered_missing_t2 += 1
+                if require_t2_data:
+                    continue
 
         watchlist.append(
             MRWatchSymbol(
@@ -146,13 +235,23 @@ def build_massive_prevday_watchlist(
                 prev_close=prev_close,
                 prev_volume=prev_volume,
                 prev_dollar_volume=prev_dollar_volume,
+                prior_ret=prior_ret,
             )
         )
 
-    logger.info(
-        f"Massive prevday watchlist complete: {len(watchlist)} symbols "
-        f"from {len(results)} grouped rows"
-    )
+    # Detailed logging
+    total_rejected = filtered_crashed + filtered_surged + filtered_missing_t2
+    if apply_prior_ret_filter:
+        logger.info(
+            f"Massive prevday watchlist (WITH prior_ret filter): {len(watchlist)} symbols "
+            f"from T-1={actual_t1} (T-2={actual_t2}), "
+            f"rejected: crashed={filtered_crashed}, surged={filtered_surged}, no_t2={filtered_missing_t2}"
+        )
+    else:
+        logger.info(
+            f"Massive prevday watchlist (NO prior_ret filter): {len(watchlist)} symbols from T-1={actual_t1}"
+        )
+    
     return watchlist
 
 
@@ -408,6 +507,7 @@ def build_live_mr_candidates_from_free_pipeline(
                 spread_pct=spread_pct,
                 volume_today=fields["volume_today"],
                 selection_score=selection_score,
+                prior_ret=prev.prior_ret,  # Propagate from Massive watchlist for audit
             )
         )
 
@@ -429,7 +529,7 @@ def convert_live_to_existing_mr_candidate(c: LiveMRCandidate):
     """
     from bot.mean_reversion_scorer import MeanReversionCandidate
 
-    return MeanReversionCandidate(
+    result = MeanReversionCandidate(
         symbol=c.symbol,
         signal_price=c.signal_price,
         open_price_930=c.signal_price,  # placeholder - use day_open if available
@@ -444,3 +544,7 @@ def convert_live_to_existing_mr_candidate(c: LiveMRCandidate):
         late_drop_1530_1550=0.0,
         selection_score=c.selection_score,
     )
+
+    # Preserve prior_ret for audit/diagnostics (may not be in original dataclass)
+    result.prior_ret = c.prior_ret
+    return result
