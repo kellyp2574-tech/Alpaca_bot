@@ -39,13 +39,15 @@ def _serialise_pending_orders(pending: dict) -> dict:
             "qty":                   p.get("qty"),
             "cancel_requested":      bool(p.get("cancel_requested", False)),
             "accounted_filled_qty":  int(p.get("accounted_filled_qty", 0)),
-            "cand_entry_time":       getattr(cand, "entry_time",    None),
-            "cand_exit_time":        getattr(cand, "exit_time",     None),
-            "cand_tp_pct":           getattr(cand, "tp_pct",        None),
-            "cand_sl_pct":           getattr(cand, "sl_pct",        None),
-            "cand_theme":            getattr(cand, "theme",         None),
-            "cand_sleeve_name":      getattr(cand, "sleeve_name",   None),
-            "cand_signal_price":     getattr(cand, "signal_price",  None),
+            "is_addon":              bool(p.get("is_addon", False)),
+            "original_position":     p.get("original_position"),  # dict or None
+            "cand_entry_time":       getattr(cand, "entry_time",    None) if cand else None,
+            "cand_exit_time":        getattr(cand, "exit_time",     None) if cand else None,
+            "cand_tp_pct":           getattr(cand, "tp_pct",        None) if cand else None,
+            "cand_sl_pct":           getattr(cand, "sl_pct",        None) if cand else None,
+            "cand_theme":            getattr(cand, "theme",         None) if cand else None,
+            "cand_sleeve_name":      getattr(cand, "sleeve_name",   None) if cand else None,
+            "cand_signal_price":     getattr(cand, "signal_price",  None) if cand else None,
         }
     return out
 
@@ -69,7 +71,9 @@ def _deserialise_pending_orders(raw: dict) -> dict:
             "qty":                  p.get("qty"),
             "cancel_requested":     bool(p.get("cancel_requested",    False)),
             "accounted_filled_qty": int( p.get("accounted_filled_qty", 0)),
-            "cand":                 cand,
+            "is_addon":             bool(p.get("is_addon",             False)),
+            "original_position":    p.get("original_position"),
+            "cand":                 cand if not p.get("is_addon") else None,
         }
     return out
 
@@ -219,6 +223,7 @@ def save_state(bot) -> None:
             "intraday_mr_symbol_cache": getattr(bot, "intraday_mr_symbol_cache", {}),
             "intraday_mr_vix_open": getattr(bot, "intraday_mr_vix_open", None),
             "intraday_mr_candidates": _serialise_candidates(getattr(bot, "intraday_mr_candidates", [])),
+            "intraday_mr_realloc_done": getattr(bot, "intraday_mr_realloc_done", False),
         }
         bot.state_mgr.save_bot_state(bot_state)
     except Exception as e:
@@ -264,6 +269,7 @@ def load_state(bot) -> None:
         bot.intraday_mr_universe_list       = []
         bot.intraday_mr_symbol_cache        = {}
         bot.intraday_mr_vix_open            = None
+        bot.intraday_mr_realloc_done        = False
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -331,6 +337,7 @@ def load_state(bot) -> None:
     bot.intraday_mr_symbol_cache          = bot_state.get("intraday_mr_symbol_cache", {})
     bot.intraday_mr_vix_open              = bot_state.get("intraday_mr_vix_open", None)
     bot.intraday_mr_candidates            = _deserialise_candidates(bot_state.get("intraday_mr_candidates", []))
+    bot.intraday_mr_realloc_done          = bot_state.get("intraday_mr_realloc_done", False)
     # Safety: if watchlist flag is set but candidates list is empty, force rebuild
     if bot.intraday_mr_watchlist_built and not bot.intraday_mr_candidates:
         logger.warning(

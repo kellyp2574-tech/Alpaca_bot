@@ -273,13 +273,24 @@ INTRADAY_MR_HARD_FLATTEN_TIME = "15:55"
 
 # ── Allocation note ──────────────────────────────────────────────────────────
 # On overlap days (MR + ETF router both active):
-#   INTRADAY_MR_BUDGET_PCT  = 0.50  (MR buys up to 50% equity pre-10:00)
+#   INTRADAY_MR_BUDGET_PCT      = 0.50  (MR buys up to 50% equity pre-10:00)
 #   INTRADAY_ETF_ALLOCATION_PCT = 0.50  (router buys up to 50% at 10:00)
 # Combined max = 100% equity (no double-spend).
-# On non-overlap days (only one sleeve active), its half of capital is idle.
-# Explicit reallocation to the other sleeve is NOT implemented — that is a
-# future enhancement requiring its own backtest validation.
+# On non-router days: at 10:10 the router bucket is reallocated to open MR
+# positions as add-on buys (see INTRADAY_REALLOC_* settings below).
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Router-budget reallocation to MR (10:10 add-on) ─────────────────────────
+# Fires once at ~10:10 when the router did NOT enter a position.
+# The unused router bucket (50% equity) is redistributed to open MR winners.
+# Weighting: equal weight among positions with ret >= 0 at 10:10.
+# Disable here without touching the rest of the sleeve.
+INTRADAY_REALLOC_ENABLED      = True
+INTRADAY_REALLOC_TIME         = "10:10"   # window start
+INTRADAY_REALLOC_CUTOFF       = "10:11"   # abandon after this (no more retries)
+INTRADAY_REALLOC_MODE         = "equal_positive"   # equal weight among ret>=0 winners
+INTRADAY_REALLOC_MAX_PCT      = 0.50      # max fraction of equity to redeploy
+INTRADAY_REALLOC_BP_BUFFER    = 0.98      # apply to buying_power before sizing
 
 # ═══════════════════════════════════════════════════
 # Afternoon timeline (T-1 entry day)

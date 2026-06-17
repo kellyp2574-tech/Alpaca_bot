@@ -419,15 +419,14 @@ def reconcile_intraday_mr_pending_fills(bot) -> None:
     confirmed = []
     still_pending = []
 
-    # Retrieve the router action latch set at 10:00 (if any)
+    # Retrieve the router action latch set at 10:00 (if any).
+    # Use the same canonical mapping as _get_router_action so the two code
+    # paths cannot disagree on what counts as a short signal.
     router_action_latch = getattr(bot, "intraday_mr_router_action", None)
-    _ROUTER_SHORT_ACTIONS = getattr(
-        config, "ROUTER_SHORT_ACTIONS",
-        ["sqqq_goldilocks", "uvxy_crash", "anti", "sqqq"]
-    )
+    _ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks", "uvxy_crash")
     router_is_short = (
         router_action_latch is not None
-        and any(s in router_action_latch.lower() for s in _ROUTER_SHORT_ACTIONS)
+        and router_action_latch.lower() in _ROUTER_SHORT_ACTIONS
     )
 
     for symbol, pend in list(pending.items()):
@@ -449,37 +448,64 @@ def reconcile_intraday_mr_pending_fills(bot) -> None:
 
             if new_filled > 0 and filled_avg:
                 fill_price = float(filled_avg)
-                theme = getattr(cand, "theme", None)
+                is_addon = bool(pend.get("is_addon", False))
 
-                # Register / update position so 15:55 failsafe can always see it
-                bot.intraday_mr_positions[symbol] = {
-                    "symbol":      symbol,
-                    "theme":       theme,
-                    "sleeve_name": getattr(cand, "sleeve_name", ""),
-                    "entry_price": fill_price,
-                    "qty":         filled_qty,
-                    "entry_time":  getattr(cand, "entry_time", ""),
-                    "exit_time":   getattr(cand, "exit_time", "15:50"),
-                    "tp_pct":      getattr(cand, "tp_pct", None),
-                    "sl_pct":      getattr(cand, "sl_pct", None),
-                    "order_id":    order_id,
-                    "exit_state":  _STATE_OPEN,
-                    "exit_order_id": None,
-                    "exit_reason": None,
-                }
-                logger.info(
-                    f"Intraday MR fill: {symbol} [{getattr(cand,'sleeve_name','')}/ "
-                    f"Theme-{theme}] x{filled_qty} @ ${fill_price:.2f}  "
-                    f"TP={getattr(cand,'tp_pct',None)}  SL={getattr(cand,'sl_pct',None)}  "
-                    f"EXIT={getattr(cand,'exit_time','')}  status={status}"
-                )
-                # If router already latched SHORT and this is a non-A fill, exit immediately
-                if router_is_short and theme != "A":
-                    logger.warning(
-                        f"Intraday MR late fill after router-short: "
-                        f"{symbol} [Theme-{theme}] — submitting immediate exit"
+                if is_addon:
+                    # ── Add-on fill: increment qty, compute weighted-average entry ──
+                    # The existing position dict is the source of truth for theme /
+                    # sleeve / TP / SL / exit_time — do NOT overwrite those fields.
+                    orig = pend.get("original_position", {})
+                    pos  = bot.intraday_mr_positions.get(symbol)
+                    if pos is None:
+                        # Position was closed before add-on filled; discard
+                        logger.warning(
+                            f"Intraday MR add-on fill: {symbol} position no longer exists — ignoring fill"
+                        )
+                    else:
+                        old_qty   = int(pos.get("qty", 0))
+                        old_entry = float(pos.get("entry_price", fill_price))
+                        new_qty   = old_qty + new_filled
+                        new_entry = (
+                            (old_qty * old_entry + new_filled * fill_price) / new_qty
+                        ) if new_qty > 0 else fill_price
+                        pos["qty"]          = new_qty
+                        pos["entry_price"]  = new_entry
+                        logger.info(
+                            f"Intraday MR add-on fill: {symbol} +{new_filled} @ ${fill_price:.2f}  "
+                            f"total={new_qty} wavg_entry=${new_entry:.2f}"
+                        )
+                else:
+                    theme = getattr(cand, "theme", None)
+
+                    # Register / update position so 15:55 failsafe can always see it
+                    bot.intraday_mr_positions[symbol] = {
+                        "symbol":      symbol,
+                        "theme":       theme,
+                        "sleeve_name": getattr(cand, "sleeve_name", ""),
+                        "entry_price": fill_price,
+                        "qty":         filled_qty,
+                        "entry_time":  getattr(cand, "entry_time", ""),
+                        "exit_time":   getattr(cand, "exit_time", "15:50"),
+                        "tp_pct":      getattr(cand, "tp_pct", None),
+                        "sl_pct":      getattr(cand, "sl_pct", None),
+                        "order_id":    order_id,
+                        "exit_state":  _STATE_OPEN,
+                        "exit_order_id": None,
+                        "exit_reason": None,
+                    }
+                    logger.info(
+                        f"Intraday MR fill: {symbol} [{getattr(cand,'sleeve_name','')}/ "
+                        f"Theme-{theme}] x{filled_qty} @ ${fill_price:.2f}  "
+                        f"TP={getattr(cand,'tp_pct',None)}  SL={getattr(cand,'sl_pct',None)}  "
+                        f"EXIT={getattr(cand,'exit_time','')}  status={status}"
                     )
-                    _submit_intraday_mr_exit(bot, symbol, reason="late_fill_after_router_short")
+                    # If router already latched SHORT and this is a non-A fill, exit immediately
+                    if router_is_short and theme != "A":
+                        logger.warning(
+                            f"Intraday MR late fill after router-short: "
+                            f"{symbol} [Theme-{theme}] — submitting immediate exit"
+                        )
+                        _submit_intraday_mr_exit(bot, symbol, reason="late_fill_after_router_short")
 
             # Now decide whether to remove from pending
             if status == "filled":
@@ -540,11 +566,8 @@ def apply_router_exit_at_1000(bot) -> None:
 
     # Cancel pending non-A buy orders
     pending: dict = getattr(bot, "intraday_mr_pending_orders", {})
-    _ROUTER_SHORT_ACTIONS = getattr(
-        config, "ROUTER_SHORT_ACTIONS",
-        ["sqqq_goldilocks", "uvxy_crash", "anti", "sqqq"]
-    )
-    is_short = any(s in router_action.lower() for s in _ROUTER_SHORT_ACTIONS)
+    _ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks", "uvxy_crash")
+    is_short = router_action.lower() in _ROUTER_SHORT_ACTIONS
 
     if is_short:
         for symbol, pend in list(pending.items()):
@@ -578,7 +601,23 @@ def apply_router_exit_at_1000(bot) -> None:
 
 
 def _get_router_action(bot) -> str:
-    """Extract router action string from bot state."""
+    """Extract router action string from bot state.
+
+    Maps live RouterBranch values to the action labels used by
+    apply_router_exit_rule / ROUTER_SHORT_ACTIONS:
+      SHORT signals  → 'sqqq_goldilocks' or 'uvxy_crash'  (trigger MR exit)
+      LONG  signals  → branch value as-is                  (hold MR positions)
+      NO_TRADE       → 'none'
+
+    Live RouterBranch enum:
+      MOMENTUM_SLEEVE_ANTI  — SQQQ short/hedge → SHORT
+      VXX_SPIKE_RECOVERY    — long TQQQ        → LONG  (was incorrectly SHORT)
+      VXX_COLLAPSE          — long TQQQ        → LONG
+      MOMENTUM_SLEEVE       — long TQQQ        → LONG
+      ROUTER_LONG           — long TQQQ        → LONG
+      SVIX_LONG             — long SVIX        → LONG
+      NO_TRADE              — no entry         → none
+    """
     decision = getattr(bot, "router_decision", None)
     if decision is None:
         return "none"
@@ -586,12 +625,209 @@ def _get_router_action(bot) -> str:
     if branch is None:
         return "none"
     branch_str = branch.value if hasattr(branch, "value") else str(branch)
-    branch_lower = branch_str.lower()
-    if "sqqq" in branch_lower or "anti" in branch_lower:
+
+    # Only MOMENTUM_SLEEVE_ANTI is a short/hedge signal in the live bot.
+    # All VXX-based strategies (VXX_SPIKE_RECOVERY, VXX_COLLAPSE) are long TQQQ.
+    if branch_str in ("MOMENTUM_SLEEVE_ANTI",):
         return "sqqq_goldilocks"
-    if "vxx" in branch_lower and "collapse" not in branch_lower:
-        return "uvxy_crash"
-    return branch_lower
+
+    if branch_str == "NO_TRADE":
+        return "none"
+
+    # All remaining branches (MOMENTUM_SLEEVE, VXX_SPIKE_RECOVERY, VXX_COLLAPSE,
+    # ROUTER_LONG, SVIX_LONG) are long signals — do not exit MR positions.
+    return branch_str.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10:10: Router-budget reallocation to open MR positions (momentum-weighted)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def reallocate_router_budget_to_mr(bot) -> None:
+    """
+    Called each tick in the 10:10–10:11 window when the router did NOT fire.
+
+    Redeploys the unused router bucket (INTRADAY_REALLOC_MAX_PCT of equity,
+    capped by available buying power) into open MR positions as add-on buys.
+
+    Weighting: equal weight among positions whose return at 10:10 >= 0.
+    If no position is in profit, falls back to equal weight across all open.
+    This is the conservative default; change INTRADAY_REALLOC_MODE in config
+    once the allocation backtest confirms a different formula.
+
+    Add-on fills reconcile via the normal pending path but use is_addon=True
+    so the reconciler increments qty + recomputes weighted-average entry
+    instead of overwriting the position dictionary.
+
+    Latch (intraday_mr_realloc_done) is set only after:
+      - Intentional skip (no eligible positions), OR
+      - At least one add-on order was successfully submitted, OR
+      - The cutoff time (INTRADAY_REALLOC_CUTOFF) has passed.
+    Temporary failures (API errors) leave the latch False so the next tick retries.
+    """
+    if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        return
+    if not getattr(config, "INTRADAY_REALLOC_ENABLED", True):
+        return
+    if getattr(bot, "intraday_mr_realloc_done", False):
+        return
+
+    from datetime import time as dtime
+    now = datetime.now(_ET)
+    cutoff_str = getattr(config, "INTRADAY_REALLOC_CUTOFF", "10:11")
+    ch, cm = cutoff_str.split(":")
+    cutoff_time = dtime(int(ch), int(cm))
+    if now.time() > cutoff_time:
+        logger.warning(
+            f"Intraday MR realloc: past cutoff {cutoff_str} — abandoning reallocation attempt"
+        )
+        bot.intraday_mr_realloc_done = True
+        bot._save_state()
+        return
+
+    positions   = getattr(bot, "intraday_mr_positions", {})
+    pending_now = getattr(bot, "intraday_mr_pending_orders", {})
+
+    # Eligible: open state AND no other pending buy already in flight for this symbol
+    open_pos = {
+        sym: pos for sym, pos in positions.items()
+        if pos.get("exit_state") in (_STATE_OPEN, _STATE_EXIT_FAILED)
+        and sym not in pending_now
+    }
+
+    if not open_pos:
+        logger.info("Intraday MR realloc: no eligible open positions — router budget stays idle")
+        bot.intraday_mr_realloc_done = True
+        bot._save_state()
+        return
+
+    # ── Account / buying-power fetch ────────────────────────────────────────
+    # Temporary failure → leave latch False so next tick retries.
+    try:
+        account      = bot.position_mgr.get_account()
+        equity       = float(account.get("equity")       or 0)
+        buying_power = float(account.get("buying_power") or 0)
+    except Exception as e:
+        logger.warning(f"Intraday MR realloc: account fetch failed, will retry: {e}")
+        return
+
+    bp_buffer       = float(getattr(config, "INTRADAY_REALLOC_BP_BUFFER",  0.98))
+    max_pct         = float(getattr(config, "INTRADAY_REALLOC_MAX_PCT",    0.50))
+    nominal_budget  = equity * max_pct
+    available_bp    = buying_power * bp_buffer
+    router_budget   = min(nominal_budget, available_bp)
+
+    if router_budget <= 0:
+        logger.warning("Intraday MR realloc: zero available buying power — skipping")
+        bot.intraday_mr_realloc_done = True
+        bot._save_state()
+        return
+
+    logger.info(
+        f"Intraday MR realloc: nominal=${nominal_budget:.0f} "
+        f"avail_bp=${available_bp:.0f} budget=${router_budget:.0f} "
+        f"positions={len(open_pos)}"
+    )
+
+    # ── Live price fetch ───────────────────────────────────────────────
+    # Temporary failure → leave latch False so next tick retries.
+    feed = getattr(config, "DATA_FEED", "iex")
+    try:
+        snaps = bot.alpaca.get_snapshots(list(open_pos.keys()), feed=feed) or {}
+    except Exception as e:
+        logger.warning(f"Intraday MR realloc: snapshot fetch failed, will retry: {e}")
+        return
+
+    live = []
+    for sym, pos in open_pos.items():
+        snap = snaps.get(sym, {})
+        px = snap.get("last_price") or snap.get("last") or snap.get("open")
+        if not px:
+            logger.warning(f"Intraday MR realloc: no price for {sym} — skipping")
+            continue
+        px    = float(px)
+        entry = float(pos.get("entry_price", px))
+        ret   = (px / entry) - 1.0 if entry > 0 else 0.0
+        live.append((sym, px, ret))
+
+    if not live:
+        logger.warning("Intraday MR realloc: no live prices — skipping")
+        bot.intraday_mr_realloc_done = True
+        bot._save_state()
+        return
+
+    # ── Equal-weight among winners (ret >= 0); fallback: equal weight all ────
+    # This is the safest untested default. Change INTRADAY_REALLOC_MODE in
+    # config once the allocation study confirms a specific formula.
+    winners = [(s, p, r) for s, p, r in live if r >= 0]
+    eligible = winners if winners else live
+    n = len(eligible)
+    weights = {sym: 1.0 / n for sym, _, _ in eligible}
+
+    logger.info(
+        f"Intraday MR realloc: {n} eligible ({len(winners)} winners / {len(live)} total)"
+    )
+    for sym, px, ret in live:
+        w = weights.get(sym, 0.0)
+        logger.info(f"  {sym}: ret={ret:.2%} px=${px:.2f} weight={w:.3f}")
+
+    # ── Concurrent add-on submissions ───────────────────────────────────
+    px_map = {sym: px for sym, px, _ in live}
+
+    def _submit_addon(sym):
+        px  = px_map[sym]
+        w   = weights[sym]
+        qty = int(router_budget * w / px)
+        if qty <= 0:
+            return (sym, None, "qty_zero", 0)
+        order, error_type = bot.position_mgr.submit_buy_order(
+            symbol=sym, qty=qty, order_type="market",
+        )
+        return (sym, order, error_type, qty)
+
+    submitted = []   # symbols where an add-on order landed
+    syms_to_submit = list(weights.keys())
+    with ThreadPoolExecutor(max_workers=len(syms_to_submit)) as pool:
+        futures = {pool.submit(_submit_addon, sym): sym for sym in syms_to_submit}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                sym_out, order, error_type, qty = future.result()
+            except Exception as e:
+                logger.error(f"Intraday MR realloc: submission error for {sym}: {e}", exc_info=True)
+                continue
+            if error_type or not order:
+                if error_type != "qty_zero":
+                    logger.error(f"Intraday MR realloc: buy rejected for {sym}: {error_type}")
+                continue
+            order_id = order.get("id")
+            # Register as add-on pending — reconciler will handle fill
+            bot.intraday_mr_pending_orders[sym] = {
+                "order_id":             order_id,
+                "qty":                  qty,
+                "cand":                 None,          # not used for add-ons
+                "is_addon":             True,
+                "original_position":    dict(positions[sym]),
+                "accounted_filled_qty": 0,
+                "cancel_requested":     False,
+            }
+            submitted.append(sym)
+            logger.info(
+                f"Intraday MR realloc add-on: {sym} x{qty} @ mkt "
+                f"weight={weights[sym]:.3f} budget=${router_budget * weights[sym]:.0f} "
+                f"order_id={order_id}"
+            )
+
+    # Latch only if at least one order landed (or no eligible symbols)
+    if submitted:
+        bot.intraday_mr_realloc_done = True
+        logger.info(f"Intraday MR realloc: {len(submitted)} add-on orders submitted — latch set")
+    else:
+        logger.warning(
+            "Intraday MR realloc: no orders submitted — leaving latch False for next tick retry"
+        )
+
+    bot._save_state()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
