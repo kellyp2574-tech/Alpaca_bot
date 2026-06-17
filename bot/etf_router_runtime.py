@@ -378,6 +378,11 @@ def make_router_decision(bot) -> None:
         bot._save_state()
         return
 
+    # Signal exists — mark fired regardless of whether execution succeeds.
+    # Callers that gate reallocation use this flag to distinguish
+    # "router had no signal" from "router signalled but order failed".
+    bot.router_signal_fired_today = True
+
     if bot._check_daily_loss_kill_switch():
         logger.critical(
             f"ETF entries BLOCKED by kill switch — {bot.kill_switch_reason}; "
@@ -420,6 +425,9 @@ def make_router_decision_1010(bot) -> None:
         logger.info("10:10 no-trade — no intraday position today")
         bot._save_state()
         return
+
+    # Signal exists at 10:10 — mark fired before execution attempt.
+    bot.router_signal_fired_today = True
 
     if bot._check_daily_loss_kill_switch():
         logger.critical(

@@ -145,7 +145,7 @@ def build_intraday_mr_finalize(bot) -> None:
 
     Completeness requirements before setting watchlist_built=True:
       - now >= 09:30:10
-      - VIX available (fetched in Stage 1)
+      - VIX available (fetched here, after 09:30:10)
       - SPY and QQQ official opens available
       - >= 50% of candidate universe has official opens
     If any requirement fails, returns without marking complete so the loop retries.
@@ -451,29 +451,93 @@ def reconcile_intraday_mr_pending_fills(bot) -> None:
                 is_addon = bool(pend.get("is_addon", False))
 
                 if is_addon:
-                    # ── Add-on fill: increment qty, compute weighted-average entry ──
-                    # The existing position dict is the source of truth for theme /
-                    # sleeve / TP / SL / exit_time — do NOT overwrite those fields.
-                    orig = pend.get("original_position", {})
-                    pos  = bot.intraday_mr_positions.get(symbol)
+                    # ── Add-on fill: weighted-average from ORIGINAL position baseline ──
+                    # Always recompute from original_position + the cumulative fill qty/avg
+                    # reported by the broker.  This is correct for any pattern:
+                    #   complete fill, multiple partials, or partial-then-cancel.
+                    # We do NOT use new_filled here because filled_avg is a CUMULATIVE
+                    # average, not the average of just the incremental shares.
+                    orig = pend.get("original_position") or {}
+                    base_qty   = int(orig.get("qty",          0))
+                    base_entry = float(orig.get("entry_price", fill_price))
+                    total_qty  = base_qty + filled_qty
+                    new_entry  = (
+                        (base_qty * base_entry + filled_qty * fill_price) / total_qty
+                    ) if total_qty > 0 else fill_price
+
+                    pos = bot.intraday_mr_positions.get(symbol)
+
                     if pos is None:
-                        # Position was closed before add-on filled; discard
-                        logger.warning(
-                            f"Intraday MR add-on fill: {symbol} position no longer exists — ignoring fill"
+                        # The position disappeared (race with exit logic or restart).
+                        # An actual broker fill cannot be ignored — create an emergency
+                        # tracked position and flatten it immediately.
+                        logger.critical(
+                            f"Intraday MR add-on fill: {symbol} has no local position "
+                            f"— creating emergency entry x{filled_qty} @ ${fill_price:.2f} "
+                            f"and flattening"
+                        )
+                        bot.intraday_mr_positions[symbol] = {
+                            "symbol":               symbol,
+                            "theme":                orig.get("theme"),
+                            "sleeve_name":          orig.get("sleeve_name", ""),
+                            "entry_price":          fill_price,
+                            "original_entry_price": fill_price,
+                            "qty":                  filled_qty,
+                            "entry_time":           orig.get("entry_time", ""),
+                            "exit_time":            orig.get("exit_time", "15:50"),
+                            "tp_pct":               orig.get("tp_pct"),
+                            "sl_pct":               orig.get("sl_pct"),
+                            "order_id":             order_id,
+                            "exit_state":           _STATE_OPEN,
+                            "exit_order_id":        None,
+                            "exit_reason":          None,
+                        }
+                        _submit_intraday_mr_exit(
+                            bot, symbol, reason="addon_emergency_flatten"
                         )
                     else:
-                        old_qty   = int(pos.get("qty", 0))
-                        old_entry = float(pos.get("entry_price", fill_price))
-                        new_qty   = old_qty + new_filled
-                        new_entry = (
-                            (old_qty * old_entry + new_filled * fill_price) / new_qty
-                        ) if new_qty > 0 else fill_price
-                        pos["qty"]          = new_qty
+                        exit_state = pos.get("exit_state")
+                        pos["qty"]          = total_qty
                         pos["entry_price"]  = new_entry
+                        # Preserve the original cost basis for audit / exit-rule comparison
+                        if "original_entry_price" not in pos:
+                            pos["original_entry_price"] = base_entry
                         logger.info(
-                            f"Intraday MR add-on fill: {symbol} +{new_filled} @ ${fill_price:.2f}  "
-                            f"total={new_qty} wavg_entry=${new_entry:.2f}"
+                            f"Intraday MR add-on fill: {symbol} addon={filled_qty} @ ${fill_price:.2f}  "
+                            f"total={total_qty} wavg_entry=${new_entry:.2f} exit_state={exit_state}"
                         )
+                        if exit_state in (_STATE_EXIT_PENDING, _STATE_CLOSED):
+                            # Add-on filled after exit process started.
+                            # The already-submitted sell may cover fewer shares than
+                            # the broker now holds.  Query broker and top-up the sell.
+                            logger.warning(
+                                f"Intraday MR add-on fill: {symbol} filled into "
+                                f"{exit_state} state — querying broker for residual shares"
+                            )
+                            try:
+                                broker_pos = bot.position_mgr.get_broker_positions() or []
+                                broker_qty = next(
+                                    (int(float(p.get("qty") or 0))
+                                     for p in broker_pos if p.get("symbol") == symbol),
+                                    0,
+                                )
+                                if broker_qty > 0:
+                                    logger.warning(
+                                        f"Intraday MR add-on residual: {symbol} broker={broker_qty} "
+                                        f"— submitting exit for residual shares"
+                                    )
+                                    # Mark OPEN momentarily so _submit_intraday_mr_exit accepts it
+                                    pos["exit_state"] = _STATE_OPEN
+                                    pos["qty"]        = broker_qty
+                                    _submit_intraday_mr_exit(
+                                        bot, symbol, reason="addon_residual_after_exit"
+                                    )
+                            except Exception as ex:
+                                logger.error(
+                                    f"Intraday MR add-on residual: broker query failed for {symbol}: {ex}"
+                                )
+                    # Update running cumulative tally for partially-filled add-on polls
+                    pend["accounted_filled_qty"] = filled_qty
                 else:
                     theme = getattr(cand, "theme", None)
 
@@ -688,10 +752,11 @@ def reallocate_router_budget_to_mr(bot) -> None:
     positions   = getattr(bot, "intraday_mr_positions", {})
     pending_now = getattr(bot, "intraday_mr_pending_orders", {})
 
-    # Eligible: open state AND no other pending buy already in flight for this symbol
+    # Eligible: OPEN only (not EXIT_FAILED — those must follow the exit retry path,
+    # not receive additional capital) AND no pending buy already in flight.
     open_pos = {
         sym: pos for sym, pos in positions.items()
-        if pos.get("exit_state") in (_STATE_OPEN, _STATE_EXIT_FAILED)
+        if pos.get("exit_state") == _STATE_OPEN
         and sym not in pending_now
     }
 
@@ -756,10 +821,19 @@ def reallocate_router_budget_to_mr(bot) -> None:
         bot._save_state()
         return
 
-    # ── Equal-weight among winners (ret >= 0); fallback: equal weight all ────
-    # This is the safest untested default. Change INTRADAY_REALLOC_MODE in
-    # config once the allocation study confirms a specific formula.
-    winners = [(s, p, r) for s, p, r in live if r >= 0]
+    # ── Weighting formula gated on INTRADAY_REALLOC_MODE ──────────────────────
+    mode = getattr(config, "INTRADAY_REALLOC_MODE", "equal_positive")
+    if mode != "equal_positive":
+        logger.error(
+            f"Intraday MR realloc: unrecognised INTRADAY_REALLOC_MODE='{mode}'. "
+            f"Only 'equal_positive' is implemented. Aborting reallocation — "
+            f"update the backtest confirmation before adding new modes."
+        )
+        bot.intraday_mr_realloc_done = True
+        bot._save_state()
+        return
+
+    winners  = [(s, p, r) for s, p, r in live if r >= 0]
     eligible = winners if winners else live
     n = len(eligible)
     weights = {sym: 1.0 / n for sym, _, _ in eligible}

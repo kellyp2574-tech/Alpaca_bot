@@ -149,6 +149,7 @@ class CombinedOvernightReboundBot:
         # Intraday sleeve
         self.intraday_etf_sleeve_filled = False
         self.router_decision_1010_made = False  # 10:10 check done flag
+        self.router_signal_fired_today = False  # True when router produced ANY qualifying signal
 
         # Morning liquidation latch — set once when broker confirms zero positions.
         # Persisted so a restart mid-session does not re-allow entries without proof.
@@ -163,6 +164,7 @@ class CombinedOvernightReboundBot:
         self.intraday_mr_universe_built = False          # Stage 1 complete
         self.intraday_mr_router_exit_checked = False
         self.intraday_mr_router_action: Optional[str] = None  # latched at 10:00
+        self.intraday_mr_realloc_done = False  # router budget realloc to MR (one-shot at 10:10)
         self.intraday_mr_universe_list: List[str] = []  # symbols from Stage 1
         self.intraday_mr_symbol_cache: Dict[str, Any] = {}  # T-1/T-2 bar cache
         self.intraday_mr_vix_open: Optional[float] = None   # actual VIX — set in Stage 1
@@ -573,6 +575,19 @@ class CombinedOvernightReboundBot:
                         and current_time >= _t_router_1000):
                     self._apply_intraday_mr_router_exit()
 
+                # 10:10 — realloc router budget to open MR positions only when the
+                # router produced NO qualifying signal at either 10:00 or 10:10.
+                # Using router_signal_fired_today (set on signal generation, not fill)
+                # avoids confusing "router signalled but execution failed" with
+                # "router had no trade opportunity today".
+                _t_router_1010 = _parse_config_time(getattr(config, "ROUTER_1010_TIME", "10:10"))
+                if (self.router_decision_1010_made
+                        and not self.router_signal_fired_today
+                        and not self.intraday_mr_realloc_done
+                        and self.intraday_mr_positions
+                        and current_time >= _t_router_1010):
+                    self._reallocate_router_budget_to_mr()
+
                 # Throughout day — TP/SL + timed exit monitoring
                 if (self.intraday_mr_positions
                         and current_time >= dt_time(9, 34)):
@@ -815,6 +830,9 @@ class CombinedOvernightReboundBot:
 
     def _flatten_all_intraday_mr_positions(self):
         return intraday_mr_runtime.flatten_all_intraday_mr_positions(self)
+
+    def _reallocate_router_budget_to_mr(self):
+        return intraday_mr_runtime.reallocate_router_budget_to_mr(self)
 
 
 def main():

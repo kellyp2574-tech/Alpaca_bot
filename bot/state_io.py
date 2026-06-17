@@ -206,6 +206,7 @@ def save_state(bot) -> None:
             # Intraday ETF sleeve state
             "intraday_etf_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
             "router_decision_1010_made": getattr(bot, "router_decision_1010_made", False),
+            "router_signal_fired_today": getattr(bot, "router_signal_fired_today", False),
             # Overnight ETF sleeve state
             "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
             "overnight_etf_position": getattr(bot, "overnight_etf_position", None),
@@ -251,6 +252,7 @@ def load_state(bot) -> None:
         # Intraday ETF sleeve state
         bot.intraday_etf_sleeve_filled = False
         bot.router_decision_1010_made = False
+        bot.router_signal_fired_today = False
         # Overnight ETF sleeve state
         bot.overnight_etf_fired = False
         bot.overnight_etf_position = None
@@ -319,6 +321,7 @@ def load_state(bot) -> None:
     # Intraday ETF sleeve state
     bot.intraday_etf_sleeve_filled = bot_state.get("intraday_etf_sleeve_filled", False)
     bot.router_decision_1010_made = bot_state.get("router_decision_1010_made", False)
+    bot.router_signal_fired_today = bot_state.get("router_signal_fired_today", False)
     # Overnight ETF sleeve state
     bot.overnight_etf_fired = bot_state.get("overnight_etf_fired", False)
     bot.overnight_etf_position = bot_state.get("overnight_etf_position", None)
