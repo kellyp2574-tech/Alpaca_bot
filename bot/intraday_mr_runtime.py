@@ -25,7 +25,7 @@ Exit states per position:
   CLOSED       — fill confirmed, done
   EXIT_FAILED  — sell rejected/cancelled; retry at next loop tick
 
-15:55 failsafe reconciles against actual broker positions —
+15:40 hard flatten reconciles against actual broker positions —
   anything still held is force-flattened regardless of local state.
 """
 
@@ -440,7 +440,7 @@ def reconcile_intraday_mr_pending_fills(bot) -> None:
     # Use the same canonical mapping as _get_router_action so the two code
     # paths cannot disagree on what counts as a short signal.
     router_action_latch = getattr(bot, "intraday_mr_router_action", None)
-    _ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks", "uvxy_crash")
+    _ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks",)
     router_is_short = (
         router_action_latch is not None
         and router_action_latch.lower() in _ROUTER_SHORT_ACTIONS
@@ -558,7 +558,7 @@ def reconcile_intraday_mr_pending_fills(bot) -> None:
                 else:
                     theme = getattr(cand, "theme", None)
 
-                    # Register / update position so 15:55 failsafe can always see it
+                    # Register / update position so the 15:40 hard flatten can always see it
                     bot.intraday_mr_positions[symbol] = {
                         "symbol":      symbol,
                         "theme":       theme,
@@ -647,7 +647,7 @@ def apply_router_exit_at_1000(bot) -> None:
 
     # Cancel pending non-A buy orders
     pending: dict = getattr(bot, "intraday_mr_pending_orders", {})
-    _ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks", "uvxy_crash")
+    _ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks",)
     is_short = router_action.lower() in _ROUTER_SHORT_ACTIONS
 
     if is_short:
@@ -686,7 +686,7 @@ def _get_router_action(bot) -> str:
 
     Maps live RouterBranch values to the action labels used by
     apply_router_exit_rule / ROUTER_SHORT_ACTIONS:
-      SHORT signals  → 'sqqq_goldilocks' or 'uvxy_crash'  (trigger MR exit)
+      SHORT signals  → 'sqqq_goldilocks'                   (trigger MR exit)
       LONG  signals  → branch value as-is                  (hold MR positions)
       NO_TRADE       → 'none'
 

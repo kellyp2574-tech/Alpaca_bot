@@ -17,7 +17,7 @@ Sorting: (sleeve_rank ASC, |pm_ret| DESC) — severity ranking for tie-breaking.
 Caps: min=1, max=8 per day.
 
 Router exit rule (10:00 AM):
-  If router SHORT (sqqq_goldilocks / uvxy_crash): exit non-Theme-A positions.
+  If router SHORT (sqqq_goldilocks): exit non-Theme-A positions.
   If router LONG or NONE: hold all.
 """
 
@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 REGIME_ACTIVE    = "ACTIVE"
 REGIME_DEAD_ZONE = "DEAD_ZONE"
 
-# Router actions that trigger MR exit (validated Version D study)
-ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks", "uvxy_crash")
+# Router actions that trigger MR exit (validated Version D study).
+# The live router only emits 'sqqq_goldilocks' (via MOMENTUM_SLEEVE_ANTI).
+ROUTER_SHORT_ACTIONS = ("sqqq_goldilocks",)
 
 # Leveraged/index ETFs excluded from universe (mirrors backtest LEVERAGED_ETFS)
 LEVERAGED_ETFS = {

@@ -398,12 +398,11 @@ def make_router_decision(bot) -> None:
         bot.router_decision = decisions[0]  # primary for backwards compat
         bot.router_branch = ",".join(filled)
         bot.router_traded_today = True
-        bot.mr_blocked_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
         logger.info(
             f"Intraday sleeve filled: {filled} — "
-            f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}; MR blocked"
+            f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}"
         )
 
     bot._save_state()
@@ -444,21 +443,41 @@ def make_router_decision_1010(bot) -> None:
         bot.router_decision = decisions[0]
         bot.router_branch = ",".join(filled)
         bot.router_traded_today = True
-        bot.mr_blocked_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
         logger.info(
             f"Intraday sleeve filled (10:10): {filled} — "
-            f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}; MR blocked"
+            f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}"
         )
 
     bot._save_state()
 
 
 def _execute_all_etf_entries(bot, decisions: list) -> None:
-    """Execute all fired strategy decisions, splitting 90% equity equally."""
+    """
+    Execute all fired strategy decisions with portfolio-aware dynamic sizing.
+
+    Pre-validates execution readiness for all symbols, then splits the
+    available router budget ONLY among eligible strategies.
+
+    Router capacity = remaining equity after morning MR deployment,
+    capped by buying power buffer (not by a fixed percentage).
+    """
     n = len(decisions)
     if n == 0:
+        return
+
+    # Step 1: Reconcile any pending MR fills BEFORE sizing
+    if getattr(bot, "intraday_mr_pending_orders", {}):
+        logger.info("Reconciling pending MR orders before router sizing")
+        bot._reconcile_intraday_mr_pending_fills()
+
+    # If MR orders remain unresolved, refuse to size to prevent double allocation
+    if getattr(bot, "intraday_mr_pending_orders", {}):
+        logger.warning(
+            "MR orders remain unresolved after reconciliation; "
+            "skipping router entry to prevent double allocation"
+        )
         return
 
     try:
@@ -467,28 +486,125 @@ def _execute_all_etf_entries(bot, decisions: list) -> None:
             logger.error("Cannot fetch account for ETF sizing")
             return
         equity = float(account.get("equity", 0))
-        total_pct = float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.90))
-        per_strategy_budget = (equity * total_pct) / n
+        buying_power = float(account.get("buying_power", 0))
+
+        # Calculate actual morning MR deployment (market value of open positions)
+        morning_mr_deployed = 0.0
+        mr_positions = getattr(bot, "intraday_mr_positions", {})
+        for pos in mr_positions.values():
+            if pos.get("exit_state") == "OPEN":
+                qty = int(pos.get("qty", 0))
+                entry_price = float(pos.get("entry_price", 0))
+                morning_mr_deployed += qty * entry_price
+
+        # Router uses remaining capacity (equity not deployed by morning MR)
+        remaining_capacity = max(0.0, equity - morning_mr_deployed)
+
+        # Apply buying power buffer (default 98% to leave room for price movement)
+        bp_buffer = float(getattr(config, "ETF_ENTRY_BP_BUFFER_PCT", 0.98))
+        bp_limited = buying_power * bp_buffer
+
+        # Final router budget is the most restrictive of: remaining capacity, buying power
+        router_budget = min(remaining_capacity, bp_limited)
+        router_budget = max(0.0, router_budget)
+
         logger.info(
-            f"ETF multi-entry: {n} strategies, equity=${equity:.0f}, "
-            f"total_pct={total_pct:.0%}, per_strategy=${per_strategy_budget:.0f}"
+            f"ETF router sizing: equity=${equity:.0f}, "
+            f"morning_mr_deployed=${morning_mr_deployed:.0f}, "
+            f"remaining_capacity=${remaining_capacity:.0f}, "
+            f"buying_power=${buying_power:.0f}, "
+            f"router_budget=${router_budget:.0f}"
         )
+
+        if router_budget <= 0:
+            logger.warning("ETF router: zero budget after morning MR deployment — skipping entries")
+            return
+
     except Exception as e:
         logger.error(f"ETF multi-entry: account fetch failed: {e}", exc_info=True)
         return
 
+    # Pre-validation: check which symbols are execution-ready before sizing
+    symbols = [d.symbol for d in decisions]
+    try:
+        snapshots = bot.alpaca.get_snapshots(symbols) or {}
+    except Exception as e:
+        logger.error(f"ETF multi-entry: snapshot fetch failed: {e}")
+        return
+
+    # Deduplicate by symbol (multiple strategies may use same underlying)
+    decision_by_symbol: dict = {}
     for decision in decisions:
-        execute_etf_entry(bot, decision, budget_override=per_strategy_budget)
+        if decision.symbol not in decision_by_symbol:
+            decision_by_symbol[decision.symbol] = decision
+        else:
+            logger.info(f"Duplicate symbol {decision.symbol} - using first decision ({decision.branch.value})")
+
+    # Pre-validate execution readiness
+    eligible_decisions = []
+    rejected = {}
+    validated_snapshots = {}
+
+    for symbol, decision in decision_by_symbol.items():
+        snap = snapshots.get(symbol, {}) or {}
+
+        orderable, exec_rejected = filter_execution_ready(
+            [symbol], {symbol: snap},
+            max_spread_pct=float(getattr(config, "ETF_ENTRY_MAX_SPREAD_PCT", 0.005)),
+            require_quote=True,
+            max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 60.0)),
+        )
+        if symbol in orderable:
+            eligible_decisions.append(decision)
+            validated_snapshots[symbol] = snap  # Store for use in execution
+        else:
+            reason = exec_rejected.get(symbol, "unknown")
+            rejected[symbol] = reason
+            logger.warning(f"ETF entry REJECTED for {symbol}: {reason}")
+
+    if not eligible_decisions:
+        logger.warning(f"ETF multi-entry: all {len(decision_by_symbol)} symbols rejected execution gate — no entries")
+        return
+
+    if rejected:
+        logger.info(f"ETF pre-validation: {len(eligible_decisions)}/{len(decision_by_symbol)} symbols eligible, {len(rejected)} rejected")
+
+    # Split router budget ONLY among eligible strategies
+    n_eligible = len(eligible_decisions)
+    per_strategy_budget = router_budget / n_eligible
+
+    logger.info(
+        f"ETF multi-entry: {n_eligible} eligible symbols, "
+        f"per_strategy_budget=${per_strategy_budget:.0f}"
+    )
+
+    # Submit each eligible entry once (pass validated snapshot to avoid double-fetch)
+    for decision in eligible_decisions:
+        execute_etf_entry(
+            bot, decision,
+            budget_override=per_strategy_budget,
+            pre_validated_snapshot=validated_snapshots.get(decision.symbol)
+        )
 
 
-def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[float] = None) -> None:
-    """Execute one ETF entry. Writes fill into bot.etf_positions[branch_value].
+def execute_etf_entry(
+    bot,
+    decision: RouterDecision,
+    budget_override: Optional[float] = None,
+    pre_validated_snapshot: Optional[dict] = None,
+) -> bool:
+    """
+    Execute one ETF entry. Writes fill into bot.etf_positions[branch_key].
 
-    budget_override: pre-calculated per-strategy budget (equity * 90% / N).
+    budget_override: pre-calculated per-strategy budget (equity * remaining_pct / N).
+    pre_validated_snapshot: optional pre-fetched and validated snapshot to avoid double API call.
     If None, uses the full INTRADAY_ETF_ALLOCATION_PCT (single-strategy path).
+
+    Returns:
+        True if position was successfully opened (fill confirmed), False otherwise.
     """
     if not decision.symbol:
-        return
+        return False
 
     symbol = decision.symbol
     branch_key = decision.branch.value
@@ -502,27 +618,29 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
             account = bot.position_mgr.get_account()
             if not account:
                 logger.error("Cannot fetch account for ETF sizing")
-                return
+                return False
             equity = float(account.get("equity", 0))
-            etf_budget = equity * float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.90))
+            etf_budget = equity * float(getattr(config, "INTRADAY_ETF_ALLOCATION_PCT", 0.50))
 
-        # Fresh snapshot for sizing AND for the execution gate.
-        snapshots = bot.alpaca.get_snapshots([symbol]) or {}
-        snap = snapshots.get(symbol, {}) or {}
+        # Use pre-validated snapshot if provided, otherwise fetch fresh
+        if pre_validated_snapshot is not None:
+            snap = pre_validated_snapshot
+            logger.info(f"Using pre-validated snapshot for {symbol}")
+        else:
+            snapshots = bot.alpaca.get_snapshots([symbol]) or {}
+            snap = snapshots.get(symbol, {}) or {}
 
-        # Execution gate (issue #4): tight spread, fresh quote, require quote.
-        # ETF_ENTRY_MAX_STALE_SECONDS is 60s for router ETFs (IEX latency is normal).
-        # A quote age between ETF_ENTRY_WARN_STALE_SECONDS and the max is a warning, not a rejection.
-        orderable, exec_rejected = filter_execution_ready(
-            [symbol], snapshots,
-            max_spread_pct=float(getattr(config, "ETF_ENTRY_MAX_SPREAD_PCT", 0.005)),
-            require_quote=True,
-            max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 60.0)),
-        )
-        if symbol not in orderable:
-            reason = exec_rejected.get(symbol, "unknown")
-            logger.warning(f"ETF entry REJECTED for {symbol}: {reason}")
-            return
+            # Execution gate: tight spread, fresh quote, require quote.
+            orderable, exec_rejected = filter_execution_ready(
+                [symbol], {symbol: snap},
+                max_spread_pct=float(getattr(config, "ETF_ENTRY_MAX_SPREAD_PCT", 0.005)),
+                require_quote=True,
+                max_stale_seconds=float(getattr(config, "ETF_ENTRY_MAX_STALE_SECONDS", 60.0)),
+            )
+            if symbol not in orderable:
+                reason = exec_rejected.get(symbol, "unknown")
+                logger.warning(f"ETF entry REJECTED for {symbol}: {reason}")
+                return False
 
         # Warn if quote is somewhat stale but still within the acceptance window
         warn_stale = float(getattr(config, "ETF_ENTRY_WARN_STALE_SECONDS", 30.0))
@@ -548,7 +666,7 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
         last_price = snap.get("last_price")
         if not last_price:
             logger.error(f"ETF entry {symbol}: no last_price after gate (should not happen)")
-            return
+            return False
 
         # Size off ask (where we'd actually fill) if available, else last.
         sizing_price = float(ask) if ask else float(last_price)
@@ -559,7 +677,7 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
                 f"ETF qty <= 0, skipping entry: budget=${etf_budget:.2f}, "
                 f"sizing_price=${sizing_price:.2f}"
             )
-            return
+            return False
 
         # Marketable limit (issue #6): bound slippage above the ask.
         slippage_pct = float(getattr(config, "ETF_ENTRY_MAX_SLIPPAGE_PCT", 0.005))
@@ -605,34 +723,56 @@ def execute_etf_entry(bot, decision: RouterDecision, budget_override: Optional[f
                 fill_price = float(fill.get("filled_avg_price", price))
                 if not hasattr(bot, "etf_positions") or bot.etf_positions is None:
                     bot.etf_positions = {}
-                bot.etf_positions[branch_key] = {
-                    "symbol": symbol,
-                    "qty": filled_qty,
-                    "entry_price": fill_price,
-                    "entry_time": datetime.now(_ET).isoformat(),
-                    "branch": branch_key,
-                    "exit_time": exit_time_str,           # from config (e.g. "15:00")
-                    "sl_arm_time": sl_arm_time_str,       # when to check green/flat (e.g. "13:00")
-                    "afternoon_gate_checked": False,      # True after green/flat decision made
-                    "blocks_overnight": blocks_overnight, # for audit/debug (day-level flag is what matters)
-                    "order_id": order.get("id"),          # entry order ID
-                }
+
+                # Aggregate with existing position if adding to same branch
+                existing = bot.etf_positions.get(branch_key)
+                if existing:
+                    old_qty = int(existing["qty"])
+                    old_price = float(existing["entry_price"])
+                    total_qty = old_qty + filled_qty
+                    weighted_price = (old_qty * old_price + filled_qty * fill_price) / total_qty
+                    existing["qty"] = total_qty
+                    existing["entry_price"] = weighted_price
+                    existing["last_add_time"] = datetime.now(_ET).isoformat()
+                    # Keep original entry time and order_id from first purchase
+                    logger.info(
+                        f"ETF position ADDED: {branch_key} {symbol} +{filled_qty}sh @ ${fill_price:.2f} "
+                        f"(total {total_qty}sh @ wavg ${weighted_price:.2f})"
+                    )
+                else:
+                    bot.etf_positions[branch_key] = {
+                        "symbol": symbol,
+                        "qty": filled_qty,
+                        "entry_price": fill_price,
+                        "entry_time": datetime.now(_ET).isoformat(),
+                        "branch": branch_key,
+                        "exit_time": exit_time_str,           # from config (e.g. "15:00")
+                        "sl_arm_time": sl_arm_time_str,       # when to check green/flat (e.g. "13:00")
+                        "afternoon_gate_checked": False,      # True after green/flat decision made
+                        "blocks_overnight": blocks_overnight, # for audit/debug (day-level flag is what matters)
+                        "order_id": order.get("id"),          # entry order ID
+                    }
+                    block_str = "BLOCKS_ON" if blocks_overnight else "allows_overnight"
+                    logger.info(
+                        f"ETF position opened: {branch_key} {symbol} {filled_qty}sh @ ${fill_price:.2f} "
+                        f"GATE@{sl_arm_time_str} EXIT={exit_time_str} [{block_str}]"
+                    )
+
                 # Persistent day-level flag: blocking positions prevent overnight ETF even after exit
                 if blocks_overnight:
                     bot.overnight_etf_blocked_today = True
-                block_str = "BLOCKS_ON" if blocks_overnight else "allows_overnight"
-                logger.info(
-                    f"ETF position opened: {branch_key} {symbol} {filled_qty}sh @ ${fill_price:.2f} "
-                    f"GATE@{sl_arm_time_str} EXIT={exit_time_str} [{block_str}]"
-                )
+                return True
             else:
                 logger.warning(f"ETF entry not filled for {symbol} ({branch_key}); canceling and leaving flat")
                 bot.position_mgr._cancel_order(order["id"])
+                return False
         else:
             logger.error(f"Failed to submit ETF buy order for {symbol} ({branch_key}): {error_type}")
+            return False
 
     except Exception as e:
         logger.error(f"Error executing ETF entry {branch_key}: {e}", exc_info=True)
+        return False
 
 
 # ────────────────────────────────────────────────────────────────────

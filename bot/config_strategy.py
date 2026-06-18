@@ -8,20 +8,21 @@ Intraday ETF sleeve (priority 1, one trade per day):
     4. Router Long         — QQQ-SPY 40min spread >= +0.2%              → BUY TQQQ at 10:10, exit 15:00 (TP+3%, SL-1%)
     5. SVIX Long           — SVIX 40min >= +0.2%                        → BUY SVIX at 10:10, exit 15:00 (TP+3%, no SL)
 
-Overnight ETF sleeve (priority 2, only if NO intraday trade today):
-    Checked at 15:45 in order:
-    A. VXX Mean Reversion  — VXX day return >= +2.5%                    → BUY SVIX overnight, sell 09:30
-    B. Overnight Quality   — SPY day > +0.5% OR VXX day < -2.0%,
-                             AND VXX day < +2.0%                        → BUY TQQQ overnight, sell 09:30
-    C. Gap Bounce          — QQQ day < -0.5%, morning down, VXX down    → BUY TQQQ overnight, sell 09:30
+Overnight sleeve (at 15:45 — runs every day, independent of intraday trades):
+    - Single-stock MR ALWAYS runs (top 3 candidates).
+    - Conditional TQQQ is added ON TOP when favorable (see
+      overnight_etf_runner_conditional.py). It does NOT block MR; instead MR
+      capacity is reduced so combined exposure stays within
+      OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT (default 90%).
+    Conditional TQQQ fires when both MR and TQQQ signals are positive, OR when the
+    TQQQ expected return exceeds TQQQ_STRONG_RETURN_THRESHOLD.
 
-Overnight single-stock MR sleeve (priority 3, fallback):
-    Only runs at 15:45 if NO intraday trade AND no overnight ETF trade fired.
+Overnight single-stock MR sleeve:
     Filters: entry price $1-$2, return <= -4%, close-location <= 0.25, ADV >= $1M
     Max 3 positions, 30% equity each.
 
 Live constants (single source of truth):
-    INTRADAY_ETF_ALLOCATION_PCT  = 0.50    # 50% of equity for the intraday ETF sleeve (50/50 split with MR)
+    INTRADAY_ETF_ALLOCATION_PCT  = 1.00    # Max router allocation = up to 100% of equity minus morning-MR deployment
     MR_ALLOC_PER_POSITION_PCT    = 0.30    # 30% of equity per MR position
     MR_MAX_PRIMARY_POSITIONS     = 3       # Top 3 MR candidates only
     MR_MAX_TOTAL_ALLOCATION_PCT  = 0.90    # Max 90% of equity in the MR sleeve
@@ -49,15 +50,38 @@ MR_OVERNIGHT_ENABLED = True    # Single-stock MR fallback
 # ═══════════════════════════════════════════════════
 # Capital allocation — LIVE CONSTANTS
 # ═══════════════════════════════════════════════════
-# 50% of equity for intraday ETF sleeve.
-# Combined with INTRADAY_MR_BUDGET_PCT=0.50, max overlap-day exposure = 100% equity.
-INTRADAY_ETF_ALLOCATION_PCT = 0.50
+# ═══════════════════════════════════════════════════
+# Intraday ETF Router Dynamic Allocation (10:00/10:10 AM)
+# ═══════════════════════════════════════════════════
+# Router uses remaining capacity after morning MR deployment, capped by buying power.
+# INTRADAY_ETF_ALLOCATION_PCT now serves as the MAXIMUM router allocation when
+# morning MR has deployed nothing (i.e., router can use up to 100% of equity).
+# When morning MR has deployed capital, router uses remaining equity - deployed.
+INTRADAY_ETF_ALLOCATION_PCT = 1.00   # Maximum 100% of equity (was 0.50)
 
-# MR sleeve sizing
+# Buying power buffer for ETF entries (default 98% to leave room for price movement)
+ETF_ENTRY_BP_BUFFER_PCT = 0.98
+
+# Maximum spread and staleness for ETF execution gate
+ETF_ENTRY_MAX_SPREAD_PCT = 0.005     # 0.5% max spread
+ETF_ENTRY_MAX_STALE_SECONDS = 60.0  # 60s max quote age (IEX latency tolerance)
+ETF_ENTRY_WARN_STALE_SECONDS = 30.0  # Warn if quote >30s old
+
+# ═══════════════════════════════════════════════════
+# Overnight Single-Stock MR Sizing (15:45 entry)
+# ═══════════════════════════════════════════════════
+# Base allocation when no conditional TQQQ fired: 90% of equity
+# When conditional TQQQ fired: reduced to 60% (TQQQ takes 30%, combined 90%)
+# Override is computed at runtime based on actual TQQQ deployment.
 MR_ALLOC_PER_POSITION_PCT = 0.30   # 30% of equity per MR position
 MR_MAX_PRIMARY_POSITIONS = 3       # Top 3 MR candidates only
-MR_MAX_TOTAL_ALLOCATION_PCT = 0.90 # Max 90% of equity across the MR sleeve
+MR_MAX_TOTAL_ALLOCATION_PCT = 0.90 # Max 90% of equity when TQQQ not fired
 MR_ADV_CAP_PCT = 0.003             # 0.3% of 20-day ADV per symbol
+
+# Conditional TQQQ allocation (overnight, 15:45)
+# When TQQQ fires, MR cap is reduced to leave room for TQQQ position
+TQQQ_CONDITIONAL_ALLOCATION_PCT = 0.30  # 30% when TQQQ signal is positive
+OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT = 0.90  # Max 90% combined MR+TQQQ
 
 # ═══════════════════════════════════════════════════
 # Intraday ETF Router Configuration (9:30-10:10 AM)
@@ -144,27 +168,8 @@ ETF_ENTRY_MAX_STALE_SECONDS = 60.0
 ETF_ENTRY_WARN_STALE_SECONDS = 30.0
 
 # ═══════════════════════════════════════════════════
-# Overnight ETF Strategies (A/B/C — at 15:45 if no intraday trade)
+# Overnight ETF positions are sold at 09:30 AM the next day
 # ═══════════════════════════════════════════════════
-# These are checked at 15:45 in priority order (A > B > C).
-# If any fires, the single-stock MR sleeve does NOT run that day.
-
-# ── Strategy A: VXX Mean Reversion → BUY SVIX ──
-OVERNIGHT_VXX_MR_TRIGGER_PCT = 2.5      # VXX day return >= +2.5%
-OVERNIGHT_VXX_MR_VEHICLE = "SVIX"
-
-# ── Strategy B: Overnight Quality → BUY TQQQ ──
-OVERNIGHT_QUALITY_SPY_MIN_PCT = 0.5     # SPY day return > +0.5%  (OR condition)
-OVERNIGHT_QUALITY_VXX_COLLAPSE_PCT = -2.0  # VXX day return < -2.0%  (OR condition)
-OVERNIGHT_QUALITY_VXX_EXCLUSION_PCT = 2.0  # VXX day return must be < +2.0% (AND exclusion)
-OVERNIGHT_QUALITY_VEHICLE = "TQQQ"
-
-# ── Strategy C: Gap Bounce → BUY TQQQ ──
-OVERNIGHT_GAP_BOUNCE_QQQ_MAX_PCT = -0.5    # QQQ day return < -0.5% (down day)
-# Also requires: QQQ 9:30-10:00 return < 0% AND VXX day return < 0%
-OVERNIGHT_GAP_BOUNCE_VEHICLE = "TQQQ"
-
-# All overnight ETF positions are sold at 09:30 AM the next day
 OVERNIGHT_ETF_EXIT_TIME = "09:30"
 
 # ═══════════════════════════════════════════════════
@@ -230,6 +235,11 @@ MR_FREE_ALPACA_BATCH_SIZE = 200
 MR_FREE_ALPACA_BATCH_SLEEP_SECONDS = 0.25
 
 # ═══════════════════════════════════════════════════
+# MR allocation sizing (60% base for individual MR)
+# ═══════════════════════════════════════════════════
+MR_MAX_TOTAL_ALLOCATION_PCT = 0.60    # 60% base allocation for individual MR
+MR_ALLOC_PER_POSITION_PCT = 0.30      # 30% max per position (2 positions max)
+
 # MR regime sizing
 # ═══════════════════════════════════════════════════
 ENABLE_MR_ETF_REGIME_SIZING = True
@@ -297,6 +307,18 @@ INTRADAY_MR_HARD_FLATTEN_TIME = "15:40"
 # Combined max = 100% equity (no double-spend).
 # On non-router days: at 10:10 the router bucket is reallocated to open MR
 # positions as add-on buys (see INTRADAY_REALLOC_* settings below).
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Conditional TQQQ Overnight Strategy ─────────────────────────────────────
+# Replaces A/B/C priority system with conditional approach
+# Individual MR always runs (60% base), TQQQ added conditionally (30% max)
+
+INDIVIDUAL_MR_SIGNAL_THRESHOLD = 0.5      # Minimum average score for individual MR signal
+INDIVIDUAL_MR_MIN_CANDIDATES = 1          # Minimum candidates for positive signal
+
+TQQQ_VIX_LOW_THRESHOLD = 15.0            # VIX below this = trending (good for TQQQ)
+TQQQ_VIX_HIGH_THRESHOLD = 25.0           # VIX above this = risk-off (bad for TQQQ)
+TQQQ_STRONG_RETURN_THRESHOLD = 0.015     # >1.5% expected return triggers TQQQ regardless
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Router-budget reallocation to MR (10:10 add-on) ─────────────────────────

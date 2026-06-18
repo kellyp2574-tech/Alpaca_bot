@@ -1,266 +1,153 @@
-# Combined MR + Router Strategy
+# Combined Bot Strategy
 
-**Status:** Live (paper)  
-**Strategy:** Combined overnight Mean Reversion + intraday ETF Router  
-**MR Allocation:** ADV-capped, up to 33% of capital per position  
-**Liquidity cap per name:** 0.3% of 20-day ADV (`ADV_CAP_PCT`)
+**Status:** Live (paper)
+**Architecture:** 3 sleeves orchestrated by `integrated_main.py`, ground truth lives in `config_strategy.py`.
+
+| Sleeve | Window | Holding |
+|---|---|---|
+| Intraday ETF Router | one trade/day at 10:00 or 10:10 | same day, flat by 15:30 |
+| Intraday MR (morning momentum) | entries 09:32–10:00 | same day, flat by 15:40 |
+| Overnight (single-stock MR + conditional TQQQ) | entry 15:45 | overnight, sold 09:30 next day |
 
 ---
 
-## Strategy 1 — MR (Mean Reversion, Overnight Hold)
+## Sleeve 1 — Intraday ETF Router (one trade per day)
 
-### Overview
-- **Entry Time:** 15:45 ET (overnight hold)
-- **Exit Time:** Next day 09:30 ET
-- **Position Limit:** Top 3 candidates per day
+Tape of `QQQ, SPY, VXX, SVIX, TQQQ, SQQQ` is recorded 09:30–10:10. Strategies are
+checked in order; the first to fire takes the only trade of the day. A fill blocks
+the rest of the intraday ETF sleeve (it does **not** block the overnight sleeves).
 
-### Stock Filtering Criteria
+Checked at **10:00** (30-minute returns):
+
+| # | Strategy | Trigger | Vehicle | Exit | SL / TP |
+|---|---|---|---|---|---|
+| 1 | VXX Spike Recovery | VXX ≥ +2.5% AND QQQ 09:30–10:00 range 0.3–0.8% | TQQQ | 15:30 | none |
+| 2 | VXX Collapse | VXX ≤ −2.0% AND QQQ ≥ −1.0% | TQQQ | 15:30 | SL −1.0% (arm 13:00) |
+| 3 | Momentum Sleeve | QQQ ≥ +0.5% | TQQQ (NORMAL) / SQQQ (HIGH_RISK) | 15:00 | SL −0.5% (arm 13:00), TP +2% |
+
+Checked at **10:10** (40-minute returns, only if no 10:00 trade):
+
+| # | Strategy | Trigger | Vehicle | Exit | SL / TP |
+|---|---|---|---|---|---|
+| 4 | Router Long | QQQ−SPY spread ≥ +0.2% | TQQQ | 15:30 | SL −0.5% (arm 13:30), TP +3% |
+| 5 | SVIX Long | SVIX ≥ +0.2% | SVIX | 15:00 | no SL, TP +3% |
+
+**HIGH_RISK regime** (used by Momentum): VXX 30-min return ≥ +2.0% OR VXX price ≥ $400.
+In HIGH_RISK, Momentum flips to the anti-vehicle (`SQQQ`, branch `MOMENTUM_SLEEVE_ANTI`).
+
+**Sizing:** up to `INTRADAY_ETF_ALLOCATION_PCT` (1.00 = 100% of equity) minus whatever
+the morning MR sleeve has already deployed, capped by buying power and an entry buffer.
+
+Per-strategy SL/TP and exit times are the table `ETF_SL_TP` in `config_strategy.py`
+(the operative source for `check_etf_exits`).
+
+---
+
+## Sleeve 2 — Intraday MR (Morning Momentum)
+
+Gap-reversal longs entered in the morning, flat the same day.
+
+- **Active day** when `VIX ≥ 15` OR (`|SPY gap| > 1%` AND `|QQQ gap| > 1%`).
+- **Universe:** price $2–$100, prev-day dollar volume ≥ $1M.
+- **Candidates:** 1–8 per day, classified into themes by `intraday_mr_classifier.py`.
+- **Budget:** 50% of equity (`INTRADAY_MR_BUDGET_PCT`) split across candidates.
+- **Timing:** Stage 1 universe + bar cache at 09:00; Stage 2 (opens, VIX, finalize) at
+  09:30; entries 09:32 until the 10:00 cutoff; hard flatten at **15:40**.
+- **10:00 router-exit rule:** if the ETF router is SHORT (`sqqq_goldilocks`, i.e.
+  `MOMENTUM_SLEEVE_ANTI`), exit all non-Theme-A positions.
+- **10:10 reallocation:** if the router produced no qualifying signal, the unused
+  router budget is redistributed to open MR winners (`INTRADAY_REALLOC_*`).
+
+---
+
+## Sleeve 3 — Overnight (15:45)
+
+Runs every day, independent of intraday trades.
+
+### Single-stock MR (always runs)
 
 | Filter | Value | Config |
 |---|---:|---|
 | Price | $1.00 – $2.00 | `MR_MIN_PRICE` / `MR_MAX_PRICE` |
 | Day return vs prior close | ≤ −4.0% | `MR_DAY_RET_MAX` |
-| Close position in day range | ≤ 0.25 (bottom 25%) | `MR_CLOSE_POSITION_MAX` |
-| 20D average dollar volume | ≥ $1,000,000 | `MR_MIN_AVG_DOLLAR_VOLUME` |
-| Max slots | 3 | `MR_MAX_POSITIONS` |
+| Close position in day range | ≤ 0.25 | `MR_CLOSE_POSITION_MAX` |
+| 20D avg dollar volume | ≥ $1,000,000 | `MR_MIN_AVG_DOLLAR_VOLUME` |
+| Max positions | 3 | `MR_MAX_PRIMARY_POSITIONS` |
+| Per-position size | 30% of equity | `MR_ALLOC_PER_POSITION_PCT` |
+| Sleeve cap | 90% of equity | `MR_MAX_TOTAL_ALLOCATION_PCT` |
+| Per-name ADV cap | 0.3% of 20D ADV | `MR_ADV_CAP_PCT` |
 
-### Candidate Selection
-- Apply all filters → rank by lowest `close_position` first
-- Top 3 candidates selected for entry
+Ranked by lowest `close_position` first. **Regime sizing:** average of SPY/IWM/QQQ
+intraday move — if ≥ 0 the sleeve is sized at 0.5×, else 1.0×.
 
-### Position Sizing
-```python
-max_shares_adv = int(adv_20d * 0.3 / 100)    # ADV constraint
-max_shares_capital = int(available_capital * 0.33 / entry_price)  # Capital constraint
-shares = min(max_shares_adv, max_shares_capital)
-```
+### Conditional TQQQ (added on top when favorable)
 
-### Regime Sizing
-The bot checks SPY, IWM, and QQQ before entry and sizes the MR sleeve
-based on the average ETF move versus open:
+Implemented in `overnight_etf_runner_conditional.py`. TQQQ is added **on top of** MR
+(it does not block MR). MR capacity is reduced so combined exposure stays within
+`OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT` (90%).
 
-| Market regime before 15:45 | Size multiplier |
-|---|---:|
-| 3-ETF average < 0 | 1.0× |
-| 3-ETF average ≥ 0 | 0.5× |
-
-### Return Calculation
-```python
-gross_return = (exit_price / entry_price - 1) * 100
-net_return = gross_return - 0.50  # 50 bps round-trip cost
-pnl = position_value * net_return / 100
-```
-
----
-
-## Strategy 2 — ETF Router (Intraday, Same-Day Entry/Exit)
-
-### Overview
-Pure intraday decision tree. One trade per day, routed to a leveraged ETF
-based on market conditions at ~10:00 ET.
-
-### Decision Tree Priority
-
-#### 1. A++ Long (TQQQ, exit 15:00)
-| Condition | Threshold |
-|---|---|
-| QQQ | > +10 bps |
-| XLK green, SPY green, IWM green, VXX red | all required |
-| QQQ near high | ≥ 80% of daily range |
-| QQQ continues up 09:45 → 10:00 | required |
-
-#### 2. A Long (TQQQ, exit 15:00)
-| Condition | Threshold |
-|---|---|
-| QQQ | > +10 bps |
-| XLK green, VXX red, IWM green | all required |
-| QQQ continues up OR QQQ ≥ 50% of range | either |
-| SPY | > −5 bps |
-
-#### 3. A− Long (TQQQ, exit 15:00)
-| Condition | Threshold |
-|---|---|
-| QQQ | > +10 bps |
-| XLK green, VXX red | required |
-| IWM | > −10 bps |
-| SPY | > −5 bps |
-
-#### 4. A− Weak (TQQQ, exit 15:00)
-| Condition | Threshold |
-|---|---|
-| QQQ | +5 to +10 bps |
-| XLK green, VXX red, IWM green | all required |
-| SPY | > −5 bps |
-
-#### 5. Goldilocks (SQQQ, exit 14:00)
-| Condition | Threshold |
-|---|---|
-| SQQQ | green |
-| QQQ | −30 to −60 bps |
-| SQQQ | +100 to +150 bps |
-| QQQ floor | not below −80 bps |
-| SQQQ ceiling | not above +250 bps |
-
-#### 6. UVXY Crash (UVXY, exit 11:00)
-| Condition | Threshold |
-|---|---|
-| QQQ | < −60 bps |
-| VXX green, near high (≥ 80%) | required |
-| UVXY green, near high (≥ 80%) | required |
-| UVXY cap | < +500 bps |
-
-#### 7. No Trade
-If none of the above conditions are met.
-
-### Router Position Sizing
-```python
-router_capital = portfolio_value * ROUTER_ALLOCATION_PCT
-shares = int(router_capital / entry_price)
-```
-
-### Return Calculation
-```python
-net_return = row["net_ret"]  # Already net of 5 bps cost
-pnl = position_value * net_return
-```
-
----
-
-## Combined Strategy Logic
-
-### Non-Overlap Principle
-- **MR:** Overnight holds (15:45 → next day 09:30)
-- **Router:** Pure intraday (same-day entry/exit, 10:00 → exit time)
-- **Capital:** Both sleeves can use available capital since their holding
-  periods do not overlap
-
-### Daily Execution Flow
-```
-for each trading day:
-    # 1. Router intraday (10:00 decision)
-    router_signal = evaluate_router_decision_tree(market_data)
-    if router_signal != "none":
-        execute_router_trade(router_signal)
-
-    # 2. MR overnight entry (15:45)
-    mr_candidates = filter_mr_candidates(mr_data)
-    mr_selected = select_top_3_by_close_location(mr_candidates)
-    execute_mr_trades(mr_selected)
-```
+TQQQ fires when **both** the MR signal and the TQQQ signal are positive, **or** when
+the TQQQ expected return exceeds `TQQQ_STRONG_RETURN_THRESHOLD` (1.5%). Allocation is
+`TQQQ_CONDITIONAL_ALLOCATION_PCT` (30%). The TQQQ signal blends VIX regime, QQQ/VXX/SPY
+day returns. All overnight positions are sold at 09:30 the next morning.
 
 ---
 
 ## Daily Schedule (ET)
 
 ```
-T-1 entry day:
-  09:00  Bot starts, reconciles broker positions
-  10:00  ETF Router decision + entry (if signal fires)
-  11:00–15:00  Router exit at configured time (depends on tier)
-  15:30  Build MR universe (asset → price → ADV → tradability)
-  15:45  Score MR candidates, apply ETF regime sizing
-  15:45  Submit up to 3 market buys (BP-aware, ADV-capped)
-  16:00  Save EOD reports, hold MR positions overnight
+T-1 (entry) / T+1 (exit) are the same calendar run:
 
-T+1 exit day:
-  05:00  Bot starts, reconciles broker positions, restores state
-  05:00–06:00  Premarket "decisive" classification at 15-min checkpoints
-               (each HH:MM runs once, dedup'd)
+  09:00  Start, load state, detect overnight positions from broker
+  09:00  Intraday MR Stage 1 (universe + T-1/T-2 bar cache)
   09:25  Cancel all open orders; freeze broker-position exit plan
-  09:30  Submit batched market sells for all remaining broker positions
+  09:30  Submit batched market sells for remaining overnight positions
+  09:30  Begin ETF tape recording; Intraday MR Stage 2 (opens, VIX, finalize)
   09:31  Broker-native rescue pass for any remaining positions
-  09:45  V2 failsafe: force-flatten any stragglers with multi-layer retry
-         (market → limit −3% → limit −5% half-then-rest)
-  16:00  Day complete; restart cycle
+  09:32  Intraday MR entries begin (until 10:00 cutoff)
+  09:45  Post-exit failsafe — verify flat or force-flatten stragglers
+  10:00  ETF router strategies 1–3; intraday MR router-exit rule
+  10:10  ETF router strategies 4–5; intraday MR budget reallocation
+  15:00  Intraday ETF exit for strategies 3 & 5
+  15:30  Intraday ETF hard flatten for strategies 1, 2 & 4
+  15:40  Intraday MR hard flatten
+  15:45  Score single-stock MR; conditional TQQQ; enter MR positions
+  16:00  Save EOD reports, hold overnight positions, done
 ```
 
-Adaptive main-loop sleep: 1s during hot windows (05:00–06:02, 09:24–10:05,
-15:29–16:01), 30s otherwise.
+Adaptive main-loop sleep: 1s during hot windows (see `_HOT_WINDOWS_HHMM` in
+`integrated_main.py`), 30s otherwise.
+
+---
+
+## Morning Exit Failsafe Layers
+
+1. **09:25 cancel-all** — every open order canceled before exit logic.
+2. **09:30 batched market sells** — frozen 09:25 broker snapshot.
+3. **09:31 broker-native rescue** — direct broker fetch + market sell of any remainder.
+4. **09:45 failsafe flatten** — force-flatten any stragglers.
+5. **Trust broker > local** — broker API errors are treated as "unknown" (None), never
+   "flat", so local state is preserved on transient glitches.
+
+`morning_liquidation_confirmed` is a one-way latch set only once the broker confirms
+zero positions; entries stay blocked until it flips.
 
 ---
 
 ## Daily Artifacts (`state/logs/`)
 
-- `universe_YYYY-MM-DD.json` — full universe pipeline counts and rejection reasons
+- `universe_YYYY-MM-DD.json` — universe pipeline counts + rejection reasons
 - `candidates_YYYY-MM-DD.json` — top scored MR candidates
 - `execution_YYYY-MM-DD.json` — selection → submit → fill funnel
 - `run_health_YYYY-MM-DD.json` — single-glance daily health report
 
 ---
 
-## Failsafe Layers
+## Config Files
 
-1. **09:25 cancel-all** — every open order is canceled before exit logic.
-2. **Batched open market exit** — 09:30 batch sells of frozen 09:25 positions.
-3. **09:31 broker-native rescue** — direct broker position fetch and market sell.
-4. **09:45 V2 failsafe** — `force_flatten_broker_positions` retries
-   market → limit −3% → limit −5% half-then-rest, falls back to broker
-   `current_price` / `lastday_price` / `avg_entry_price` if live snapshot
-   is unavailable, escalates to market sell if no reference price resolves.
-5. **Circuit breaker** — per-symbol 60s cooldown after 3 consecutive
-   sell rejections, applied via `_is_exit_blocked`.
-6. **Trust broker > local** — every exit path treats broker API errors as
-   "unknown" (None) rather than "flat", preserving local state on glitches.
+- `config_broker.py` — Alpaca/Massive credentials, endpoints, data feed
+- `config_runtime.py` — state and log paths
+- `config_universe.py` — price/ADV filters, presets, lookback periods
+- `config_strategy.py` — sleeve configs, exit rules, SL/TP table, timing
 
----
-
-## Key Config Files
-
-- `bot/config_strategy.py` — MR filters, sizing, timing, router config, failsafe modes
-- `bot/config_universe.py` — price range presets, ADV/ATR lookback
-- `bot/config_runtime.py` — state and log paths
-- `bot/config_broker.py` — Alpaca/Massive credentials, data feed
-
-All re-exported by `bot/config.py` for `from bot import config; config.X` use.
-
----
-
-*Last updated: Combined MR + Router strategy consolidation.*
-
----
-
-## Strategy 3 — No-Trade QQQ Range-Breakout Fallback
-
-### Overview
-This is an intraday-only fallback sleeve that is eligible only after the
-primary 10:00 ETF router resolves to **No Trade**. It is deliberately
-MR-permission-neutral: a fallback trade does **not** block the 15:45 overnight
-MR sleeve.
-
-### Eligibility
-- Primary ETF router branch must be `No trade`.
-- Live no-trade subtype must be in Set C:
-  - `LIVE_FLAT_CHOP`
-  - `LIVE_WEAK_GREEN`
-  - `LIVE_MILD_RISK_OFF`
-  - `LIVE_BULLISH_MESSY`
-  - `LIVE_VOL_WARNING`
-- QQQ 09:30 to strictly-before-10:00 range must be at least `0.45%` (`NO_TRADE_QQQ_BREAKOUT_RANGE_THRESHOLD`).
-
-### Entry
-- After 10:00, monitor QQQ live (poll every `NO_TRADE_QQQ_BREAKOUT_POLL_SECONDS`).
-- If QQQ breaks above the 09:30–10:00 high → buy `TQQQ`.
-- If QQQ breaks below the 09:30–10:00 low → buy `SQQQ`.
-- One attempt only. No re-entry.
-- Size: `equity × NO_TRADE_QQQ_BREAKOUT_CAPITAL_PCT` (default 50%).
-
-### Exit / Risk
-- Submit a broker-native `NO_TRADE_QQQ_BREAKOUT_TRAIL_PCT` (default 1.50%) trailing-stop sell after the ETF buy fills.
-- Force exit any remaining position at `NO_TRADE_QQQ_BREAKOUT_EXIT_TIME` (default 11:30).
-- The hard 11:30 exit cancels any resting trailing stop before selling.
-
-### MR Interaction
-This sleeve must not set `mr_blocked_today`. MR is blocked only by the original
-primary router branches. Because this fallback exits by 11:30, it does not
-overlap the 15:45 MR overnight entry window.
-
-### Key Config Knobs
-| Knob | Default | Description |
-|---|---|---|
-| `NO_TRADE_QQQ_BREAKOUT_ENABLED` | `True` | Master switch |
-| `NO_TRADE_QQQ_BREAKOUT_CAPITAL_PCT` | `0.50` | Fraction of equity to use |
-| `NO_TRADE_QQQ_BREAKOUT_RANGE_THRESHOLD` | `0.0045` | Min QQQ 09:30-10:00 range to arm |
-| `NO_TRADE_QQQ_BREAKOUT_TRAIL_PCT` | `1.50` | Trailing stop % |
-| `NO_TRADE_QQQ_BREAKOUT_EXIT_TIME` | `"11:30"` | Hard exit deadline |
-| `NO_TRADE_QQQ_BREAKOUT_POLL_SECONDS` | `5.0` | QQQ poll interval |
-| `NO_TRADE_QQQ_BREAKOUT_ALLOWED_SUBTYPES` | Set C list | Live day subtypes that can arm the breakout |
+All re-exported by `config.py` for `from bot import config; config.X`.

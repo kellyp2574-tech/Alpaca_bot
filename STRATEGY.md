@@ -1,46 +1,39 @@
-# Combined MR + Router Strategy — Quick Reference
+# Combined Bot Strategy — Quick Reference
 
-**Status:** Live (paper)  
-**Strategy:** Combined overnight Mean Reversion + intraday ETF Router  
+**Status:** Live (paper)
+**Architecture:** 3 sleeves (Intraday ETF Router + Intraday MR + Overnight MR/TQQQ).
 
 For the full specification see [`bot/STRATEGY.md`](bot/STRATEGY.md).
 
 ---
 
-## MR (Overnight Hold)
+## Sleeves at a glance
+
+| Sleeve | Trigger window | Holding |
+|---|---|---|
+| Intraday ETF Router | one trade/day at 10:00 (strats 1–3) or 10:10 (strats 4–5) | same day, flat by 15:30 |
+| Intraday MR | entries 09:32–10:00 | same day, flat by 15:40 |
+| Overnight | entry 15:45 | overnight, sold 09:30 next day |
+
+## Overnight single-stock MR
 
 | Parameter | Value |
 |---|---|
-| Entry | 15:45 ET |
-| Exit | Next day 09:30 ET |
-| Max positions | 3 |
+| Entry / Exit | 15:45 ET → next day 09:30 ET |
+| Max positions | 3 (`MR_MAX_PRIMARY_POSITIONS`) |
+| Per-position size | 30% of equity |
 | Price range | $1.00 – $2.00 |
 | Day return | ≤ −4.0% |
 | Close position | ≤ 0.25 (bottom 25% of range) |
 | ADV requirement | ≥ $1M (20-day avg dollar volume) |
-| Sizing | min(0.3% ADV, 33% capital) |
-| Regime gate | Half-size when SPY/IWM/QQQ average ≥ 0 |
 
----
+**Conditional TQQQ** is added on top of MR (does not block it) when favorable, capped
+so combined overnight exposure stays within 90% (`OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT`).
 
-## ETF Router (Intraday)
+## Intraday ETF Router strategies
 
-One trade per day, ~10:00 ET decision. Priority waterfall:
-
-| Tier | Instrument | Exit | Core Condition |
-|---|---|---|---|
-| A++ Long | TQQQ | 15:00 | QQQ >10bp, all sectors green, near high, continuing up |
-| A Long | TQQQ | 15:00 | QQQ >10bp, XLK/VXX/IWM confirm, SPY >−5bp |
-| A− Long | TQQQ | 15:00 | QQQ >10bp, XLK/VXX confirm, IWM >−10bp |
-| A− Weak | TQQQ | 15:00 | QQQ 5–10bp, XLK/VXX/IWM green |
-| Goldilocks | SQQQ | 14:00 | QQQ −30 to −60bp, SQQQ +100–150bp |
-| UVXY Crash | UVXY | 11:00 | QQQ <−60bp, VXX/UVXY green near highs |
-| No Trade | — | — | None of the above met |
-
----
-
-## Non-Overlap Principle
-
-- MR holds overnight → exits before market open
-- Router trades intraday → exits same day
-- Both can use full available capital (no capital contention)
+1. VXX Spike Recovery → TQQQ (exit 15:30)
+2. VXX Collapse → TQQQ (exit 15:30)
+3. Momentum Sleeve → TQQQ / SQQQ in HIGH_RISK (exit 15:00)
+4. Router Long → TQQQ (exit 15:30)
+5. SVIX Long → SVIX (exit 15:00)

@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 from bot import config
+from bot.rate_limiter import create_alpaca_session
 
 logger = logging.getLogger(__name__)
 
@@ -296,10 +297,13 @@ def fetch_alpaca_snapshots_batched(
     daily bar, and previous daily bar for requested symbols.
     """
     base_url = "https://data.alpaca.markets/v2/stocks/snapshots"
-    headers = {
+    # Use the shared rate-limited session so these snapshot calls count against
+    # the global Alpaca budget (60/min) instead of bypassing it with raw requests.
+    session = create_alpaca_session()
+    session.headers.update({
         "APCA-API-KEY-ID": alpaca_data_key,
         "APCA-API-SECRET-KEY": alpaca_data_secret,
-    }
+    })
 
     out: Dict[str, dict] = {}
 
@@ -310,7 +314,7 @@ def fetch_alpaca_snapshots_batched(
         }
 
         try:
-            resp = requests.get(base_url, headers=headers, params=params, timeout=timeout)
+            resp = session.get(base_url, params=params, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
 

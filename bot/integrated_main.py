@@ -1,9 +1,10 @@
 """Combined Overnight Rebound Bot — Main Orchestrator
 
 3-Sleeve Optimized Portfolio:
-  Sleeve 1 (Intraday ETF)  — one trade per day at 10:00 or 10:10, flat by 15:30
-  Sleeve 2 (Overnight ETF) — entered at 15:45, exited at 09:30, only if no intraday trade
-  Sleeve 3 (Single-stock MR) — entered at 15:45, only if no intraday OR overnight ETF trade
+  Sleeve 1 (Intraday ETF)   — one trade per day at 10:00 or 10:10, flat by 15:30
+  Sleeve 2 (Intraday MR)    — morning momentum longs, entered 09:32-10:00, flat same day
+  Sleeve 3 (Overnight)      — single-stock MR (always) PLUS conditional TQQQ added on top
+                              when favorable; both entered at 15:45 and held overnight
 
 Daily Schedule (ET) — bot starts 09:00 AM:
 
@@ -15,7 +16,7 @@ MORNING (T+1 exits — positions from yesterday's 15:45 entries):
   09:45  Post-exit failsafe — verify broker is flat or force-flatten stragglers
 
 INTRADAY ETF (one sleeve per day):
-  09:30-10:00  Build ETF tape (QQQ, SPY, VXX, SVIX, TQQQ)
+  09:30-10:00  Build ETF tape (QQQ, SPY, VXX, SVIX, TQQQ, SQQQ)
   10:00  Evaluate strategies 1-3 (VXX Spike Recovery, VXX Collapse, Momentum)
   10:00  Enter immediately if strategy 1-3 fires
   10:10  Evaluate strategies 4-5 (Router Long, SVIX Long) if no trade yet
@@ -23,10 +24,13 @@ INTRADAY ETF (one sleeve per day):
   15:00  Exit TQQQ/SVIX for strategies 3/4/5
   15:30  Exit TQQQ for strategies 1/2; hard flatten any remaining intraday ETF
 
-AFTERNOON — only if NO intraday ETF trade was taken:
-  15:45  Evaluate overnight ETF strategies A/B/C (VXX MR→SVIX, Quality→TQQQ, Gap Bounce→TQQQ)
-  15:45  If overnight ETF fires, enter ETF position (blocks single-stock MR)
-  15:45  If overnight ETF does NOT fire, run single-stock MR entry pipeline
+AFTERNOON — overnight entries at 15:45:
+  15:30  Collect universe + bars for single-stock MR
+  15:45  Score single-stock MR candidates (top 3)
+  15:45  Evaluate conditional TQQQ — adds a TQQQ position ON TOP of MR when favorable.
+         This does NOT block single-stock MR; MR capacity is reduced so combined
+         exposure stays within OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT.
+  15:45  Enter single-stock MR positions
   16:00  Confirm positions held overnight, save state, done
 """
 import logging
@@ -43,7 +47,7 @@ from bot import entry_executor
 from bot import etf_router_runtime
 from bot import intraday_mr_runtime
 from bot import morning_exits
-from bot import overnight_etf_runner
+from bot import overnight_etf_runner_conditional
 from bot import scoring
 from bot import state_io
 from bot.massive_client import MassiveClient
@@ -98,6 +102,7 @@ _HOT_WINDOWS_HHMM = (
     (9, 58, 10, 12),  # ETF tape final, 10:00 strat 1-3, 10:10 strat 4-5, MR router exit
     (14, 58, 15, 2),  # 15:00 intraday exit (strats 3/4/5)
     (15, 28, 15, 32), # 15:30 intraday hard flatten (strats 1/2)
+    (15, 39, 15, 42), # 15:40 intraday MR hard flatten
     (15, 44, 16, 1),  # Overnight ETF + MR selection, entry, EOD
 )
 
@@ -112,15 +117,15 @@ def _is_hot_window(now_t: dt_time) -> bool:
 
 
 class CombinedOvernightReboundBot:
-    """Unified Bot Orchestrator — Intraday ETF + Overnight ETF + Single-stock MR
+    """Unified Bot Orchestrator — Intraday ETF + Intraday MR + Overnight (MR + conditional TQQQ)
 
-    Priority precedence:
-      1. Intraday ETF (10:00 strategies 1-3, 10:10 strategies 4-5)
-         → any fill blocks both overnight ETF and single-stock MR
-      2. Overnight ETF (15:45 strategies A/B/C)
-         → any fill blocks single-stock MR
-      3. Single-stock MR (15:45)
-         → runs only if neither intraday nor overnight ETF fired
+    Sleeve interaction:
+      1. Intraday ETF (10:00 strategies 1-3, 10:10 strategies 4-5) — one trade/day,
+         flat by 15:30.
+      2. Intraday MR — morning momentum longs, flat same day by 15:40.
+      3. Overnight (15:45) — single-stock MR always runs; conditional TQQQ is added
+         ON TOP when favorable (it does not block MR). MR capacity is reduced so the
+         combined overnight exposure stays within OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT.
     """
 
     def __init__(self):
@@ -384,7 +389,7 @@ class CombinedOvernightReboundBot:
                     # rescue+failsafe were silently skipped while positions remained
                     # open. Gate on TIME ALONE; the position-count check inside is
                     # what decides whether to act.
-                    t_rescue = dt_time(t_exit_all.hour, t_exit_all.minute + 1)
+                    t_rescue = (datetime.combine(date.today(), t_exit_all) + timedelta(minutes=1)).time()
                     if (not self.open_market_rescue_done
                             and current_time >= t_rescue):
                         bc = self.position_mgr.broker_position_count()
@@ -422,7 +427,9 @@ class CombinedOvernightReboundBot:
 
             # ════════════════════════════════════════════
             # INTRADAY ETF Sleeve (5 strategies, one per day)
-            # Up to 50% of equity (see INTRADAY_ETF_ALLOCATION_PCT); fill blocks overnight ETF + MR
+            # Up to 100% of equity minus morning-MR deployment (see
+            # INTRADAY_ETF_ALLOCATION_PCT). A fill blocks the rest of the intraday
+            # ETF sleeve for the day; it does not block the overnight sleeves.
             # ════════════════════════════════════════════
 
             if getattr(config, "ETF_ROUTER_ENABLED", False):
@@ -533,9 +540,14 @@ class CombinedOvernightReboundBot:
             # ════════════════════════════════════════════
 
             if getattr(config, "INTRADAY_MR_ENABLED", False):
+                # Visibility: confirm MR sleeve is active (diagnoses silent skips)
+                if not getattr(self, "_intraday_mr_logged_active", False):
+                    logger.info("Intraday MR sleeve: ENABLED — scheduling Stage 1/2 builds and entries")
+                    self._intraday_mr_logged_active = True
+
                 t_mr_stage1  = _parse_config_time(getattr(config, "INTRADAY_MR_STAGE1_TIME",    "09:00"))
                 t_mr_stage2  = _parse_config_time(getattr(config, "INTRADAY_MR_STAGE2_TIME",    "09:30"))
-                t_mr_flatten = _parse_config_time(getattr(config, "INTRADAY_MR_HARD_FLATTEN_TIME", "15:55"))
+                t_mr_flatten = _parse_config_time(getattr(config, "INTRADAY_MR_HARD_FLATTEN_TIME", "15:40"))
 
                 # 09:00 — Stage 1: build universe + T-1/T-2 bar cache
                 if (not self.intraday_mr_universe_built
@@ -594,7 +606,7 @@ class CombinedOvernightReboundBot:
                         and current_time >= dt_time(9, 34)):
                     self._check_intraday_mr_exits(current_time)
 
-                # 15:55 — hard flatten any remaining intraday MR positions
+                # 15:40 — hard flatten any remaining intraday MR positions
                 if current_time >= t_mr_flatten:
                     self._flatten_all_intraday_mr_positions()
 
@@ -647,12 +659,11 @@ class CombinedOvernightReboundBot:
             if (self.scoring_done
                     and not self.entries_done
                     and current_time >= t_entry):
-                if self.mr_blocked_today or self.overnight_etf_fired:
-                    # Permanent block - do not retry
+                if self.mr_blocked_today:
+                    # Permanent block due to other reasons (not overnight ETF)
                     logger.info(
                         f"Single-stock MR skipped permanently: "
-                        f"mr_blocked_today={self.mr_blocked_today} "
-                        f"overnight_etf_fired={self.overnight_etf_fired}"
+                        f"mr_blocked_today={self.mr_blocked_today}"
                     )
                     self.entries_done = True
                 elif intraday_positions_open:
@@ -662,7 +673,31 @@ class CombinedOvernightReboundBot:
                         "broker-confirmed closed"
                     )
                 else:
-                    # All clear - execute
+                    # All clear - execute (proceeds even if overnight ETF fired)
+                    # Calculate dynamic MR capacity based on actual TQQQ deployment
+                    if self.overnight_etf_fired and self.overnight_etf_position:
+                        tqqq_symbol = self.overnight_etf_position.get("symbol")
+                        if tqqq_symbol == "TQQQ":
+                            # TQQQ deployed - reduce MR capacity to leave room
+                            tqqq_deployed_pct = self.overnight_etf_position.get("allocation_pct", 0.0)
+                            combined_max = float(getattr(config, "OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT", 0.90))
+                            mr_capacity_pct = max(0.0, combined_max - tqqq_deployed_pct)
+                            self.mr_total_allocation_override_pct = mr_capacity_pct
+                            logger.info(
+                                f"Single-stock MR capacity adjusted: TQQQ deployed {tqqq_deployed_pct:.1%}, "
+                                f"MR capacity reduced to {mr_capacity_pct:.1%} (combined max {combined_max:.0%})"
+                            )
+                        else:
+                            # Other overnight ETF fired - use base capacity
+                            self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.90))
+                    else:
+                        # No overnight ETF - full MR capacity
+                        self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.90))
+                        if self.overnight_etf_fired:
+                            logger.info(
+                                "Single-stock MR proceeding: no TQQQ position, full capacity"
+                            )
+
                     self._step_execute_entries()
 
             # ════════════════════════════════════════════
@@ -816,10 +851,10 @@ class CombinedOvernightReboundBot:
         return etf_router_runtime.execute_etf_exit(self, branch_key)
 
     # ═══════════════════════════════════════════════════
-    # Overnight ETF sleeve delegates
+    # Overnight ETF sleeve delegates (Conditional TQQQ)
     # ═══════════════════════════════════════════════════
     def _evaluate_overnight_etf_strategies(self):
-        return overnight_etf_runner.evaluate_overnight_etf_strategies(self)
+        return overnight_etf_runner_conditional.evaluate_overnight_etf_strategies(self)
 
     def _confirm_morning_flat(self, reason: str) -> None:
         """One-way latch: set both morning_exits_done and morning_liquidation_confirmed."""

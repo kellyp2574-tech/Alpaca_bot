@@ -234,17 +234,17 @@ def step_execute_entries(bot) -> None:
         bot.entries_done = True
         bot._save_state()
 
-    # Check MR permission — block ONLY if router actually has/had a filled position.
-    # A router signal that was rejected (failed execution gate, stale quote, etc.)
-    # must NOT block MR.  Only a confirmed fill is a regime conflict.
-    has_etf_position = bool(getattr(bot, "etf_positions", None))
-    intraday_etf_filled = getattr(bot, "intraday_etf_sleeve_filled", False)
-    if has_etf_position or intraday_etf_filled:
+    # Check MR permission — block ONLY if intraday ETF positions are still OPEN.
+    # A router that filled earlier but has since exited (positions closed) does NOT block MR.
+    # A router signal that was rejected (failed execution gate) also does NOT block MR.
+    open_etf_positions = getattr(bot, "etf_positions", {})
+    has_open_etf = bool(open_etf_positions)  # True if any positions remain open
+    if has_open_etf:
         branch = bot.router_branch or "unknown"
+        etf_symbols = list(open_etf_positions.keys())
         logger.info(
-            "MR entries BLOCKED — intraday ETF position confirmed "
-            "(branch=%s, has_position=%s, sleeve_filled=%s)",
-            branch, has_etf_position, intraday_etf_filled,
+            "MR entries BLOCKED — intraday ETF positions still open: %s (branch=%s)",
+            etf_symbols, branch,
         )
         mark_entries_done_and_save()
         return
@@ -328,11 +328,32 @@ def step_execute_entries(bot) -> None:
         from bot import scoring as _scoring
         mr_size_mult, mr_regime_info = _scoring.compute_mr_etf_regime_size_multiplier(bot)
 
-        # Sleeve budget = deployable * MR_MAX_TOTAL_ALLOCATION_PCT (0.90) * regime_mult
-        mr_budget = deployable * config.MR_MAX_TOTAL_ALLOCATION_PCT * mr_size_mult
+        # MR sleeve budget calculation:
+        # 1. Check for override (e.g., when TQQQ conditional has taken allocation)
+        override = getattr(bot, "mr_total_allocation_override_pct", None)
+        mr_max_pct = float(
+            config.MR_MAX_TOTAL_ALLOCATION_PCT
+            if override is None
+            else override
+        )
+        # Clamp to valid range [0.0, 1.0]
+        mr_max_pct = max(0.0, min(1.0, mr_max_pct))
+
+        # 2. Calculate absolute equity cap (e.g., 60% of $100k = $60k)
+        absolute_mr_cap = equity * mr_max_pct
+
+        # 3. Take minimum of: absolute cap, available deployable
+        #    This respects both the equity percentage AND buying power constraints
+        pre_regime_budget = min(deployable, absolute_mr_cap)
+
+        # 4. Apply regime multiplier
+        mr_budget = pre_regime_budget * mr_size_mult
+
         logger.info(
-            f"MR sleeve budget: ${mr_budget:,.2f} "
-            f"({config.MR_MAX_TOTAL_ALLOCATION_PCT:.0%} * regime_mult={mr_size_mult:.2f}) | "
+            f"MR sleeve budget: ${mr_budget:,.2f} | "
+            f"equity_cap=${absolute_mr_cap:,.2f} ({mr_max_pct:.1%} equity), "
+            f"available_BP=${deployable:,.2f}, "
+            f"regime_mult={mr_size_mult:.2f} | "
             f"regime={mr_regime_info}"
         )
 
@@ -827,17 +848,19 @@ def step_execute_entries(bot) -> None:
             "submit_latency_ms": latency_summary,
         }
 
-        deployment_pct = total_deployed / deployable * 100 if deployable > 0 else 0.0
+        # MR-specific deployment percentage (against MR budget, not total deployable)
+        # This correctly shows 100% when MR fills its reduced cap (e.g., 60%) after TQQQ
+        mr_deployment_pct = total_deployed / mr_budget * 100 if mr_budget > 0 else 0.0
         logger.info(
             f"Entry execution complete: {len(exec_diag.filled_symbols)} filled "
             f"({mr_filled} MR), "
             f"{len(exec_diag.rejected_symbols)} rejected at execution gate, "
             f"${total_deployed:,.2f} deployed "
-            f"({deployment_pct:.1f}% of deployable)"
+            f"({mr_deployment_pct:.1f}% of MR budget ${mr_budget:,.0f})"
         )
 
-        # Shortfall diagnostics
-        if deployment_pct < 80.0:
+        # Shortfall diagnostics (compare against MR budget, not total deployable)
+        if mr_deployment_pct < 80.0:
             logger.warning("=== DEPLOYMENT SHORTFALL DIAGNOSTICS ===")
             if equity < 50_000 and bot.sold_today:
                 logger.warning(f"PDT guard active: sold_today={bot.sold_today}")
@@ -853,12 +876,11 @@ def step_execute_entries(bot) -> None:
             if not_filled:
                 logger.warning(f"Symbols not filled: {len(not_filled)} (e.g., {list(not_filled)[:5]})")
 
-            # Target vs actual deployment
-            target_deploy_pct = deployable / equity * 100
+            # Target vs actual deployment (MR-specific)
             logger.warning(
-                f"Target deployment: ${deployable:,.2f} ({target_deploy_pct:.1f}% of equity) "
-                f"-> Actual: ${total_deployed:,.2f} ({deployment_pct:.1f}%) "
-                f"= Gap of ${deployable - total_deployed:,.2f}"
+                f"MR target: ${mr_budget:,.2f} ({mr_max_pct:.0%} of deployable) "
+                f"-> Actual: ${total_deployed:,.2f} ({mr_deployment_pct:.1f}%) "
+                f"= Gap of ${mr_budget - total_deployed:,.2f}"
             )
             logger.warning("=== END SHORTFALL DIAGNOSTICS ===")
 
