@@ -10,7 +10,7 @@ Pipeline:
 """
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from bot import config
 from bot.scorer_utils import compute_intraday_base_metrics
@@ -29,12 +29,18 @@ class MeanReversionCandidate:
     volume_930_to_signal: int
     adv_20d: float
     adv_dollars: float
+    adv_multiplier: float = 1.0      # source-specific multiplier (e.g. 1.0 for Massive, 50.0 for IEX)
+    adv_source: str = "unknown"    # e.g. "massive_grouped_daily" or "alpaca_iex"
 
     day_return: float = 0.0
     volume_ratio: float = 0.0
+    volume_ratio_available: bool = True  # False if source cannot compute this metric
     close_position: float = 0.0        # 0.0 = at low, 1.0 = at high
     late_drop_1530_1550: float = 0.0   # return from ~15:30 bar to signal
+    late_drop_available: bool = True   # False if source cannot compute this metric
     selection_score: float = 0.0
+    prior_ret: Optional[float] = None            # T-2 to T-1 return from Massive
+    prior_ret_filter_passed: Optional[bool] = None  # True if prior_ret passed configured bounds
 
 
 def build_mean_reversion_candidates(
@@ -79,6 +85,8 @@ def build_mean_reversion_candidates(
             volume_930_to_signal=m.total_volume,
             adv_20d=adv_shares,
             adv_dollars=adv_dollars,
+            adv_multiplier=float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0)),
+            adv_source="alpaca_iex",
             day_return=m.day_return,
             volume_ratio=m.volume_ratio,
             close_position=m.close_position,

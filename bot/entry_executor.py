@@ -11,7 +11,7 @@ sold_today, _exec_stats). State ownership stays in
 `CombinedOvernightReboundBot`.
 
 Live constants (read from `bot.config`):
-    MR_MAX_TOTAL_ALLOCATION_PCT  = 0.90  -> sleeve budget = deployable * 0.90 * regime_mult
+    MR_MAX_TOTAL_ALLOCATION_PCT  = 0.60  -> base sleeve budget = deployable * 0.60 * regime_mult
     MR_ALLOC_PER_POSITION_PCT    = 0.30  -> per-position cap (3 positions x 30% = 90%)
     MR_MAX_PRIMARY_POSITIONS     = 3     -> top 3 candidates only (overflow goes to waterfall)
     MR_ADV_CAP_PCT               = 0.003 -> 0.3% of 20-day ADV per symbol
@@ -28,7 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -44,7 +44,12 @@ _ET = ZoneInfo("America/New_York")
 
 @dataclass
 class SleeveAllocation:
-    """Per-symbol allocation produced by the waterfall + sized to shares."""
+    """Per-symbol allocation produced by the waterfall.
+
+    `shares` is not known until live execution pricing is available; it is set
+    to 0 here and recalculated inside step_execute_entries using the conservative
+    execution price (max(signal, ask, limit)) so ADV caps hold for actual fills.
+    """
     symbol: str
     shares: int
     target_dollars: float
@@ -73,15 +78,20 @@ def allocate_waterfall(bot, candidates, sleeve_budget: float, equity: float,
     # Per-position cap = MR_ALLOC_PER_POSITION_PCT * equity (default 30%).
     max_single_dollars = equity * config.MR_ALLOC_PER_POSITION_PCT
 
-    # ADV multiplier for IEX data (IEX reports lower volume than composite)
-    adv_multiplier = getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0)
+    # ADV multiplier is per-candidate: 1.0 for Massive (actual dollar volume),
+    # default ADV_DOLLAR_MULTIPLIER for IEX-derived data.
+    default_adv_multiplier = getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0)
     adv_cap_pct = config.MR_ADV_CAP_PCT
+
+    def _candidate_adv_multiplier(c) -> float:
+        return float(getattr(c, "adv_multiplier", default_adv_multiplier))
 
     # Pre-filter: skip candidates where cap is below effective minimum
     viable = []
     skips = {}
     for c in candidates:
-        sizing_adv_dollars = c.adv_dollars * adv_multiplier if c.adv_dollars > 0 else 0.0
+        cand_multiplier = _candidate_adv_multiplier(c)
+        sizing_adv_dollars = c.adv_dollars * cand_multiplier if c.adv_dollars > 0 else 0.0
         adv_cap = sizing_adv_dollars * adv_cap_pct if sizing_adv_dollars > 0 else 0.0
         cap = min(
             adv_cap,
@@ -100,7 +110,8 @@ def allocate_waterfall(bot, candidates, sleeve_budget: float, equity: float,
                 "cap": round(cap, 2),
                 "effective_min": round(effective_min, 2),
                 "raw_adv_dollars": round(c.adv_dollars, 0),
-                "adv_multiplier": adv_multiplier,
+                "adv_multiplier": cand_multiplier,
+                "adv_source": getattr(c, "adv_source", "unknown"),
                 "sizing_adv_dollars": round(sizing_adv_dollars, 0),
                 "adv_cap_pct": adv_cap_pct,
                 "adv_cap_dollars": round(adv_cap, 2),
@@ -128,7 +139,8 @@ def allocate_waterfall(bot, candidates, sleeve_budget: float, equity: float,
     sizing_info = {}
     last_sizing_adv = 0.0
     for c in viable:
-        sizing_adv_dollars = c.adv_dollars * adv_multiplier if c.adv_dollars > 0 else 0.0
+        cand_multiplier = _candidate_adv_multiplier(c)
+        sizing_adv_dollars = c.adv_dollars * cand_multiplier if c.adv_dollars > 0 else 0.0
         adv_cap = sizing_adv_dollars * adv_cap_pct
         caps[c.symbol] = min(
             adv_cap,
@@ -137,7 +149,8 @@ def allocate_waterfall(bot, candidates, sleeve_budget: float, equity: float,
         )
         sizing_info[c.symbol] = {
             "raw_adv_dollars": round(c.adv_dollars, 0),
-            "adv_multiplier": adv_multiplier,
+            "adv_multiplier": cand_multiplier,
+            "adv_source": getattr(c, "adv_source", "unknown"),
             "sizing_adv_dollars": round(sizing_adv_dollars, 0),
             "adv_cap_pct": adv_cap_pct,
             "adv_cap_dollars": round(adv_cap, 2),
@@ -190,7 +203,7 @@ def allocate_waterfall(bot, candidates, sleeve_budget: float, equity: float,
                 "target_dollars": allocations[c.symbol],
                 "cap_dollars": caps[c.symbol],
                 "adv_dollars": c.adv_dollars,
-                "sizing_adv_dollars": last_sizing_adv,
+                "sizing_adv_dollars": sizing_diag.get("sizing_adv_dollars", last_sizing_adv),
                 "candidate": c,
                 "sizing": sizing_diag,
             })
@@ -443,15 +456,15 @@ def step_execute_entries(bot) -> None:
                     f"Final MR leftover: ${mr_leftover:,.2f} (no more orderable candidates)"
                 )
 
-        # Build SleeveAllocation list with shares calculated from target dollars
+        # Build SleeveAllocation list; shares are recomputed at execution time
+        # using the conservative execution price, so leave them as 0 here.
         allocations: List[SleeveAllocation] = []
         for rank, r in enumerate(mr_results, start=1):
             c = r["candidate"]
-            shares = math.floor(r["target_dollars"] / c.signal_price) if c.signal_price > 0 else 0
             sleeve_label = "MR" if not r.get("fallback") else "MR_OVERFLOW"
             allocations.append(SleeveAllocation(
                 symbol=c.symbol,
-                shares=shares,
+                shares=0,
                 target_dollars=r["target_dollars"],
                 rank=rank,
                 sleeve=sleeve_label,
@@ -489,13 +502,21 @@ def step_execute_entries(bot) -> None:
         bp_remaining = buying_power
 
         def _adaptive_qty(alloc: SleeveAllocation, bp_avail: float,
-                          bp_buffer: float = config.ENTRY_BP_BUFFER_PCT) -> int:
-            """Return shares clamped to current buying power using target_dollars."""
+                          bp_buffer: float = config.ENTRY_BP_BUFFER_PCT,
+                          exec_price: Optional[float] = None) -> int:
+            """Return shares clamped to current buying power using target_dollars.
+
+            Use the highest applicable execution price (signal, ask, or limit)
+            so that the actual filled notional cannot exceed the target dollars
+            or the ADV cap. See June 22 post-mortem: SPWH/OXSQ/FTHM slightly
+            overfilled because quantity was computed off the signal price while
+            the actual fill was higher.
+            """
             if bp_avail <= 0:
                 return 0
             max_notional = bp_avail * bp_buffer
             target = min(alloc.target_dollars, max_notional)
-            price_ref = alloc.candidate.signal_price
+            price_ref = exec_price if exec_price and exec_price > 0 else alloc.candidate.signal_price
             if price_ref <= 0:
                 return 0
             return math.floor(target / price_ref)
@@ -527,16 +548,7 @@ def step_execute_entries(bot) -> None:
                 continue
 
             candidate = alloc.candidate
-            price_ref = candidate.signal_price
-            qty = _adaptive_qty(alloc, bp_remaining)
-
-            if qty < config.MIN_SHARES:
-                logger.warning(
-                    f"ENTRY SKIP {symbol}: adaptive qty {qty} < {config.MIN_SHARES} min shares "
-                    f"(bp=${bp_remaining:,.2f}, price={price_ref:.4f})"
-                )
-                exec_diag.failed_submissions[symbol] = "bp_resize_below_min"
-                continue
+            signal_price = candidate.signal_price
 
             # Marketable-limit price (issue #6): cap at ask * (1 + slippage).
             # Falls back to market order (limit_price=None) when the ask is
@@ -549,15 +561,35 @@ def step_execute_entries(bot) -> None:
             else:
                 limit_price = None
 
+            # Conservative execution price: the highest price we might actually pay.
+            # This ensures the ADV cap and target dollars are respected even if the
+            # marketable-limit fill lands at the limit (ask + slippage).
+            price_ref = max(
+                signal_price,
+                float(ask) if ask and float(ask) > 0 else 0.0,
+                float(limit_price) if limit_price and float(limit_price) > 0 else 0.0,
+            ) if signal_price > 0 else 0.0
+
+            qty = _adaptive_qty(alloc, bp_remaining, exec_price=price_ref)
+
+            if qty < config.MIN_SHARES:
+                logger.warning(
+                    f"ENTRY SKIP {symbol}: adaptive qty {qty} < {config.MIN_SHARES} min shares "
+                    f"(bp=${bp_remaining:,.2f}, price_ref={price_ref:.4f})"
+                )
+                exec_diag.failed_submissions[symbol] = "bp_resize_below_min"
+                continue
+
             # Create deterministic client_order_id
             client_order_id = f"BOT-{timestamp}-{symbol}"
-            planned_notional = qty * (limit_price if limit_price else price_ref)
+            planned_notional = qty * price_ref
 
             logger.info(
-                f"ENTRY PLAN {symbol}: qty={qty}, price_ref={price_ref:.4f}, "
+                f"ENTRY PLAN {symbol}: qty={qty}, signal_price={signal_price:.4f}, "
                 f"ask={ask}, limit={f'{limit_price:.4f}' if limit_price else 'MARKET'}, "
-                f"notional={planned_notional:,.2f}, bp_remaining={bp_remaining:,.2f}, "
-                f"sleeve={alloc.sleeve}, rank={alloc.rank}, client_id={client_order_id}"
+                f"price_ref={price_ref:.4f}, notional={planned_notional:,.2f}, "
+                f"bp_remaining={bp_remaining:,.2f}, sleeve={alloc.sleeve}, rank={alloc.rank}, "
+                f"client_id={client_order_id}"
             )
 
             submission_plans.append((alloc, qty, client_order_id, price_ref, limit_price))

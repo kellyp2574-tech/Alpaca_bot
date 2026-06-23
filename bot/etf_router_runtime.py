@@ -9,8 +9,10 @@ Owns the intraday ETF workflow:
   - Exit checkpoints: 15:00 and 15:30 (`check_etf_exits`, `execute_etf_exit`)
   - EOD summary + artifact (`build_etf_router_summary`, `save_etf_router_artifact`)
 
-Only ONE strategy can be filled per day. Any fill blocks the overnight ETF
-sleeve AND the single-stock MR fallback.
+Multiple strategies can fill per day. Whether a fill blocks the overnight ETF
+sleeve and single-stock MR fallback depends on the branch's
+blocks_overnight_etf value in ETF_SL_TP (e.g., SVIX_LONG and MOMENTUM_SLEEVE_ANTI
+are nonblocking; VXX_SPIKE_RECOVERY and MOMENTUM_SLEEVE block).
 
 Every function takes the orchestrator instance (`bot`) as its first argument
 and mutates its state directly. State ownership stays with
@@ -96,6 +98,16 @@ def build_etf_router_summary(bot) -> Dict[str, Any]:
             summary["decisions"] = [d.to_dict() for d in decisions]
         except Exception:
             logger.warning("ETF router decisions.to_dict() failed", exc_info=True)
+
+    # All fired signals (including unfilled ones) for audit
+    signals_fired = getattr(bot, "router_signals_fired", [])
+    if signals_fired:
+        summary["signals_fired"] = signals_fired
+
+    # Realized exits: actual exit time, price, reason, and return
+    realized_exits = getattr(bot, "router_realized_exits", [])
+    if realized_exits:
+        summary["realized_exits"] = realized_exits
 
     # All open positions (multi-strategy)
     positions = getattr(bot, "etf_positions", {})
@@ -382,6 +394,13 @@ def make_router_decision(bot) -> None:
     # Callers that gate reallocation use this flag to distinguish
     # "router had no signal" from "router signalled but order failed".
     bot.router_signal_fired_today = True
+    if not hasattr(bot, "router_signals_fired") or bot.router_signals_fired is None:
+        bot.router_signals_fired = []
+    signal_ts = datetime.now(_ET).isoformat()
+    bot.router_signals_fired.extend(
+        {**d.to_dict(), "decision_window": "10:00", "signal_time": signal_ts}
+        for d in decisions
+    )
 
     if bot._check_daily_loss_kill_switch():
         logger.critical(
@@ -391,17 +410,22 @@ def make_router_decision(bot) -> None:
         bot._save_state()
         return
 
-    _execute_all_etf_entries(bot, decisions)
+    filled_decisions = _execute_all_etf_entries(bot, decisions)
     if bot.etf_positions:
         filled = list(bot.etf_positions.keys())
-        bot.router_decisions = decisions  # store ALL decisions for artifact
-        bot.router_decision = decisions[0]  # primary for backwards compat
+        unfilled = [d.branch.value for d in decisions if d not in filled_decisions]
+        bot.router_decisions = filled_decisions  # only filled decisions are "completed"
+        bot.router_decision = filled_decisions[0] if filled_decisions else None
         bot.router_branch = ",".join(filled)
         bot.router_traded_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
+        # mr_blocked_today is True only if a decision that actually blocks MR/overnight ETF FILLED.
+        bot.mr_blocked_today = any(d.mr_blocked() for d in filled_decisions)
         logger.info(
             f"Intraday sleeve filled: {filled} — "
+            f"unfilled_signals={unfilled}, "
+            f"mr_blocked_today={bot.mr_blocked_today}, "
             f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}"
         )
 
@@ -427,6 +451,13 @@ def make_router_decision_1010(bot) -> None:
 
     # Signal exists at 10:10 — mark fired before execution attempt.
     bot.router_signal_fired_today = True
+    if not hasattr(bot, "router_signals_fired") or bot.router_signals_fired is None:
+        bot.router_signals_fired = []
+    signal_ts = datetime.now(_ET).isoformat()
+    bot.router_signals_fired.extend(
+        {**d.to_dict(), "decision_window": "10:10", "signal_time": signal_ts}
+        for d in decisions
+    )
 
     if bot._check_daily_loss_kill_switch():
         logger.critical(
@@ -436,24 +467,28 @@ def make_router_decision_1010(bot) -> None:
         bot._save_state()
         return
 
-    _execute_all_etf_entries(bot, decisions)
+    filled_decisions = _execute_all_etf_entries(bot, decisions)
     if bot.etf_positions:
         filled = list(bot.etf_positions.keys())
-        bot.router_decisions = decisions  # store ALL decisions
-        bot.router_decision = decisions[0]
+        unfilled = [d.branch.value for d in decisions if d not in filled_decisions]
+        bot.router_decisions = filled_decisions
+        bot.router_decision = filled_decisions[0] if filled_decisions else None
         bot.router_branch = ",".join(filled)
         bot.router_traded_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
+        bot.mr_blocked_today = any(d.mr_blocked() for d in filled_decisions)
         logger.info(
             f"Intraday sleeve filled (10:10): {filled} — "
+            f"unfilled_signals={unfilled}, "
+            f"mr_blocked_today={bot.mr_blocked_today}, "
             f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}"
         )
 
     bot._save_state()
 
 
-def _execute_all_etf_entries(bot, decisions: list) -> None:
+def _execute_all_etf_entries(bot, decisions: list) -> list:
     """
     Execute all fired strategy decisions with portfolio-aware dynamic sizing.
 
@@ -462,10 +497,12 @@ def _execute_all_etf_entries(bot, decisions: list) -> None:
 
     Router capacity = remaining equity after morning MR deployment,
     capped by buying power buffer (not by a fixed percentage).
+
+    Returns the list of decisions whose orders actually filled.
     """
     n = len(decisions)
     if n == 0:
-        return
+        return []
 
     # Step 1: Reconcile any pending MR fills BEFORE sizing
     if getattr(bot, "intraday_mr_pending_orders", {}):
@@ -478,13 +515,13 @@ def _execute_all_etf_entries(bot, decisions: list) -> None:
             "MR orders remain unresolved after reconciliation; "
             "skipping router entry to prevent double allocation"
         )
-        return
+        return []
 
     try:
         account = bot.position_mgr.get_account()
         if not account:
             logger.error("Cannot fetch account for ETF sizing")
-            return
+            return []
         equity = float(account.get("equity", 0))
         buying_power = float(account.get("buying_power", 0))
 
@@ -518,11 +555,11 @@ def _execute_all_etf_entries(bot, decisions: list) -> None:
 
         if router_budget <= 0:
             logger.warning("ETF router: zero budget after morning MR deployment — skipping entries")
-            return
+            return []
 
     except Exception as e:
         logger.error(f"ETF multi-entry: account fetch failed: {e}", exc_info=True)
-        return
+        return []
 
     # Pre-validation: check which symbols are execution-ready before sizing
     symbols = [d.symbol for d in decisions]
@@ -530,7 +567,7 @@ def _execute_all_etf_entries(bot, decisions: list) -> None:
         snapshots = bot.alpaca.get_snapshots(symbols) or {}
     except Exception as e:
         logger.error(f"ETF multi-entry: snapshot fetch failed: {e}")
-        return
+        return []
 
     # Deduplicate by symbol (multiple strategies may use same underlying)
     decision_by_symbol: dict = {}
@@ -579,12 +616,16 @@ def _execute_all_etf_entries(bot, decisions: list) -> None:
     )
 
     # Submit each eligible entry once (pass validated snapshot to avoid double-fetch)
+    filled_decisions = []
     for decision in eligible_decisions:
-        execute_etf_entry(
+        success = execute_etf_entry(
             bot, decision,
             budget_override=per_strategy_budget,
             pre_validated_snapshot=validated_snapshots.get(decision.symbol)
         )
+        if success:
+            filled_decisions.append(decision)
+    return filled_decisions
 
 
 def execute_etf_entry(
@@ -841,6 +882,8 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
                                 f"ETF afternoon gate: {branch_key} {symbol} FLAT/RED "
                                 f"({pnl_pct:.2%} @ ${current_price:.2f}) — cutting now"
                             )
+                            pos["exit_reason"] = "afternoon_gate_flat_red"
+                            pos["exit_gate_price"] = current_price
                             execute_etf_exit(bot, branch_key)
                             continue
                     else:
@@ -848,6 +891,7 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
                         logger.warning(
                             f"ETF afternoon gate: {branch_key} {symbol} no price data — cutting"
                         )
+                        pos["exit_reason"] = "afternoon_gate_no_price"
                         execute_etf_exit(bot, branch_key)
                         continue
             except Exception as e:
@@ -860,25 +904,58 @@ def check_etf_exits(bot, current_time: dt_time) -> None:
                 exit_h, exit_m = int(parts[0]), int(parts[1])
                 if current_time >= dt_time(exit_h, exit_m):
                     logger.info(f"ETF exit time reached: {branch_key} {symbol} at {current_time}")
+                    pos["exit_reason"] = "timed_exit"
                     execute_etf_exit(bot, branch_key)
             except Exception as e:
                 logger.warning(f"ETF exit time check failed ({branch_key}): {e}")
 
 
-def _clear_one_etf_position(bot, branch_key: str) -> None:
-    """Remove one position from etf_positions and log it.
+def _clear_one_etf_position(
+    bot,
+    branch_key: str,
+    exit_reason: Optional[str] = None,
+    exit_price: Optional[float] = None,
+    exit_time: Optional[datetime] = None,
+) -> None:
+    """Remove one position from etf_positions and record its realized exit.
 
     intraday_etf_sleeve_filled stays True for the rest of the day.
+    The exit record is appended to bot.router_realized_exits so the EOD artifact
+    captures the actual exit time, price, and reason, not just the planned exit_time.
     """
     pos = (getattr(bot, "etf_positions", None) or {}).get(branch_key)
-    if pos:
-        entry = float(pos.get("entry_price") or 0)
-        qty   = int(pos.get("qty") or 0)
-        fill_info = f" entry=${entry:.2f} qty={qty}" if entry > 0 and qty > 0 else ""
-        logger.info(
-            f"ETF intraday exit confirmed: branch={branch_key}{fill_info} — "
-            f"sleeve flags preserved (blocks overnight ETF + MR)"
-        )
+    if not pos:
+        return
+
+    entry = float(pos.get("entry_price") or 0)
+    qty = int(pos.get("qty") or 0)
+    realized_price = exit_price if exit_price and exit_price > 0 else float(pos.get("exit_fill_price") or entry)
+    realized_time = exit_time if exit_time else datetime.now(_ET)
+    realized_reason = exit_reason or pos.get("exit_reason") or pos.get("exit_trigger") or "unknown"
+    realized_return = 0.0
+    if entry > 0 and realized_price > 0:
+        realized_return = (realized_price - entry) / entry
+
+    record = {
+        "branch": branch_key,
+        "symbol": pos.get("symbol"),
+        "qty": qty,
+        "entry_price": round(entry, 4),
+        "entry_time": pos.get("entry_time"),
+        "exit_price": round(realized_price, 4) if realized_price > 0 else None,
+        "exit_time": realized_time.strftime("%H:%M:%S"),
+        "exit_reason": realized_reason,
+        "return_pct": round(realized_return, 4),
+    }
+    if not hasattr(bot, "router_realized_exits"):
+        bot.router_realized_exits = []
+    bot.router_realized_exits.append(record)
+
+    fill_info = f" entry=${entry:.2f} qty={qty} exit=${realized_price:.2f} ret={realized_return:+.2%}"
+    logger.info(
+        f"ETF intraday exit confirmed: branch={branch_key}{fill_info} "
+        f"(reason={realized_reason})"
+    )
     if hasattr(bot, "etf_positions") and bot.etf_positions:
         bot.etf_positions.pop(branch_key, None)
 
@@ -903,14 +980,16 @@ def execute_etf_exit(bot, branch_key: str) -> None:
 
         if fill and int(fill.get("filled_qty", 0)) > 0:
             filled_qty = int(fill["filled_qty"])
+            fill_price = float(fill.get("filled_avg_price", 0) or 0)
             if filled_qty >= qty:
                 logger.info(f"ETF exit filled: {branch_key} {symbol} {filled_qty}sh")
-                _clear_one_etf_position(bot, branch_key)
+                _clear_one_etf_position(bot, branch_key, exit_price=fill_price)
                 bot._save_state()
             else:
                 remaining = qty - filled_qty
                 pos["qty"] = remaining
                 pos["exit_order_id"] = None
+                pos["exit_fill_price"] = fill_price
                 logger.warning(f"ETF exit partial: {branch_key} {symbol} {filled_qty}/{qty}, {remaining} remaining")
                 bot._save_state()
             return
@@ -956,14 +1035,16 @@ def execute_etf_exit(bot, branch_key: str) -> None:
             fill = bot.position_mgr.get_order_fill(order["id"], max_wait=10)
             if fill and int(fill.get("filled_qty", 0)) > 0:
                 filled_qty = int(fill["filled_qty"])
+                fill_price = float(fill.get("filled_avg_price", 0) or 0)
                 if filled_qty >= qty:
                     logger.info(f"ETF exit filled: {branch_key} {symbol} {filled_qty}sh")
-                    _clear_one_etf_position(bot, branch_key)
+                    _clear_one_etf_position(bot, branch_key, exit_price=fill_price)
                     bot._save_state()
                 else:
                     remaining = qty - filled_qty
                     pos["qty"] = remaining
                     pos["exit_order_id"] = None
+                    pos["exit_fill_price"] = fill_price
                     logger.warning(f"ETF exit partial: {branch_key} {symbol} {filled_qty}/{qty}, {remaining} remaining")
                     bot._save_state()
             else:

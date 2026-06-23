@@ -25,7 +25,9 @@ Live constants (single source of truth):
     INTRADAY_ETF_ALLOCATION_PCT  = 1.00    # Max router allocation = up to 100% of equity minus morning-MR deployment
     MR_ALLOC_PER_POSITION_PCT    = 0.30    # 30% of equity per MR position
     MR_MAX_PRIMARY_POSITIONS     = 3       # Top 3 MR candidates only
-    MR_MAX_TOTAL_ALLOCATION_PCT  = 0.90    # Max 90% of equity in the MR sleeve
+    MR_MAX_TOTAL_ALLOCATION_PCT  = 0.60    # Base 60% of equity for single-stock MR
+    TQQQ_CONDITIONAL_ALLOCATION_PCT = 0.30 # 30% reserved for conditional TQQQ
+    OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT = 0.90  # Max 90% combined MR+TQQQ
     MR_ADV_CAP_PCT               = 0.003   # 0.3% of 20-day ADV per symbol
 """
 
@@ -70,12 +72,12 @@ ETF_ENTRY_WARN_STALE_SECONDS = 30.0  # Warn if quote >30s old
 # ═══════════════════════════════════════════════════
 # Overnight Single-Stock MR Sizing (15:45 entry)
 # ═══════════════════════════════════════════════════
-# Base allocation when no conditional TQQQ fired: 90% of equity
-# When conditional TQQQ fired: reduced to 60% (TQQQ takes 30%, combined 90%)
-# Override is computed at runtime based on actual TQQQ deployment.
+# Base allocation for single-stock MR (when no conditional TQQQ fires): 60%.
+# When overnight TQQQ fires, the remaining MR budget is combined_max - TQQQ
+# allocation, capped at 60%. The combined overnight sleeve is capped at 90%.
 MR_ALLOC_PER_POSITION_PCT = 0.30   # 30% of equity per MR position
 MR_MAX_PRIMARY_POSITIONS = 3       # Top 3 MR candidates only
-MR_MAX_TOTAL_ALLOCATION_PCT = 0.90 # Max 90% of equity when TQQQ not fired
+MR_MAX_TOTAL_ALLOCATION_PCT = 0.60 # Base 60% of equity for single-stock MR
 MR_ADV_CAP_PCT = 0.003             # 0.3% of 20-day ADV per symbol
 
 # Conditional TQQQ allocation (overnight, 15:45)
@@ -90,7 +92,9 @@ OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT = 0.90  # Max 90% combined MR+TQQQ
 ETF_ROUTER_SYMBOLS = ["QQQ", "SPY", "VXX", "SVIX", "TQQQ", "SQQQ"]
 
 # Tape recording cadence — once every N seconds.
-ETF_TAPE_UPDATE_INTERVAL_SECONDS = 5
+# Reduced to 10s to avoid operating near the 60/60 API rate limit during
+# the 9:30-10:10 execution window, when order/account calls are also needed.
+ETF_TAPE_UPDATE_INTERVAL_SECONDS = 10
 
 # ── Strategy 1: VXX Spike Recovery (check at 10:00) ──
 VXX_SPIKE_MIN_RETURN_PCT = 2.5       # VXX 30min return >= +2.5%
@@ -182,7 +186,7 @@ OVERNIGHT_ETF_EXIT_TIME = "09:30"
 # Strategy              SL       SL_ARM_TIME   EXIT_TIME   Notes
 # Momentum_Sleeve      0.5%     13:00         15:00       Cut losers at 1pm, ride winners
 # Router_Long          0.5%     13:30         15:30       Cut losers at 1:30pm, late exit
-# SVIX_Long            0.5%     13:30         15:00       Cut losers at 1:30pm, 3pm exit
+# SVIX_Long            None     None          15:00       15:00 timed exit only (no 13:30 flat/red gate)
 # VXX_Collapse         1.0%     13:00         15:30       Catastrophe stop, ride vol crush
 # VXX_Spike_Recovery   None     None          15:30       No SL — hard time exit only
 ETF_SL_TP: dict = {
@@ -192,7 +196,7 @@ ETF_SL_TP: dict = {
     "MOMENTUM_SLEEVE":          {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": True},   # 0.5% SL, blocks
     "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": False},  # SQQQ — allows overnight ETF
     "ROUTER_LONG":              {"sl": 0.005,  "sl_arm_time": "13:30", "exit_time": "15:30", "blocks_overnight_etf": True},   # 0.5% SL, blocks
-    "SVIX_LONG":                {"sl": 0.005,  "sl_arm_time": "13:30", "exit_time": "15:00", "blocks_overnight_etf": False},  # SVIX — allows overnight ETF
+    "SVIX_LONG":                {"sl": None,    "sl_arm_time": None,   "exit_time": "15:00", "blocks_overnight_etf": False},  # SVIX — 15:00 timed exit only (no 13:30 flat/red gate)
 }
 
 # ═══════════════════════════════════════════════════
@@ -235,11 +239,6 @@ MR_FREE_ALPACA_BATCH_SIZE = 200
 MR_FREE_ALPACA_BATCH_SLEEP_SECONDS = 0.25
 
 # ═══════════════════════════════════════════════════
-# MR allocation sizing (60% base for individual MR)
-# ═══════════════════════════════════════════════════
-MR_MAX_TOTAL_ALLOCATION_PCT = 0.60    # 60% base allocation for individual MR
-MR_ALLOC_PER_POSITION_PCT = 0.30      # 30% max per position (2 positions max)
-
 # MR regime sizing
 # ═══════════════════════════════════════════════════
 ENABLE_MR_ETF_REGIME_SIZING = True
@@ -303,7 +302,8 @@ INTRADAY_MR_HARD_FLATTEN_TIME = "15:40"
 # ── Allocation note ──────────────────────────────────────────────────────────
 # On overlap days (MR + ETF router both active):
 #   INTRADAY_MR_BUDGET_PCT      = 0.50  (MR buys up to 50% equity pre-10:00)
-#   INTRADAY_ETF_ALLOCATION_PCT = 0.50  (router buys up to 50% at 10:00)
+#   INTRADAY_ETF_ALLOCATION_PCT = 1.00  (router maximum = 100% of equity,
+#                                        less actual morning-MR deployment)
 # Combined max = 100% equity (no double-spend).
 # On non-router days: at 10:10 the router bucket is reallocated to open MR
 # positions as add-on buys (see INTRADAY_REALLOC_* settings below).

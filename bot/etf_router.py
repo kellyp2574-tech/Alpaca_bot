@@ -37,6 +37,23 @@ class RouterBranch(Enum):
     NO_TRADE             = "NO_TRADE"
 
 
+def _blocks_overnight_for_branch(branch: RouterBranch) -> bool:
+    """Return whether the branch blocks single-stock MR / overnight ETF.
+
+    Looks up the ETF_SL_TP config mapping. Defaults to True (conservative) if
+    config is unavailable or branch is unknown. NO_TRADE never blocks.
+    """
+    if branch == RouterBranch.NO_TRADE:
+        return False
+    try:
+        from bot import config
+        sltp = getattr(config, "ETF_SL_TP", {})
+        mapping = sltp.get(branch.value, {})
+        return bool(mapping.get("blocks_overnight_etf", True))
+    except Exception:
+        return True
+
+
 @dataclass
 class ETFTapeSnapshot:
     """Price tracking for one ETF from 9:30 open onwards."""
@@ -113,10 +130,15 @@ class RouterDecision:
     decision_time: Optional[datetime] = None
     market_state: Optional[MarketTape] = None
     conditions_met: Dict[str, Any] = field(default_factory=dict)
+    blocks_overnight_etf: Optional[bool] = None
+
+    def __post_init__(self):
+        if self.blocks_overnight_etf is None:
+            self.blocks_overnight_etf = _blocks_overnight_for_branch(self.branch)
 
     def mr_blocked(self) -> bool:
-        """Intraday ETF trade blocks overnight ETF strategies AND single-stock MR."""
-        return self.branch != RouterBranch.NO_TRADE
+        """True if this decision blocks single-stock MR / overnight ETF strategies."""
+        return bool(self.blocks_overnight_etf)
 
     def to_dict(self) -> dict:
         return {
@@ -125,6 +147,7 @@ class RouterDecision:
             "entry_time": self.entry_time.isoformat() if self.entry_time else None,
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
             "decision_time": self.decision_time.isoformat() if self.decision_time else None,
+            "blocks_overnight_etf": self.blocks_overnight_etf,
             "mr_blocked": self.mr_blocked(),
             "conditions_met": self.conditions_met,
         }

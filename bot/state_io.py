@@ -199,6 +199,7 @@ def save_state(bot) -> None:
             "router_traded_today": bot.router_traded_today,
             "router_branch": bot.router_branch,
             "mr_blocked_today": bot.mr_blocked_today,
+            "router_realized_exits": getattr(bot, "router_realized_exits", []),
             "etf_positions": getattr(bot, "etf_positions", {}),  # dict keyed by branch value
             "startup_done": bot.startup_done,
             "tape_initialized": bot.tape_initialized,
@@ -207,6 +208,7 @@ def save_state(bot) -> None:
             "intraday_etf_sleeve_filled": getattr(bot, "intraday_etf_sleeve_filled", False),
             "router_decision_1010_made": getattr(bot, "router_decision_1010_made", False),
             "router_signal_fired_today": getattr(bot, "router_signal_fired_today", False),
+            "router_signals_fired": getattr(bot, "router_signals_fired", []),
             # Overnight ETF sleeve state
             "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
             "overnight_etf_position": getattr(bot, "overnight_etf_position", None),
@@ -215,6 +217,8 @@ def save_state(bot) -> None:
             # Intraday MR sleeve state
             "intraday_mr_universe_built": getattr(bot, "intraday_mr_universe_built", False),
             "intraday_mr_watchlist_built": getattr(bot, "intraday_mr_watchlist_built", False),
+            "intraday_mr_build_terminal": getattr(bot, "intraday_mr_build_terminal", False),
+            "intraday_mr_decision_artifact_written": getattr(bot, "intraday_mr_decision_artifact_written", False),
             "intraday_mr_router_exit_checked": getattr(bot, "intraday_mr_router_exit_checked", False),
             "intraday_mr_router_action": getattr(bot, "intraday_mr_router_action", None),
             "intraday_mr_positions": getattr(bot, "intraday_mr_positions", {}),
@@ -245,6 +249,7 @@ def load_state(bot) -> None:
         bot.router_traded_today = False
         bot.router_branch = None
         bot.mr_blocked_today = False
+        bot.router_realized_exits = []
         bot.etf_positions = {}
         bot.startup_done = False
         bot.tape_initialized = False
@@ -253,6 +258,7 @@ def load_state(bot) -> None:
         bot.intraday_etf_sleeve_filled = False
         bot.router_decision_1010_made = False
         bot.router_signal_fired_today = False
+        bot.router_signals_fired = []
         # Overnight ETF sleeve state
         bot.overnight_etf_fired = False
         bot.overnight_etf_position = None
@@ -262,6 +268,8 @@ def load_state(bot) -> None:
         bot.morning_liquidation_confirmed   = False
         bot.intraday_mr_universe_built      = False
         bot.intraday_mr_watchlist_built     = False
+        bot.intraday_mr_build_terminal      = False
+        bot.intraday_mr_decision_artifact_written = False
         bot.intraday_mr_router_exit_checked = False
         bot.intraday_mr_router_action       = None
         bot.intraday_mr_positions           = {}
@@ -306,6 +314,7 @@ def load_state(bot) -> None:
     bot.router_traded_today = bot_state.get("router_traded_today", False)
     bot.router_branch = bot_state.get("router_branch", None)
     bot.mr_blocked_today = bot_state.get("mr_blocked_today", False)
+    bot.router_realized_exits = bot_state.get("router_realized_exits", [])
     raw_etf_positions = bot_state.get("etf_positions") or {}
     if isinstance(raw_etf_positions, dict):
         bot.etf_positions = {
@@ -322,6 +331,7 @@ def load_state(bot) -> None:
     bot.intraday_etf_sleeve_filled = bot_state.get("intraday_etf_sleeve_filled", False)
     bot.router_decision_1010_made = bot_state.get("router_decision_1010_made", False)
     bot.router_signal_fired_today = bot_state.get("router_signal_fired_today", False)
+    bot.router_signals_fired = bot_state.get("router_signals_fired", [])
     # Overnight ETF sleeve state
     bot.overnight_etf_fired = bot_state.get("overnight_etf_fired", False)
     bot.overnight_etf_position = bot_state.get("overnight_etf_position", None)
@@ -331,6 +341,8 @@ def load_state(bot) -> None:
     # Intraday MR sleeve state
     bot.intraday_mr_universe_built        = bot_state.get("intraday_mr_universe_built", False)
     bot.intraday_mr_watchlist_built       = bot_state.get("intraday_mr_watchlist_built", False)
+    bot.intraday_mr_build_terminal        = bot_state.get("intraday_mr_build_terminal", False)
+    bot.intraday_mr_decision_artifact_written = bot_state.get("intraday_mr_decision_artifact_written", False)
     bot.intraday_mr_router_exit_checked   = bot_state.get("intraday_mr_router_exit_checked", False)
     bot.intraday_mr_router_action         = bot_state.get("intraday_mr_router_action", None)
     bot.intraday_mr_positions             = bot_state.get("intraday_mr_positions", {})
@@ -366,10 +378,14 @@ def _mr_candidate_dict(c) -> Dict[str, Any]:
         "selection_score": round(c.selection_score, 4),
         "signal_price": round(c.signal_price, 4),
         "day_return": round(c.day_return, 4),
-        "volume_ratio": round(c.volume_ratio, 2),
+        "volume_ratio": round(c.volume_ratio, 2) if c.volume_ratio_available else None,
+        "volume_ratio_available": c.volume_ratio_available,
         "close_position": round(c.close_position, 3),
-        "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
+        "late_drop_1530_1550": round(c.late_drop_1530_1550, 4) if c.late_drop_available else None,
+        "late_drop_available": c.late_drop_available,
         "adv_dollars": round(c.adv_dollars, 0),
+        "adv_multiplier": float(getattr(c, "adv_multiplier", 1.0)),
+        "adv_source": getattr(c, "adv_source", "unknown"),
     }
 
 

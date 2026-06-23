@@ -542,13 +542,23 @@ def convert_live_to_existing_mr_candidate(c: LiveMRCandidate):
         volume_930_to_signal=int(c.volume_today or 0),
         adv_20d=c.adv_dollars,      # proxy ADV from previous-day Massive dollar volume
         adv_dollars=c.adv_dollars,  # do NOT multiply by 50 when source is Massive
+        adv_multiplier=1.0,
+        adv_source="massive_grouped_daily",
         day_return=c.day_return,
-        volume_ratio=1.0,  # placeholder unless you compute today's vol / ADV
+        volume_ratio=0.0,
+        volume_ratio_available=False,  # not available in free live snapshot scan
         close_position=c.close_position,
         late_drop_1530_1550=0.0,
+        late_drop_available=False,  # not available in free live snapshot scan
         selection_score=c.selection_score,
+        prior_ret=c.prior_ret,
     )
 
-    # Preserve prior_ret for audit/diagnostics (may not be in original dataclass)
-    result.prior_ret = c.prior_ret
+    # Determine prior-day filter status from config bounds
+    if c.prior_ret is not None:
+        prior_min = float(getattr(config, "MR_FREE_PRIOR_RET_MIN", -0.20))
+        prior_max = float(getattr(config, "MR_FREE_PRIOR_RET_MAX", 0.05))
+        result.prior_ret_filter_passed = bool(prior_min <= c.prior_ret <= prior_max)
+    else:
+        result.prior_ret_filter_passed = None
     return result

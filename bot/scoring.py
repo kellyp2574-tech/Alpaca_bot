@@ -111,6 +111,9 @@ def step_score_and_rank(bot) -> None:
         bot._save_state()
 
         # Audit logging for debugging
+        prior_ret_min = float(getattr(config, "MR_FREE_PRIOR_RET_MIN", -0.20))
+        prior_ret_max = float(getattr(config, "MR_FREE_PRIOR_RET_MAX", 0.05))
+
         def _free_mr_dict(c):
             return {
                 "symbol": c.symbol,
@@ -118,17 +121,24 @@ def step_score_and_rank(bot) -> None:
                 "selection_score": round(c.selection_score, 4),
                 "signal_price": round(c.signal_price, 4),
                 "day_return": round(c.day_return, 4),
-                "volume_ratio": round(c.volume_ratio, 2),
+                "volume_ratio": round(c.volume_ratio, 2) if c.volume_ratio_available else None,
+                "volume_ratio_available": c.volume_ratio_available,
                 "close_position": round(c.close_position, 3),
-                "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
+                "late_drop_1530_1550": round(c.late_drop_1530_1550, 4) if c.late_drop_available else None,
+                "late_drop_available": c.late_drop_available,
                 "adv_dollars": round(c.adv_dollars, 0),
+                "adv_multiplier": float(getattr(c, "adv_multiplier", 1.0)),
+                "adv_source": getattr(c, "adv_source", "unknown"),
                 "prior_ret": round(c.prior_ret, 4) if c.prior_ret is not None else None,
+                "prior_ret_filter_passed": c.prior_ret_filter_passed,
+                "prior_ret_filter_bounds": [prior_ret_min, prior_ret_max],
                 "source": "massive_prevday_plus_alpaca_snapshot",
             }
 
         audit_dicts = {
             "mr_selected": [_free_mr_dict(c) for c in bot.mr_candidates[:getattr(config, "MR_MAX_PRIMARY_POSITIONS", 3)]],
             "mr_all_passed": [_free_mr_dict(c) for c in bot.mr_candidates],
+            "prior_ret_filter_bounds": {"min": prior_ret_min, "max": prior_ret_max},
         }
         save_candidates_audit(audit_dicts)
 
@@ -292,6 +302,7 @@ def step_score_and_rank(bot) -> None:
             raw_adv = float(getattr(c, "adv_dollars", 0.0) or 0.0)
             adv_multiplier = float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0) or 1.0)
             adjusted_adv = raw_adv * adv_multiplier
+            prior_ret = getattr(c, "prior_ret", None)
 
             return {
                 "symbol": c.symbol,
@@ -300,16 +311,25 @@ def step_score_and_rank(bot) -> None:
                 "signal_price": round(c.signal_price, 4),
                 "day_return": round(c.day_return, 4),
                 "volume_ratio": round(c.volume_ratio, 2),
+                "volume_ratio_available": c.volume_ratio_available,
                 "close_position": round(c.close_position, 3),
                 "late_drop_1530_1550": round(c.late_drop_1530_1550, 4),
+                "late_drop_available": c.late_drop_available,
                 "adv_dollars_raw": round(raw_adv, 0),
                 "adv_multiplier": adv_multiplier,
+                "adv_source": getattr(c, "adv_source", "unknown"),
                 "adv_dollars_adjusted": round(adjusted_adv, 0),
+                "prior_ret": round(prior_ret, 4) if prior_ret is not None else None,
+                "prior_ret_filter_passed": getattr(c, "prior_ret_filter_passed", None),
             }
 
         audit_dicts = {
             "mr_selected": [_mr_dict(c) for c in bot.mr_candidates[:config.MR_MAX_PRIMARY_POSITIONS]],
             "mr_all_passed": [_mr_dict(c) for c in bot.mr_candidates],
+            "prior_ret_filter_bounds": {
+                "min": float(getattr(config, "MR_FREE_PRIOR_RET_MIN", -0.20)),
+                "max": float(getattr(config, "MR_FREE_PRIOR_RET_MAX", 0.05)),
+            } if getattr(config, "USE_FREE_MR_PIPELINE", False) else None,
         }
         save_candidates_audit(audit_dicts)
 

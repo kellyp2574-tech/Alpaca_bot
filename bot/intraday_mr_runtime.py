@@ -36,7 +36,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date as dt_date
+from datetime import datetime, date as dt_date, timedelta
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
@@ -82,6 +82,10 @@ def build_intraday_mr_universe(bot) -> None:
         universe = _build_universe_from_massive(bot)
         if not universe:
             logger.warning("Intraday MR Stage 1: empty universe from Massive — will retry")
+            if _stage2_past_deadline():
+                _save_intraday_mr_decision_artifact(
+                    bot, decision="stage1_universe_empty", reason="Massive watchlist returned zero symbols"
+                )
             return
 
         for sym in _REGIME_SYMBOLS:
@@ -103,6 +107,14 @@ def build_intraday_mr_universe(bot) -> None:
                 "prev_volume": float(t1.get("v") or t1.get("volume") or 0),
             }
 
+        if not symbol_cache:
+            logger.warning("Intraday MR Stage 1: no symbols with valid T-1/T-2 bars — will retry")
+            if _stage2_past_deadline():
+                _save_intraday_mr_decision_artifact(
+                    bot, decision="stage1_daily_data_incomplete", reason="No valid T-1/T-2 bars"
+                )
+            return
+
         bot.intraday_mr_symbol_cache = symbol_cache
         bot.intraday_mr_universe_list = universe
         bot.intraday_mr_universe_built = True
@@ -113,6 +125,9 @@ def build_intraday_mr_universe(bot) -> None:
         bot._save_state()
     except Exception as e:
         logger.error(f"Intraday MR Stage 1 error: {e}", exc_info=True)
+        _save_intraday_mr_decision_artifact(
+            bot, decision="stage1_error", reason="classifier_error", extra_meta={"error": str(e)}
+        )
 
 
 def _select_t1_t2_bars(bars: List[dict], today_str: str):
@@ -137,6 +152,23 @@ def _select_t1_t2_bars(bars: List[dict], today_str: str):
 
 _STAGE2_MIN_OPEN_RATIO = 0.50  # at least 50% of universe must have valid opens
 _STAGE2_EARLIEST_SECONDS = 10  # do not run before 09:30:10
+_STAGE2_DEADLINE_SECONDS_AFTER_OPEN = 90  # final attempt at 09:31:30
+
+
+def _stage2_past_deadline() -> bool:
+    now = datetime.now(_ET)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    deadline = market_open + timedelta(seconds=_STAGE2_DEADLINE_SECONDS_AFTER_OPEN)
+    return now >= deadline
+
+
+def _stage2_failure(bot, reason: str, extra_meta: Optional[Dict] = None) -> None:
+    """Log the failure reason and write a final decision artifact if past deadline."""
+    bot.intraday_mr_stage2_failure_reason = reason
+    if _stage2_past_deadline() and not getattr(bot, "intraday_mr_watchlist_built", False):
+        _save_intraday_mr_decision_artifact(
+            bot, decision="stage2_incomplete", reason=reason, extra_meta=extra_meta
+        )
 
 
 def build_intraday_mr_finalize(bot) -> None:
@@ -151,11 +183,13 @@ def build_intraday_mr_finalize(bot) -> None:
     If any requirement fails, returns without marking complete so the loop retries.
     """
     if not getattr(config, "INTRADAY_MR_ENABLED", False):
+        _save_intraday_mr_decision_artifact(bot, decision="disabled", reason="INTRADAY_MR_ENABLED=False")
         return
     if getattr(bot, "intraday_mr_watchlist_built", False):
         return
     if not getattr(bot, "intraday_mr_universe_built", False):
         logger.warning("Intraday MR Stage 2: Stage 1 not complete — skipping")
+        _stage2_failure(bot, "stage1_not_complete")
         return
 
     # ── Early-time guard: ensure official opens are actually populated ────────
@@ -172,6 +206,7 @@ def build_intraday_mr_finalize(bot) -> None:
         # We cannot distinguish stale from error here without changing the API further,
         # so we simply retry (watchlist_built stays False) and let the 09:30-09:31
         # retry window sort it out. If still None at 09:31+, caller loop stops trying.
+        _stage2_failure(bot, "vix_unavailable")
         return
     vix_open, vix_bar_date = vix_result
     bot.intraday_mr_vix_open = vix_open
@@ -198,6 +233,7 @@ def build_intraday_mr_finalize(bot) -> None:
                 f"Intraday MR Stage 2: SPY open={spy_open}, QQQ open={qqq_open} — "
                 f"official opens not yet available, retrying"
             )
+            _stage2_failure(bot, "spy_qqq_open_unavailable")
             return
 
         # ── Build enriched dict; only use official dailyBar.open (no last_price fallback) ──
@@ -240,6 +276,14 @@ def build_intraday_mr_finalize(bot) -> None:
                 f"symbols have official opens — below {_STAGE2_MIN_OPEN_RATIO:.0%} threshold, "
                 f"retrying (missing e.g.: {missing_open_syms[:5]})"
             )
+            _stage2_failure(
+                bot, "insufficient_open_coverage",
+                extra_meta={
+                    "open_ratio": round(open_ratio, 3),
+                    "symbols_with_open": n_with_open,
+                    "symbols_missing_open": n_missing_open,
+                }
+            )
             return
 
         enriched["_vix_open"] = float(vix_open)
@@ -250,6 +294,10 @@ def build_intraday_mr_finalize(bot) -> None:
         bot.intraday_mr_watchlist_built = True
         bot._save_state()
 
+        decision = (
+            "no_candidates" if not candidates
+            else f"{len(candidates)} candidates"
+        )
         _save_intraday_mr_artifact(
             bot, candidates,
             meta={
@@ -263,14 +311,20 @@ def build_intraday_mr_finalize(bot) -> None:
                 "spy_open": spy_open,
                 "qqq_open": qqq_open,
                 "stage2_time": now.strftime("%H:%M:%S"),
+                "decision": decision,
             }
         )
         logger.info(
             f"Intraday MR Stage 2 done: {len(candidates)} candidates, "
-            f"VIX={vix_open:.2f}, opens={n_with_open}/{n_universe}"
+            f"VIX={vix_open:.2f}, opens={n_with_open}/{n_universe} "
+            f"(decision={decision})"
         )
     except Exception as e:
         logger.error(f"Intraday MR Stage 2 error: {e}", exc_info=True)
+        _save_intraday_mr_decision_artifact(
+            bot, decision="stage2_incomplete", reason="classifier_error",
+            extra_meta={"error": str(e)}
+        )
 
 
 def _build_universe_from_massive(bot) -> List[str]:
@@ -309,6 +363,9 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
 
     candidates: List[IntradayMRCandidate] = getattr(bot, "intraday_mr_candidates", [])
     if not candidates:
+        if not getattr(bot, "_intraday_mr_no_candidates_logged", False):
+            logger.info("Intraday MR entry: NO CANDIDATES — nothing to submit")
+            bot._intraday_mr_no_candidates_logged = True
         return
 
     if not hasattr(bot, "intraday_mr_positions"):
@@ -373,6 +430,12 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
         due.append(cand)
 
     if not due:
+        if not getattr(bot, "_intraday_mr_no_due_logged", False):
+            logger.info(
+                f"Intraday MR entry: no candidates due at {current_time.strftime('%H:%M:%S')} "
+                f"({len(candidates)} total candidates, none ready for this minute)"
+            )
+            bot._intraday_mr_no_due_logged = True
         return
 
     # Submit all due candidates CONCURRENTLY via a thread pool.
@@ -1176,7 +1239,7 @@ def _save_intraday_mr_artifact(bot, candidates: list, meta: Optional[Dict] = Non
                     "theme":         c.theme,
                     "sleeve":        c.sleeve_name,
                     "regime":        c.regime,
-                    "prior_ret":     round(c.prior_ret, 4),
+                    "prior_ret":     round(c.prior_ret, 4) if c.prior_ret is not None else None,
                     "pm_ret":        round(c.pm_ret, 4),
                     "severity_score":round(c.severity_score, 4),
                     "signal_price":  round(c.signal_price, 4),
@@ -1192,5 +1255,46 @@ def _save_intraday_mr_artifact(bot, candidates: list, meta: Optional[Dict] = Non
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         logger.info(f"Intraday MR artifact saved: {path}")
+        bot.intraday_mr_decision_artifact_written = True
+        bot._save_state()
     except Exception as e:
         logger.warning(f"Intraday MR artifact save failed: {e}")
+
+
+def _save_intraday_mr_decision_artifact(bot, decision: str, reason: str,
+                                        extra_meta: Optional[Dict] = None) -> None:
+    """Write a final decision artifact for non-success paths (disabled, incomplete, etc.).
+
+    Guarded by intraday_mr_decision_artifact_written so it is only written once.
+    Also marks the morning build as terminal so the orchestrator stops retrying.
+    """
+    if getattr(bot, "intraday_mr_decision_artifact_written", False):
+        return
+    try:
+        log_dir = getattr(config, "LOG_DIR", "logs")
+        today = datetime.now(_ET).strftime("%Y-%m-%d")
+        path = os.path.join(log_dir, f"intraday_mr_{today}.json")
+        meta = {
+            "decision": decision,
+            "reason": reason,
+            "stage1_complete": getattr(bot, "intraday_mr_universe_built", False),
+            "stage2_complete": getattr(bot, "intraday_mr_watchlist_built", False),
+            "decision_time": datetime.now(_ET).strftime("%H:%M:%S"),
+        }
+        if extra_meta:
+            meta.update(extra_meta)
+        data = {
+            "date": today,
+            "meta": meta,
+            "candidate_count": 0,
+            "candidates": [],
+        }
+        os.makedirs(log_dir, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Intraday MR decision artifact saved: {path} ({decision}: {reason})")
+        bot.intraday_mr_decision_artifact_written = True
+        bot.intraday_mr_build_terminal = True
+        bot._save_state()
+    except Exception as e:
+        logger.warning(f"Intraday MR decision artifact save failed: {e}")

@@ -146,6 +146,7 @@ class CombinedOvernightReboundBot:
         self.router_traded_today = False
         self.router_branch: Optional[str] = None
         self.mr_blocked_today = False
+        self.router_realized_exits: List[Dict[str, Any]] = []  # actual exit records for artifact
         self.etf_positions: Dict[str, Any] = {}  # keyed by branch value, e.g. {"MOMENTUM_SLEEVE": {...}}
         self.etf_opens_930: Dict[str, float] = {}
         self.tape_recording_active = False
@@ -155,6 +156,7 @@ class CombinedOvernightReboundBot:
         self.intraday_etf_sleeve_filled = False
         self.router_decision_1010_made = False  # 10:10 check done flag
         self.router_signal_fired_today = False  # True when router produced ANY qualifying signal
+        self.router_signals_fired: List[Dict[str, Any]] = []  # all fired signals (filled or unfilled)
 
         # Morning liquidation latch — set once when broker confirms zero positions.
         # Persisted so a restart mid-session does not re-allow entries without proof.
@@ -167,6 +169,8 @@ class CombinedOvernightReboundBot:
         self.intraday_mr_pending_orders: Dict[str, Any] = {}  # awaiting fill confirmation
         self.intraday_mr_watchlist_built = False         # Stage 2 complete
         self.intraday_mr_universe_built = False          # Stage 1 complete
+        self.intraday_mr_build_terminal = False          # True once a terminal failure is recorded
+        self.intraday_mr_decision_artifact_written = False  # failure/no-decision artifact
         self.intraday_mr_router_exit_checked = False
         self.intraday_mr_router_action: Optional[str] = None  # latched at 10:00
         self.intraday_mr_realloc_done = False  # router budget realloc to MR (one-shot at 10:10)
@@ -250,7 +254,7 @@ class CombinedOvernightReboundBot:
 
     def _validate_config(self):
         """Fail fast on config combinations that contradict the researched setup."""
-        # Live MR sleeve: 3 positions x 30% per position = 90% total max.
+        # Live MR sleeve: 3 positions x 30% per position; base sleeve 60%, combined 90%.
         per_pos = float(getattr(config, "MR_ALLOC_PER_POSITION_PCT", 0.0))
         total = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.0))
         max_pos = int(getattr(config, "MR_MAX_PRIMARY_POSITIONS", 0))
@@ -550,12 +554,14 @@ class CombinedOvernightReboundBot:
                 t_mr_flatten = _parse_config_time(getattr(config, "INTRADAY_MR_HARD_FLATTEN_TIME", "15:40"))
 
                 # 09:00 — Stage 1: build universe + T-1/T-2 bar cache
-                if (not self.intraday_mr_universe_built
+                if (not self.intraday_mr_build_terminal
+                        and not self.intraday_mr_universe_built
                         and current_time >= t_mr_stage1):
                     self._build_intraday_mr_universe()
 
                 # 09:30:05 — Stage 2: fetch official opens, get VIX, finalize candidates
-                if (self.intraday_mr_universe_built
+                if (not self.intraday_mr_build_terminal
+                        and self.intraday_mr_universe_built
                         and not self.intraday_mr_watchlist_built
                         and current_time >= t_mr_stage2):
                     self._build_intraday_mr_finalize()
