@@ -125,9 +125,10 @@ def build_intraday_mr_universe(bot) -> None:
         bot._save_state()
     except Exception as e:
         logger.error(f"Intraday MR Stage 1 error: {e}", exc_info=True)
-        _save_intraday_mr_decision_artifact(
-            bot, decision="stage1_error", reason="classifier_error", extra_meta={"error": str(e)}
-        )
+        if _stage2_past_deadline():
+            _save_intraday_mr_decision_artifact(
+                bot, decision="stage1_error", reason="stage1_exception", extra_meta={"error": str(e)}
+            )
 
 
 def _select_t1_t2_bars(bars: List[dict], today_str: str):
@@ -221,6 +222,7 @@ def build_intraday_mr_finalize(bot) -> None:
         snapshots = bot.alpaca.get_snapshots(universe, feed=feed)
         if not snapshots:
             logger.warning("Intraday MR Stage 2: empty snapshots — will retry")
+            _stage2_failure(bot, "empty_snapshots")
             return
 
         # ── Validate SPY/QQQ official opens (required for regime gaps) ────────
@@ -321,9 +323,10 @@ def build_intraday_mr_finalize(bot) -> None:
         )
     except Exception as e:
         logger.error(f"Intraday MR Stage 2 error: {e}", exc_info=True)
-        _save_intraday_mr_decision_artifact(
-            bot, decision="stage2_incomplete", reason="classifier_error",
-            extra_meta={"error": str(e)}
+        _stage2_failure(
+            bot,
+            "classifier_error",
+            extra_meta={"error": str(e)},
         )
 
 

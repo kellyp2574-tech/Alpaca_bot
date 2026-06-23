@@ -353,11 +353,18 @@ def load_state(bot) -> None:
     bot.intraday_mr_vix_open              = bot_state.get("intraday_mr_vix_open", None)
     bot.intraday_mr_candidates            = _deserialise_candidates(bot_state.get("intraday_mr_candidates", []))
     bot.intraday_mr_realloc_done          = bot_state.get("intraday_mr_realloc_done", False)
-    # Safety: if watchlist flag is set but candidates list is empty, force rebuild
-    if bot.intraday_mr_watchlist_built and not bot.intraday_mr_candidates:
+    # Safety: if watchlist flag is set but candidates list is empty and no terminal
+    # decision artifact exists, assume the state was corrupted and force Stage 2 rebuild.
+    # A legitimate no-candidate day writes the decision artifact, so the guard will not
+    # reset it.
+    if (
+        bot.intraday_mr_watchlist_built
+        and not bot.intraday_mr_candidates
+        and not bot.intraday_mr_decision_artifact_written
+    ):
         logger.warning(
-            "Intraday MR: watchlist_built=True but candidates empty after restore — "
-            "resetting to force Stage 2 rebuild"
+            "Intraday MR: watchlist_built=True but candidates empty after restore and "
+            "no decision artifact — resetting to force Stage 2 rebuild"
         )
         bot.intraday_mr_watchlist_built = False
 
