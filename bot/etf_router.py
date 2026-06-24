@@ -38,11 +38,7 @@ class RouterBranch(Enum):
 
 
 def _blocks_overnight_for_branch(branch: RouterBranch) -> bool:
-    """Return whether the branch blocks single-stock MR / overnight ETF.
-
-    Looks up the ETF_SL_TP config mapping. Defaults to True (conservative) if
-    config is unavailable or branch is unknown. NO_TRADE never blocks.
-    """
+    """Return whether the branch blocks the 15:45 overnight ETF sleeve."""
     if branch == RouterBranch.NO_TRADE:
         return False
     try:
@@ -52,6 +48,35 @@ def _blocks_overnight_for_branch(branch: RouterBranch) -> bool:
         return bool(mapping.get("blocks_overnight_etf", True))
     except Exception:
         return True
+
+
+def _blocks_single_stock_mr_for_branch(branch: RouterBranch) -> bool:
+    """Return whether the branch blocks the 15:45 single-stock overnight MR sleeve.
+
+    Fails OPEN (returns False) on any config error or missing key, preserving the
+    declared independence of single-stock MR from intraday ETF router decisions.
+    """
+    if branch == RouterBranch.NO_TRADE:
+        return False
+    try:
+        from bot import config
+        sltp = getattr(config, "ETF_SL_TP", {})
+        mapping = sltp.get(branch.value, {})
+        if "blocks_single_stock_mr" not in mapping:
+            logger.error(
+                "Missing blocks_single_stock_mr config for %s; "
+                "defaulting to False to preserve independent single-stock MR",
+                branch.value,
+            )
+            return False
+        return bool(mapping["blocks_single_stock_mr"])
+    except Exception:
+        logger.exception(
+            "Could not resolve blocks_single_stock_mr for %s; "
+            "defaulting to False to preserve independent single-stock MR",
+            branch.value,
+        )
+        return False
 
 
 @dataclass
@@ -131,14 +156,17 @@ class RouterDecision:
     market_state: Optional[MarketTape] = None
     conditions_met: Dict[str, Any] = field(default_factory=dict)
     blocks_overnight_etf: Optional[bool] = None
+    blocks_single_stock_mr: Optional[bool] = None
 
     def __post_init__(self):
         if self.blocks_overnight_etf is None:
             self.blocks_overnight_etf = _blocks_overnight_for_branch(self.branch)
+        if self.blocks_single_stock_mr is None:
+            self.blocks_single_stock_mr = _blocks_single_stock_mr_for_branch(self.branch)
 
     def mr_blocked(self) -> bool:
-        """True if this decision blocks single-stock MR / overnight ETF strategies."""
-        return bool(self.blocks_overnight_etf)
+        """True if this decision blocks the 15:45 single-stock overnight MR sleeve."""
+        return bool(self.blocks_single_stock_mr)
 
     def to_dict(self) -> dict:
         return {
@@ -148,6 +176,7 @@ class RouterDecision:
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
             "decision_time": self.decision_time.isoformat() if self.decision_time else None,
             "blocks_overnight_etf": self.blocks_overnight_etf,
+            "blocks_single_stock_mr": self.blocks_single_stock_mr,
             "mr_blocked": self.mr_blocked(),
             "conditions_met": self.conditions_met,
         }
@@ -409,7 +438,11 @@ def _parse_hhmm(value: str) -> time:
 
 
 def parse_router_decision_from_dict(data: dict) -> Optional[RouterDecision]:
-    """Rehydrate RouterDecision from persisted state."""
+    """Rehydrate RouterDecision from persisted state.
+
+    Restores the exact blocking flags that were in effect when the trade was made,
+    so a same-day restart with a different config cannot reinterpret the decision.
+    """
     if not data:
         return None
     try:
@@ -421,6 +454,8 @@ def parse_router_decision_from_dict(data: dict) -> Optional[RouterDecision]:
             exit_time=datetime.strptime(data["exit_time"], "%H:%M:%S").time() if data.get("exit_time") else None,
             decision_time=datetime.fromisoformat(data["decision_time"]) if data.get("decision_time") else None,
             conditions_met=data.get("conditions_met", {}),
+            blocks_overnight_etf=data.get("blocks_overnight_etf"),
+            blocks_single_stock_mr=data.get("blocks_single_stock_mr"),
         )
     except Exception as e:
         logger.error(f"Failed to parse router decision from state: {e}")

@@ -75,6 +75,15 @@ def build_intraday_mr_universe(bot) -> None:
         return
     if getattr(bot, "intraday_mr_universe_built", False):
         return
+    if getattr(bot, "intraday_mr_build_terminal", False):
+        return
+
+    # Throttle retries so a transient failure does not flood APIs every loop tick.
+    now_mono = time.monotonic()
+    last_attempt = getattr(bot, "_intraday_mr_last_stage1_attempt", 0)
+    if now_mono - last_attempt < 10:
+        return
+    bot._intraday_mr_last_stage1_attempt = now_mono
 
     logger.info("Intraday MR Stage 1: building universe and daily bar cache")
     try:
@@ -188,10 +197,19 @@ def build_intraday_mr_finalize(bot) -> None:
         return
     if getattr(bot, "intraday_mr_watchlist_built", False):
         return
+    if getattr(bot, "intraday_mr_build_terminal", False):
+        return
     if not getattr(bot, "intraday_mr_universe_built", False):
         logger.warning("Intraday MR Stage 2: Stage 1 not complete — skipping")
         _stage2_failure(bot, "stage1_not_complete")
         return
+
+    # Throttle retries so transient failures do not flood the snapshot API.
+    now_mono = time.monotonic()
+    last_attempt = getattr(bot, "_intraday_mr_last_stage2_attempt", 0)
+    if now_mono - last_attempt < 10:
+        return
+    bot._intraday_mr_last_stage2_attempt = now_mono
 
     # ── Early-time guard: ensure official opens are actually populated ────────
     now = datetime.now(_ET)

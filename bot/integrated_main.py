@@ -177,6 +177,8 @@ class CombinedOvernightReboundBot:
         self.intraday_mr_universe_list: List[str] = []  # symbols from Stage 1
         self.intraday_mr_symbol_cache: Dict[str, Any] = {}  # T-1/T-2 bar cache
         self.intraday_mr_vix_open: Optional[float] = None   # actual VIX — set in Stage 1
+        self._intraday_mr_last_stage1_attempt: float = 0.0  # throttle retries
+        self._intraday_mr_last_stage2_attempt: float = 0.0  # throttle retries
 
         # Overnight ETF sleeve (precedence over single-stock MR)
         self.overnight_etf_fired = False        # True if an overnight ETF strategy fired
@@ -546,7 +548,12 @@ class CombinedOvernightReboundBot:
             if getattr(config, "INTRADAY_MR_ENABLED", False):
                 # Visibility: confirm MR sleeve is active (diagnoses silent skips)
                 if not getattr(self, "_intraday_mr_logged_active", False):
-                    logger.info("Intraday MR sleeve: ENABLED — scheduling Stage 1/2 builds and entries")
+                    logger.info(
+                        "MORNING_MR_SCAN: ENABLED — scheduling Stage 1/2 builds and entries "
+                        f"(terminal={self.intraday_mr_build_terminal}, "
+                        f"universe_built={self.intraday_mr_universe_built}, "
+                        f"watchlist_built={self.intraday_mr_watchlist_built})"
+                    )
                     self._intraday_mr_logged_active = True
 
                 t_mr_stage1  = _parse_config_time(getattr(config, "INTRADAY_MR_STAGE1_TIME",    "09:00"))
@@ -615,6 +622,10 @@ class CombinedOvernightReboundBot:
                 # 15:40 — hard flatten any remaining intraday MR positions
                 if current_time >= t_mr_flatten:
                     self._flatten_all_intraday_mr_positions()
+            else:
+                if not getattr(self, "_intraday_mr_logged_disabled", False):
+                    logger.info("MORNING_MR_SCAN: DISABLED by INTRADAY_MR_ENABLED=False")
+                    self._intraday_mr_logged_disabled = True
 
             # ════════════════════════════════════════════
             # AFTERNOON: Score universe and enter new positions

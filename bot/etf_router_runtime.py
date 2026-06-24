@@ -281,12 +281,12 @@ def initialize_tape_recording(bot) -> None:
                         age_s = (now - lt_dt.astimezone(_ET)).total_seconds()
                     except (TypeError, ValueError):
                         age_s = 9999.0
-                    if 0 <= age_s <= 60:
+                    if -5 <= age_s <= 60:
                         open_price = float(lt_p)
                         source = f"last_price_fresh_{age_s:.0f}s"
                     else:
                         logger.warning(
-                            f"Tape init {symbol}: rejecting last_price — age={age_s:.0f}s (limit 60s)"
+                            f"Tape init {symbol}: rejecting last_price — age={age_s:.0f}s (limit 60s, allow -5s skew)"
                         )
 
             if open_price is not None and open_price > 0:
@@ -420,11 +420,17 @@ def make_router_decision(bot) -> None:
         bot.router_traded_today = True
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
-        # mr_blocked_today is True only if a decision that actually blocks MR/overnight ETF FILLED.
+        # mr_blocked_today is True only if a FILLED decision blocks the 15:45 single-stock MR sleeve.
         bot.mr_blocked_today = any(d.mr_blocked() for d in filled_decisions)
+        # overnight_etf_blocked_today is set inside execute_etf_entry when a blocking position fills.
+        block_summary = [
+            f"{d.branch.value}:etf={d.blocks_overnight_etf},mr={d.blocks_single_stock_mr}"
+            for d in filled_decisions
+        ]
         logger.info(
             f"Intraday sleeve filled: {filled} — "
             f"unfilled_signals={unfilled}, "
+            f"block_flags=[{'; '.join(block_summary)}], "
             f"mr_blocked_today={bot.mr_blocked_today}, "
             f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}"
         )
@@ -478,9 +484,14 @@ def make_router_decision_1010(bot) -> None:
         bot.intraday_etf_sleeve_filled = True
         bot.tape_recording_active = False
         bot.mr_blocked_today = any(d.mr_blocked() for d in filled_decisions)
+        block_summary = [
+            f"{d.branch.value}:etf={d.blocks_overnight_etf},mr={d.blocks_single_stock_mr}"
+            for d in filled_decisions
+        ]
         logger.info(
             f"Intraday sleeve filled (10:10): {filled} — "
             f"unfilled_signals={unfilled}, "
+            f"block_flags=[{'; '.join(block_summary)}], "
             f"mr_blocked_today={bot.mr_blocked_today}, "
             f"overnight_etf_blocked_today={bot.overnight_etf_blocked_today}"
         )

@@ -62,8 +62,8 @@ class UniverseDiagnostics:
             f"  -> {self.after_asset_type} after asset-type filter",
             f"  -> {self.after_price} after price filter",
             f"  -> {self.after_adv} after ADV filter",
-            f"  -> {self.after_data_quality} after data-quality filter",
-            f"  -> {self.after_tradability} after tradability filter (final)",
+            f"  -> {self.after_tradability} after broker tradability filter",
+            f"  -> {self.after_data_quality} after data-quality filter (final)",
         ]
         if self.dropped_by_reason:
             lines.append("  Rejections:")
@@ -515,8 +515,8 @@ def save_universe_audit(
         "after_asset_type": diag.after_asset_type,
         "after_price": diag.after_price,
         "after_adv": diag.after_adv,
-        "after_data_quality": diag.after_data_quality,
         "after_tradability": diag.after_tradability,
+        "after_data_quality": diag.after_data_quality,
         "final_count": len(final_symbols),
         "dropped_by_reason": diag.dropped_by_reason,
         "rejection_samples": diag.rejection_samples,
@@ -561,8 +561,8 @@ def save_run_health(
             "after_asset_type": diag.after_asset_type,
             "after_price": diag.after_price,
             "after_adv": diag.after_adv,
-            "after_data_quality": diag.after_data_quality,
             "after_tradability": diag.after_tradability,
+            "after_data_quality": diag.after_data_quality,
             "dropped_by_reason": diag.dropped_by_reason,
             "rejection_samples": diag.rejection_samples,
         }

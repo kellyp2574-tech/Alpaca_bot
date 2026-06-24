@@ -280,6 +280,8 @@ def load_state(bot) -> None:
         bot.intraday_mr_symbol_cache        = {}
         bot.intraday_mr_vix_open            = None
         bot.intraday_mr_realloc_done        = False
+        bot._intraday_mr_last_stage1_attempt = 0
+        bot._intraday_mr_last_stage2_attempt = 0
         logger.info("ETF router state reset for new trading day")
         saved = bot.state_mgr.load_positions()
         if saved:
@@ -402,6 +404,15 @@ def save_end_of_day_reports(bot) -> None:
         stats = bot._exec_stats
         total_candidates = len(bot.mr_candidates)
 
+        # Selected = candidates that would have been entered (top N by config), regardless
+        # of whether execution was attempted or blocked. This makes blocked-but-selected
+        # days distinguishable from genuinely no-candidate days.
+        selected_count = min(
+            total_candidates,
+            int(getattr(config, "MR_MAX_PRIMARY_POSITIONS", 3)),
+        )
+
+        mr_blocked = bool(getattr(bot, "mr_blocked_today", False))
         extras: Dict[str, Any] = {
             "api_calls_total": get_api_call_count(),
             "submit_latency_ms": stats.get("submit_latency_ms"),
@@ -410,11 +421,19 @@ def save_end_of_day_reports(bot) -> None:
                 "reason": bot.kill_switch_reason,
             },
             "etf_router": bot._build_etf_router_summary(),
+            "overnight_mr": {
+                "candidates_passed": total_candidates,
+                "selected": selected_count,
+                "blocked": mr_blocked,
+                "block_reason": "intraday_router_branch" if mr_blocked else None,
+                "execution_attempted": bool(getattr(bot, "entries_done", False)),
+                "filled": stats.get("entries_filled", 0),
+            },
         }
         save_run_health(
             diag=bot._universe_diag,
             scored_count=total_candidates,
-            selected_count=stats.get("selected", 0),
+            selected_count=selected_count,
             orderable_count=stats.get("orderable", 0),
             filled_count=stats.get("entries_filled", 0),
             total_deployed=stats.get("total_deployed", 0.0),
