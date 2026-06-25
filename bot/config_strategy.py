@@ -64,10 +64,8 @@ INTRADAY_ETF_ALLOCATION_PCT = 1.00   # Maximum 100% of equity (was 0.50)
 # Buying power buffer for ETF entries (default 98% to leave room for price movement)
 ETF_ENTRY_BP_BUFFER_PCT = 0.98
 
-# Maximum spread and staleness for ETF execution gate
+# Maximum spread for ETF execution gate (also defined alongside slippage below)
 ETF_ENTRY_MAX_SPREAD_PCT = 0.005     # 0.5% max spread
-ETF_ENTRY_MAX_STALE_SECONDS = 60.0  # 60s max quote age (IEX latency tolerance)
-ETF_ENTRY_WARN_STALE_SECONDS = 30.0  # Warn if quote >30s old
 
 # ═══════════════════════════════════════════════════
 # Overnight Single-Stock MR Sizing (15:45 entry)
@@ -165,11 +163,11 @@ ENTRY_MAX_SLIPPAGE_PCT = 0.02          # Marketable-limit cap above ask for low-
 # ETF router 10:00 entry uses tighter caps (highly-liquid universe)
 ETF_ENTRY_MAX_SPREAD_PCT = 0.005
 ETF_ENTRY_MAX_SLIPPAGE_PCT = 0.005
-# Staleness threshold for intraday ETF entries (IEX can be 10-30s behind SIP).
-# A 12-second-old quote is normal — do not reject liquid ETFs on IEX latency.
-ETF_ENTRY_MAX_STALE_SECONDS = 60.0
+# Staleness threshold for intraday ETF entries (IEX can be 30-90s behind SIP).
+# Observed: SVIX quote 86s old at 10:10 was rejected at 60s — raised to 120s.
+ETF_ENTRY_MAX_STALE_SECONDS = 120.0
 # Log a warning when quote age exceeds this but still allow entry.
-ETF_ENTRY_WARN_STALE_SECONDS = 30.0
+ETF_ENTRY_WARN_STALE_SECONDS = 45.0
 
 # ═══════════════════════════════════════════════════
 # Overnight ETF positions are sold at 09:30 AM the next day

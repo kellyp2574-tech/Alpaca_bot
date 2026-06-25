@@ -256,6 +256,21 @@ class CombinedOvernightReboundBot:
 
     def _validate_config(self):
         """Fail fast on config combinations that contradict the researched setup."""
+        import os as _os, sys as _sys
+        logger.warning(
+            "STARTUP DIAGNOSTIC: cwd=%s python=%s main=%s config=%s",
+            _os.getcwd(), _sys.executable, __file__,
+            getattr(config, "__file__", "unknown"),
+        )
+        logger.warning(
+            "CONFIG DIAGNOSTIC: INTRADAY_MR_ENABLED=%r ETF_ROUTER_ENABLED=%r "
+            "MR_OVERNIGHT_ENABLED=%r OVERNIGHT_ETF_ENABLED=%r",
+            getattr(config, "INTRADAY_MR_ENABLED", "MISSING"),
+            getattr(config, "ETF_ROUTER_ENABLED", "MISSING"),
+            getattr(config, "MR_OVERNIGHT_ENABLED", "MISSING"),
+            getattr(config, "OVERNIGHT_ETF_ENABLED", "MISSING"),
+        )
+
         # Live MR sleeve: 3 positions x 30% per position; base sleeve 60%, combined 90%.
         per_pos = float(getattr(config, "MR_ALLOC_PER_POSITION_PCT", 0.0))
         total = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.0))
