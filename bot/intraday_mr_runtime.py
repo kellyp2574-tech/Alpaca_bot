@@ -218,18 +218,24 @@ def build_intraday_mr_finalize(bot) -> None:
         logger.debug(f"Intraday MR Stage 2: too early ({now.strftime('%H:%M:%S')} < 09:30:{_STAGE2_EARLIEST_SECONDS:02d}) — retry")
         return
 
-    # ── Fetch today's ^VIX open (date-validated; retries until today's bar available) ──
-    vix_result = bot.alpaca.get_vix_open()  # returns (float, bar_date) or None
-    if vix_result is None:
-        # get_vix_open already logged the reason; stale bar = retry, error = abort
-        # We cannot distinguish stale from error here without changing the API further,
-        # so we simply retry (watchlist_built stays False) and let the 09:30-09:31
-        # retry window sort it out. If still None at 09:31+, caller loop stops trying.
-        _stage2_failure(bot, "vix_unavailable")
-        return
-    vix_open, vix_bar_date = vix_result
-    bot.intraday_mr_vix_open = vix_open
-    logger.info(f"Intraday MR Stage 2: VIX open = {vix_open:.2f} (bar_date={vix_bar_date})")
+    # ── Fetch today's VIX value ───────────────────────────────────────────────
+    # Returns (float, source_label) or None. source_label is one of:
+    #   "alpaca_indices"  — new v1beta1/indices/latest/values endpoint (preferred)
+    #   "vixy_proxy"      — VIXY ETF snapshot used as degraded fallback
+    # On total failure: continue with vix_open=0.0 so Stage 2 is not blocked.
+    # vix_open=0.0 => classify_regime returns DEAD_ZONE; MR still runs (Theme D/UL).
+    vix_result = bot.alpaca.get_vix_open()  # returns (float, source) or None
+    if vix_result is not None:
+        vix_open, vix_source = vix_result
+        bot.intraday_mr_vix_open = vix_open
+        logger.info(f"Intraday MR Stage 2: VIX={vix_open:.2f} (source={vix_source})")
+    else:
+        vix_open   = 0.0
+        vix_source = "unavailable"
+        logger.warning(
+            "Intraday MR Stage 2: VIX unavailable from all sources — "
+            "continuing with vix_open=0.0 (regime=DEAD_ZONE)"
+        )
 
     logger.info("Intraday MR Stage 2: fetching official opens")
     try:
@@ -322,7 +328,7 @@ def build_intraday_mr_finalize(bot) -> None:
             bot, candidates,
             meta={
                 "vix_open": vix_open,
-                "vix_bar_date": vix_bar_date,
+                "vix_source": vix_source,
                 "universe_size": len(universe),
                 "symbols_with_t1t2": len(symbol_cache),
                 "symbols_with_open": n_with_open,

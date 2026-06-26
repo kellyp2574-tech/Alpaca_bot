@@ -77,11 +77,18 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format=LOG_FORMAT,
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
     ],
     force=True,
 )
+# Ensure the StreamHandler also uses UTF-8 on Windows (cp1252 breaks Unicode arrows)
+for _h in logging.getLogger().handlers:
+    if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+        try:
+            _h.stream = open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
+        except Exception:
+            pass
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")

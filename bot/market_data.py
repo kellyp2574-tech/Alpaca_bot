@@ -143,69 +143,62 @@ class AlpacaDataClient:
 
     def get_vix_open(self) -> Optional[tuple]:
         """
-        Fetch today's VIX opening value from the Alpaca indices endpoint (^VIX).
+        Fetch today's VIX value.  Returns ``(vix_value: float, source: str)`` on
+        success, or ``None`` if every source fails.
 
-        Returns ``(vix_open: float, bar_date: str)`` on success, ``None`` on failure.
-        The bar_date is validated to equal today's market date; stale bars return None
-        so the caller retries rather than using yesterday's regime value.
+        Source hierarchy:
+          1. Alpaca indices latest-values API  (v1beta1/indices/latest/values)
+             — added by Alpaca on 2026-06-03; returns current index value
+          2. VIXY ETF snapshot                 (degraded proxy; 'vixy_proxy')
+             — VIXY price is not VIX, but is correlated; caller logs 'degraded'
 
-        Called in Stage 2 (after 09:30) so today's bar should exist.
-        VIXY share price is NOT used as a fallback — it is not VIX.
+        Note: the old v1beta3/indices/bars endpoint with symbol='^VIX' was
+        removed/changed and returns non-200.
         """
+        today_str = date.today().isoformat()
+
+        # ── Source 1: new indices latest-values endpoint ──────────────────────
         try:
-            today_str = date.today().isoformat()
-            start_str = (date.today() - timedelta(days=5)).isoformat()
-            url = f"{self.data_url}/v1beta3/indices/bars"
-            params = {
-                "symbols": "^VIX",
-                "timeframe": "1Day",
-                "start": start_str,
-                "end": today_str,
-                "limit": 5,
-            }
+            url = "https://data.alpaca.markets/v1beta1/indices/latest/values"
+            params = {"index_symbols": "VIX"}
             resp = self.session.get(url, params=params, timeout=10)
-            if resp.status_code != 200:
-                logger.debug(f"^VIX index bar: HTTP {resp.status_code}")
-                logger.error(
-                    "Actual ^VIX open unavailable (indices endpoint non-200). "
-                    "Intraday MR will be skipped for today."
-                )
-                return None
-
-            data = resp.json()
-            bars = (data.get("bars") or {}).get("^VIX") or []
-            if not bars:
-                logger.error("^VIX index bar endpoint returned empty bars list.")
-                return None
-
-            latest = sorted(bars, key=lambda b: b.get("t", ""))[-1]
-            open_val = latest.get("o")
-            if open_val is None:
-                logger.error("^VIX latest bar has no open field.")
-                return None
-
-            # Validate bar belongs to today — if Alpaca hasn't published today's
-            # bar yet, the most recent bar is yesterday's; using it would apply the
-            # wrong regime value.  Stage 2 retries until this check passes.
-            bar_ts   = str(latest.get("t", ""))
-            bar_date = bar_ts[:10]  # "YYYY-MM-DD"
-            if bar_date != today_str:
-                logger.warning(
-                    f"^VIX latest bar is stale: bar_date={bar_date}, "
-                    f"expected={today_str}. Retrying next tick."
-                )
-                return None
-
-            logger.info(f"VIX open from ^VIX index bar: {open_val:.2f} ({bar_date})")
-            return (float(open_val), bar_date)
-
+            if resp.status_code == 200:
+                payload = resp.json()
+                values = payload.get("values") or {}
+                item = values.get("VIX") if isinstance(values, dict) else None
+                if item is None and isinstance(values, list):
+                    item = next((r for r in values if isinstance(r, dict)
+                                 and r.get("symbol", r.get("S")) == "VIX"), None)
+                if isinstance(item, dict):
+                    raw = item.get("value") or item.get("price") or item.get("v")
+                    if raw is not None:
+                        val = float(raw)
+                        ts  = item.get("timestamp") or item.get("time") or item.get("t") or today_str
+                        logger.info(f"VIX from indices/latest/values: {val:.2f} (ts={ts})")
+                        return (val, "alpaca_indices")
+                logger.warning(f"Alpaca indices/latest/values: VIX missing in payload: {payload!r}")
+            else:
+                logger.warning(f"Alpaca indices/latest/values: HTTP {resp.status_code}")
         except Exception as e:
-            logger.debug(f"^VIX index bar fetch failed: {e}")
-            logger.error(
-                "Actual ^VIX open unavailable (exception). "
-                "Intraday MR will be skipped for today."
-            )
-            return None
+            logger.warning(f"Alpaca indices/latest/values failed: {e}")
+
+        # ── Source 2: VIXY ETF snapshot as degraded proxy ────────────────────
+        try:
+            snaps = self.get_snapshots(["VIXY"])
+            vixy = snaps.get("VIXY", {})
+            price = vixy.get("last") or vixy.get("open")
+            if price:
+                val = float(price)
+                logger.warning(
+                    f"VIX primary source failed; using VIXY proxy: {val:.2f} "
+                    f"(vix_mode=degraded)"
+                )
+                return (val, "vixy_proxy")
+        except Exception as e:
+            logger.warning(f"VIXY snapshot fallback failed: {e}")
+
+        logger.error("VIX unavailable from all sources (indices API + VIXY fallback)")
+        return None
 
     def get_tradable_assets_full(self) -> List[dict]:
         """
