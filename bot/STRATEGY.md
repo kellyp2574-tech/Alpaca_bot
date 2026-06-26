@@ -74,7 +74,8 @@ Runs every day, independent of intraday trades.
 | 20D avg dollar volume | ≥ $1,000,000 | `MR_MIN_AVG_DOLLAR_VOLUME` |
 | Max positions | 3 | `MR_MAX_PRIMARY_POSITIONS` |
 | Per-position size | 30% of equity | `MR_ALLOC_PER_POSITION_PCT` |
-| Sleeve cap | 90% of equity | `MR_MAX_TOTAL_ALLOCATION_PCT` |
+| Base sleeve cap | 60% of equity | `MR_MAX_TOTAL_ALLOCATION_PCT` |
+| Combined cap (MR + TQQQ) | 90% of equity | `OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT` |
 | Per-name ADV cap | 0.3% of 20D ADV | `MR_ADV_CAP_PCT` |
 
 Ranked by lowest `close_position` first. **Regime sizing:** average of SPY/IWM/QQQ

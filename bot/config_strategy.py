@@ -64,9 +64,6 @@ INTRADAY_ETF_ALLOCATION_PCT = 1.00   # Maximum 100% of equity (was 0.50)
 # Buying power buffer for ETF entries (default 98% to leave room for price movement)
 ETF_ENTRY_BP_BUFFER_PCT = 0.98
 
-# Maximum spread for ETF execution gate (also defined alongside slippage below)
-ETF_ENTRY_MAX_SPREAD_PCT = 0.005     # 0.5% max spread
-
 # ═══════════════════════════════════════════════════
 # Overnight Single-Stock MR Sizing (15:45 entry)
 # ═══════════════════════════════════════════════════
@@ -124,7 +121,9 @@ VXX_HIGH_RISK_PRICE = 400.0          # VXX price >= $400 → HIGH_RISK (absolute
 # ── Strategy 4: Router Long (check at 10:10) ──
 ROUTER_LONG_SPREAD_MIN_PCT = 0.2     # QQQ-SPY 40min spread >= +0.2%
 ROUTER_LONG_VEHICLE = "TQQQ"
-ROUTER_LONG_EXIT_TIME = "15:00"
+# Operative exit is ETF_SL_TP["ROUTER_LONG"]["exit_time"] (15:30); this value only
+# feeds RouterDecision.exit_time used for audit logging. Kept in sync to avoid drift.
+ROUTER_LONG_EXIT_TIME = "15:30"
 ROUTER_LONG_TAKE_PROFIT_PCT = 0.03   # +3% TP
 ROUTER_LONG_STOP_LOSS_PCT = 0.01     # -1% SL
 

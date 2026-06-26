@@ -728,10 +728,10 @@ class CombinedOvernightReboundBot:
                             )
                         else:
                             # Other overnight ETF fired - use base capacity
-                            self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.90))
+                            self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.60))
                     else:
                         # No overnight ETF - full MR capacity
-                        self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.90))
+                        self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.60))
                         if self.overnight_etf_fired:
                             logger.info(
                                 "Single-stock MR proceeding: no TQQQ position, full capacity"
