@@ -193,6 +193,7 @@ def save_state(bot) -> None:
             # Daily-loss kill switch
             "kill_switch_tripped": bot.kill_switch_tripped,
             "kill_switch_reason": bot.kill_switch_reason,
+            "session_baseline_equity": getattr(bot, "session_baseline_equity", None),
             # ETF Router state
             "router_decision": bot.router_decision.to_dict() if bot.router_decision else None,
             "router_decisions": [d.to_dict() for d in getattr(bot, "router_decisions", []) if d],
@@ -298,6 +299,9 @@ def load_state(bot) -> None:
     bot.sold_today = set(bot_state.get("sold_today", []))
     bot.kill_switch_tripped = bot_state.get("kill_switch_tripped", False)
     bot.kill_switch_reason = bot_state.get("kill_switch_reason", None)
+    bot.session_baseline_equity = bot_state.get("session_baseline_equity", None)
+    if bot.session_baseline_equity is not None:
+        logger.info(f"Restored session_baseline_equity=${bot.session_baseline_equity:,.2f} from state")
     if bot.kill_switch_tripped:
         logger.critical(
             f"Daily-loss kill switch is ACTIVE from earlier this session — "
@@ -419,6 +423,7 @@ def save_end_of_day_reports(bot) -> None:
             "kill_switch": {
                 "tripped": bot.kill_switch_tripped,
                 "reason": bot.kill_switch_reason,
+                "session_baseline_equity": getattr(bot, "session_baseline_equity", None),
             },
             "etf_router": bot._build_etf_router_summary(),
             "overnight_mr": {

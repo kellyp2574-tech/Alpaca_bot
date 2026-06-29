@@ -352,8 +352,13 @@ def step_score_and_rank(bot) -> None:
 def check_daily_loss_kill_switch(bot, account: Optional[dict] = None) -> bool:
     """Evaluate the global daily-loss kill switch.
 
+    Uses ``session_baseline_equity`` (captured after morning exits) as the
+    denominator to avoid penalizing overnight gap losses the bot did not
+    control.  Falls back to Alpaca's ``last_equity`` if the baseline has not
+    been captured yet (e.g. bot started after 10:00 without morning exits).
+
     Trips ``bot.kill_switch_tripped`` (and persists state) when
-    ``(equity - last_equity) / last_equity <= -DAILY_LOSS_LIMIT_PCT``.
+    ``(equity - baseline) / baseline <= -DAILY_LOSS_LIMIT_PCT``.
     Once tripped, the flag remains True for the rest of the session and
     blocks both the 10:00 ETF router entry and the 15:45 MR entries.
 
@@ -385,18 +390,38 @@ def check_daily_loss_kill_switch(bot, account: Optional[dict] = None) -> bool:
         last_equity = float(acct.get("last_equity") or 0.0)
     except (TypeError, ValueError):
         return False
-    if equity <= 0 or last_equity <= 0:
+    if equity <= 0:
         return False
 
-    day_ret = (equity - last_equity) / last_equity
+    # Prefer session baseline (post-morning-exit equity) over broker's
+    # last_equity which includes overnight gap P&L.
+    baseline = getattr(bot, "session_baseline_equity", None)
+    baseline_source = "session_baseline"
+    if baseline is None or baseline <= 0:
+        baseline = last_equity
+        baseline_source = "broker_last_equity"
+    if baseline <= 0:
+        return False
+
+    day_ret = (equity - baseline) / baseline
+
+    # Always log the full reconciliation so false blocks are diagnosable
+    logger.info(
+        f"KILL SWITCH CHECK: equity=${equity:,.2f} baseline=${baseline:,.2f} "
+        f"({baseline_source}) broker_last_equity=${last_equity:,.2f} "
+        f"session_baseline=${getattr(bot, 'session_baseline_equity', None)} "
+        f"day_ret={day_ret:+.2%} limit=-{loss_limit:.0%}"
+    )
+
     if day_ret <= -loss_limit:
         bot.kill_switch_tripped = True
         bot.kill_switch_reason = (
             f"day_ret={day_ret:+.2%} <= -{loss_limit:.0%} "
-            f"(equity=${equity:,.2f} vs last_equity=${last_equity:,.2f})"
+            f"(equity=${equity:,.2f} vs baseline=${baseline:,.2f} "
+            f"[{baseline_source}], broker_last_equity=${last_equity:,.2f})"
         )
         logger.critical(
-            f"DAILY LOSS KILL SWITCH TRIPPED — {bot.kill_switch_reason}. "
+            f"DAILY LOSS KILL SWITCH TRIPPED -- {bot.kill_switch_reason}. "
             f"All new entries (ETF router + MR) BLOCKED for the rest of the session."
         )
         try:

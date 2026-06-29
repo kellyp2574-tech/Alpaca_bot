@@ -227,6 +227,10 @@ class CombinedOvernightReboundBot:
         # after a crash still honors the breaker.
         self.kill_switch_tripped: bool = False
         self.kill_switch_reason: Optional[str] = None
+        # Session baseline equity: captured once when morning exits confirm flat.
+        # Kill switch uses this instead of Alpaca's last_equity (which includes
+        # overnight gap P&L the bot had no control over).
+        self.session_baseline_equity: Optional[float] = None
 
         # Graceful shutdown flag set by SIGINT/SIGTERM handlers installed in
         # main(). The main loop polls this between ticks and exits cleanly:
@@ -896,11 +900,33 @@ class CombinedOvernightReboundBot:
         return overnight_etf_runner_conditional.evaluate_overnight_etf_strategies(self)
 
     def _confirm_morning_flat(self, reason: str) -> None:
-        """One-way latch: set both morning_exits_done and morning_liquidation_confirmed."""
+        """One-way latch: set both morning_exits_done and morning_liquidation_confirmed.
+
+        Also captures session_baseline_equity (once) so the kill switch measures
+        intraday loss from post-liquidation equity, not from the broker's prior-day
+        close which includes overnight gap P&L the bot did not control.
+        """
         self.morning_exits_done = True
         if not self.morning_liquidation_confirmed:
             self.morning_liquidation_confirmed = True
             logger.info(f"morning_liquidation_confirmed latched True ({reason})")
+        # Capture post-exit equity as kill-switch baseline (one-shot)
+        if self.session_baseline_equity is None:
+            try:
+                acct = self.position_mgr.get_account()
+                if acct:
+                    eq = float(acct.get("equity") or 0.0)
+                    last_eq = float(acct.get("last_equity") or 0.0)
+                    if eq > 0:
+                        self.session_baseline_equity = eq
+                        logger.info(
+                            f"SESSION BASELINE EQUITY captured: ${eq:,.2f} "
+                            f"(broker last_equity=${last_eq:,.2f}, "
+                            f"overnight gap={((eq/last_eq)-1) if last_eq > 0 else 0:+.2%}) "
+                            f"({reason})"
+                        )
+            except Exception:
+                logger.warning("Could not capture session baseline equity", exc_info=True)
         self._save_state()
 
     # ═══════════════════════════════════════════════════
