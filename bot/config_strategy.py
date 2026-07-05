@@ -206,6 +206,7 @@ MR_DAY_RET_MAX = -0.04
 MR_VOLUME_RATIO_MIN = 0.0
 MR_CLOSE_POSITION_MAX = 0.25
 MR_LATE_DROP_MAX = None
+MR_LATE_DROP_MIN = -0.20  # Reject stocks with late drop worse than -20% (falling knives)
 MR_MIN_AVG_DOLLAR_VOLUME = 1_000_000
 
 # Finalist rank is close_location ascending, top 3.
@@ -242,7 +243,7 @@ MR_FREE_ALPACA_BATCH_SLEEP_SECONDS = 0.25
 ENABLE_MR_ETF_REGIME_SIZING = True
 MR_ETF_REGIME_SYMBOLS = ["SPY", "IWM", "QQQ"]
 MR_ETF_NEGATIVE_SIZE_MULT = 1.0
-MR_ETF_POSITIVE_SIZE_MULT = 0.5
+MR_ETF_POSITIVE_SIZE_MULT = 0.75
 
 # Daily-loss circuit breaker (vs yesterday's close equity).
 # 0.05 = abort 15:45 entries AND 10:00 ETF entry if today's PnL < -5%.

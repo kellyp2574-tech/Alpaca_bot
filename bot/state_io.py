@@ -29,6 +29,19 @@ from bot.universe_builder import (
 )
 
 
+def _serialise_overnight_etf_position(pos) -> Optional[dict]:
+    """Return a JSON-safe copy of overnight_etf_position, converting any datetime values."""
+    if pos is None:
+        return None
+    out = {}
+    for k, v in pos.items():
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
 def _serialise_pending_orders(pending: dict) -> dict:
     """JSON-safe representation of intraday_mr_pending_orders (drop IntradayMRCandidate obj)."""
     out = {}
@@ -212,7 +225,7 @@ def save_state(bot) -> None:
             "router_signals_fired": getattr(bot, "router_signals_fired", []),
             # Overnight ETF sleeve state
             "overnight_etf_fired": getattr(bot, "overnight_etf_fired", False),
-            "overnight_etf_position": getattr(bot, "overnight_etf_position", None),
+            "overnight_etf_position": _serialise_overnight_etf_position(getattr(bot, "overnight_etf_position", None)),
             "overnight_etf_decision_made": getattr(bot, "overnight_etf_decision_made", False),
             "overnight_etf_blocked_today": getattr(bot, "overnight_etf_blocked_today", False),
             # Intraday MR sleeve state

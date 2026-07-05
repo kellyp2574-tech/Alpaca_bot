@@ -123,6 +123,9 @@ def filter_mean_reversion_candidates(
     filtered = []
     rejected = {"price": 0, "day_ret": 0, "vol_ratio": 0, "close_pos": 0, "late_drop": 0}
 
+    late_drop_min = getattr(config, "MR_LATE_DROP_MIN", None)
+    late_drop_max = getattr(config, "MR_LATE_DROP_MAX", None)
+
     for c in candidates:
         if not (config.MR_MIN_PRICE <= c.signal_price <= config.MR_MAX_PRICE):
             rejected["price"] += 1
@@ -136,7 +139,10 @@ def filter_mean_reversion_candidates(
         if c.close_position > config.MR_CLOSE_POSITION_MAX:
             rejected["close_pos"] += 1
             continue
-        if config.MR_LATE_DROP_MAX is not None and c.late_drop_1530_1550 > config.MR_LATE_DROP_MAX:
+        if late_drop_max is not None and c.late_drop_1530_1550 > late_drop_max:
+            rejected["late_drop"] += 1
+            continue
+        if late_drop_min is not None and c.late_drop_1530_1550 < late_drop_min:
             rejected["late_drop"] += 1
             continue
 

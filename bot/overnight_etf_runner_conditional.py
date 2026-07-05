@@ -310,7 +310,7 @@ def _execute_conditional_tqqq_entry(bot, allocation_pct: float) -> None:
             "symbol": "TQQQ",
             "qty": filled_qty,
             "entry_price": fill_price,
-            "entry_time": datetime.now(_ET),
+            "entry_time": datetime.now(_ET).isoformat(),
             "strategy": "CONDITIONAL_TQQQ",
             "allocation_pct": actual_allocation,  # Store actual, not intended
             "order_id": submitted_order["id"],
