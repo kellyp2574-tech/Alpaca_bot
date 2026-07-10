@@ -685,8 +685,9 @@ class CombinedOvernightReboundBot:
                     "waiting for 15:40 hard flatten to complete"
                 )
 
-            # 15:45 — Overnight ETF (strategies A/B/C)
-            # Gate on intraday positions being flat to avoid buying power conflicts
+            # 15:45 — Overnight TQQQ (sole active overnight strategy)
+            # Gate on intraday positions being flat to avoid buying power conflicts.
+            # Single-stock MR overnight is disabled (MR_OVERNIGHT_ENABLED=False).
             if (self.scoring_done
                     and not self.overnight_etf_decision_made
                     and not self.overnight_etf_blocked_today
@@ -697,51 +698,12 @@ class CombinedOvernightReboundBot:
                 self.overnight_etf_decision_made = True
                 self._save_state()
 
-            # 15:45 — Single-stock MR
-            # Separate temporary waiting (intraday open) from permanent blocking
+            # 15:45 — Single-stock MR (disabled; entry_executor gates on MR_OVERNIGHT_ENABLED)
             if (self.scoring_done
                     and not self.entries_done
-                    and current_time >= t_entry):
-                if self.mr_blocked_today:
-                    # Permanent block due to other reasons (not overnight ETF)
-                    logger.info(
-                        f"Single-stock MR skipped permanently: "
-                        f"mr_blocked_today={self.mr_blocked_today}"
-                    )
-                    self.entries_done = True
-                elif intraday_positions_open:
-                    # Temporary wait - retry next tick, do NOT set entries_done
-                    logger.warning(
-                        "Single-stock MR waiting: intraday MR positions are not yet "
-                        "broker-confirmed closed"
-                    )
-                else:
-                    # All clear - execute (proceeds even if overnight ETF fired)
-                    # Calculate dynamic MR capacity based on actual TQQQ deployment
-                    if self.overnight_etf_fired and self.overnight_etf_position:
-                        tqqq_symbol = self.overnight_etf_position.get("symbol")
-                        if tqqq_symbol == "TQQQ":
-                            # TQQQ deployed - reduce MR capacity to leave room
-                            tqqq_deployed_pct = self.overnight_etf_position.get("allocation_pct", 0.0)
-                            combined_max = float(getattr(config, "OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT", 0.90))
-                            mr_capacity_pct = max(0.0, combined_max - tqqq_deployed_pct)
-                            self.mr_total_allocation_override_pct = mr_capacity_pct
-                            logger.info(
-                                f"Single-stock MR capacity adjusted: TQQQ deployed {tqqq_deployed_pct:.1%}, "
-                                f"MR capacity reduced to {mr_capacity_pct:.1%} (combined max {combined_max:.0%})"
-                            )
-                        else:
-                            # Other overnight ETF fired - use base capacity
-                            self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.60))
-                    else:
-                        # No overnight ETF - full MR capacity
-                        self.mr_total_allocation_override_pct = float(getattr(config, "MR_MAX_TOTAL_ALLOCATION_PCT", 0.60))
-                        if self.overnight_etf_fired:
-                            logger.info(
-                                "Single-stock MR proceeding: no TQQQ position, full capacity"
-                            )
-
-                    self._step_execute_entries()
+                    and current_time >= t_entry
+                    and not intraday_positions_open):
+                self._step_execute_entries()
 
             # ════════════════════════════════════════════
             # Day completion check

@@ -60,37 +60,21 @@ Gap-reversal longs entered in the morning, flat the same day.
 
 ---
 
-## Sleeve 3 — Overnight (15:45)
+## Sleeve 3 — Overnight TQQQ (15:45)
 
-Runs every day, independent of intraday trades.
+Sole active overnight strategy. Single-stock MR overnight is disabled (`MR_OVERNIGHT_ENABLED=False`).
 
-### Single-stock MR (always runs)
+### Conditional TQQQ
 
-| Filter | Value | Config |
+Implemented in `overnight_etf_runner_conditional.py`.
+
+| Parameter | Value | Config |
 |---|---:|---|
-| Price | $1.00 – $2.00 | `MR_MIN_PRICE` / `MR_MAX_PRICE` |
-| Day return vs prior close | ≤ −4.0% | `MR_DAY_RET_MAX` |
-| Close position in day range | ≤ 0.25 | `MR_CLOSE_POSITION_MAX` |
-| 20D avg dollar volume | ≥ $1,000,000 | `MR_MIN_AVG_DOLLAR_VOLUME` |
-| Max positions | 3 | `MR_MAX_PRIMARY_POSITIONS` |
-| Per-position size | 30% of equity | `MR_ALLOC_PER_POSITION_PCT` |
-| Base sleeve cap | 60% of equity | `MR_MAX_TOTAL_ALLOCATION_PCT` |
-| Combined cap (MR + TQQQ) | 90% of equity | `OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT` |
-| Per-name ADV cap | 0.3% of 20D ADV | `MR_ADV_CAP_PCT` |
+| Allocation when signal fires | 75% of equity | `TQQQ_CONDITIONAL_ALLOCATION_PCT` |
+| Max overnight exposure | 75% of equity | `OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT` |
 
-Ranked by lowest `close_position` first. **Regime sizing:** average of SPY/IWM/QQQ
-intraday move — if ≥ 0 the sleeve is sized at 0.5×, else 1.0×.
-
-### Conditional TQQQ (added on top when favorable)
-
-Implemented in `overnight_etf_runner_conditional.py`. TQQQ is added **on top of** MR
-(it does not block MR). MR capacity is reduced so combined exposure stays within
-`OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT` (90%).
-
-TQQQ fires when **both** the MR signal and the TQQQ signal are positive, **or** when
-the TQQQ expected return exceeds `TQQQ_STRONG_RETURN_THRESHOLD` (1.5%). Allocation is
-`TQQQ_CONDITIONAL_ALLOCATION_PCT` (30%). The TQQQ signal blends VIX regime, QQQ/VXX/SPY
-day returns. All overnight positions are sold at 09:30 the next morning.
+TQQQ fires when the signal is positive (blends VIX regime, QQQ/VXX/SPY day returns;
+requires `expected_return > 0.2%`). All overnight positions are sold at 09:30 the next morning.
 
 ---
 

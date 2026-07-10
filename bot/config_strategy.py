@@ -46,8 +46,8 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 # Master switches
 # ═══════════════════════════════════════════════════
 ETF_ROUTER_ENABLED = True
-OVERNIGHT_ETF_ENABLED = True   # A/B/C overnight ETF strategies
-MR_OVERNIGHT_ENABLED = True    # Single-stock MR fallback
+OVERNIGHT_ETF_ENABLED = True   # Overnight TQQQ strategy
+MR_OVERNIGHT_ENABLED = False   # Single-stock MR overnight disabled
 
 # ═══════════════════════════════════════════════════
 # Capital allocation — LIVE CONSTANTS
@@ -65,20 +65,19 @@ INTRADAY_ETF_ALLOCATION_PCT = 1.00   # Maximum 100% of equity (was 0.50)
 ETF_ENTRY_BP_BUFFER_PCT = 0.98
 
 # ═══════════════════════════════════════════════════
-# Overnight Single-Stock MR Sizing (15:45 entry)
+# Overnight Single-Stock MR Sizing (15:45 entry) — DISABLED
 # ═══════════════════════════════════════════════════
-# Base allocation for single-stock MR (when no conditional TQQQ fires): 60%.
-# When overnight TQQQ fires, the remaining MR budget is combined_max - TQQQ
-# allocation, capped at 60%. The combined overnight sleeve is capped at 90%.
+# Single-stock MR overnight is disabled (MR_OVERNIGHT_ENABLED=False).
+# These constants are kept for reference and scoring infrastructure.
 MR_ALLOC_PER_POSITION_PCT = 0.30   # 30% of equity per MR position
 MR_MAX_PRIMARY_POSITIONS = 3       # Top 3 MR candidates only
-MR_MAX_TOTAL_ALLOCATION_PCT = 0.60 # Base 60% of equity for single-stock MR
+MR_MAX_TOTAL_ALLOCATION_PCT = 0.60 # Reference only — MR not active overnight
 MR_ADV_CAP_PCT = 0.003             # 0.3% of 20-day ADV per symbol
 
-# Conditional TQQQ allocation (overnight, 15:45)
-# When TQQQ fires, MR cap is reduced to leave room for TQQQ position
-TQQQ_CONDITIONAL_ALLOCATION_PCT = 0.30  # 30% when TQQQ signal is positive
-OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT = 0.90  # Max 90% combined MR+TQQQ
+# Overnight TQQQ allocation (15:45) — ONLY active overnight strategy
+# Fires when TQQQ signal conditions are met; 75% of equity.
+TQQQ_CONDITIONAL_ALLOCATION_PCT = 0.75  # 75% of equity when TQQQ signal fires
+OVERNIGHT_COMBINED_MAX_ALLOCATION_PCT = 0.75  # Cap matches TQQQ-only sizing
 
 # ═══════════════════════════════════════════════════
 # Intraday ETF Router Configuration (9:30-10:10 AM)
@@ -187,13 +186,14 @@ OVERNIGHT_ETF_EXIT_TIME = "09:30"
 # VXX_Collapse         1.0%     13:00         15:30       Catastrophe stop, ride vol crush
 # VXX_Spike_Recovery   None     None          15:30       No SL — hard time exit only
 ETF_SL_TP: dict = {
-    # blocks_overnight_etf   = prevents 15:45 overnight ETF sleeve from firing
-    # blocks_single_stock_mr = single-stock overnight MR is always independent; all branches False
-    "VXX_SPIKE_RECOVERY":       {"sl": None,  "sl_arm_time": None,    "exit_time": "15:30", "blocks_overnight_etf": True,  "blocks_single_stock_mr": False},
-    "VXX_COLLAPSE":             {"sl": 0.01,   "sl_arm_time": "13:00", "exit_time": "15:30", "blocks_overnight_etf": True,  "blocks_single_stock_mr": False},
-    "MOMENTUM_SLEEVE":          {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": True,  "blocks_single_stock_mr": False},
+    # blocks_overnight_etf   = False for all branches: TQQQ overnight evaluates independently
+    #                          of intraday ETF router results (intraday exits by 15:30 anyway).
+    # blocks_single_stock_mr = all False: single-stock overnight MR is disabled (MR_OVERNIGHT_ENABLED=False).
+    "VXX_SPIKE_RECOVERY":       {"sl": None,  "sl_arm_time": None,    "exit_time": "15:30", "blocks_overnight_etf": False, "blocks_single_stock_mr": False},
+    "VXX_COLLAPSE":             {"sl": 0.01,   "sl_arm_time": "13:00", "exit_time": "15:30", "blocks_overnight_etf": False, "blocks_single_stock_mr": False},
+    "MOMENTUM_SLEEVE":          {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": False, "blocks_single_stock_mr": False},
     "MOMENTUM_SLEEVE_ANTI":     {"sl": 0.005,  "sl_arm_time": "13:00", "exit_time": "15:00", "blocks_overnight_etf": False, "blocks_single_stock_mr": False},
-    "ROUTER_LONG":              {"sl": 0.005,  "sl_arm_time": "13:30", "exit_time": "15:30", "blocks_overnight_etf": True,  "blocks_single_stock_mr": False},
+    "ROUTER_LONG":              {"sl": 0.005,  "sl_arm_time": "13:30", "exit_time": "15:30", "blocks_overnight_etf": False, "blocks_single_stock_mr": False},
     "SVIX_LONG":                {"sl": None,    "sl_arm_time": None,   "exit_time": "15:00", "blocks_overnight_etf": False, "blocks_single_stock_mr": False},
 }
 

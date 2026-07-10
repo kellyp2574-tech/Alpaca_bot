@@ -1,12 +1,10 @@
-"""Conditional TQQQ Overnight Strategy - works alongside individual MR.
+"""Conditional TQQQ Overnight Strategy.
 
-This replaces the A/B/C priority system with a conditional approach:
-- Individual MR always runs (60% allocation)
-- TQQQ added conditionally (30% allocation) when favorable
-- Maximum 90% total overnight exposure
+Sole active overnight strategy: TQQQ at 75% of equity when conditions are met.
+Single-stock MR overnight is disabled (MR_OVERNIGHT_ENABLED=False).
 
-Conditions for adding TQQQ:
-1. Both individual MR and TQQQ expected positive, OR
+Conditions for TQQQ entry:
+1. TQQQ expected return > minimum threshold (>0.2%), OR
 2. TQQQ shows strong expected return (>1.5%)
 """
 from __future__ import annotations
@@ -24,88 +22,31 @@ _ET = ZoneInfo("America/New_York")
 
 
 def evaluate_overnight_etf_strategies(bot) -> None:
-    """15:45: Evaluate conditional TQQQ strategy alongside individual MR.
-    
-    This replaces the old A/B/C priority system with a conditional approach
-    that complements rather than blocks individual MR.
-    """
+    """15:45: Evaluate and execute TQQQ overnight strategy at 75% sizing."""
     if not getattr(config, "OVERNIGHT_ETF_ENABLED", True):
         logger.info("Overnight ETF sleeve disabled")
         return
 
     logger.info("=" * 60)
-    logger.info("CONDITIONAL TQQQ EVALUATION (15:45)")
+    logger.info("TQQQ OVERNIGHT EVALUATION (15:45)")
     logger.info("=" * 60)
 
-    # Get individual MR signal status
-    individual_mr_positive = _evaluate_individual_mr_signal(bot)
-    
-    # Evaluate TQQQ conditions
+    # Evaluate TQQQ signal
     tqqq_signal, tqqq_expected_return = _evaluate_tqqq_signal(bot)
-    
-    # Determine TQQQ allocation based on conditional logic
-    tqqq_allocation = _calculate_tqqq_allocation(individual_mr_positive, tqqq_signal, tqqq_expected_return)
-    
-    logger.info(f"Individual MR signal: {'POSITIVE' if individual_mr_positive else 'NEGATIVE/NEUTRAL'}")
+    tqqq_allocation = _calculate_tqqq_allocation(tqqq_signal, tqqq_expected_return)
+
     logger.info(f"TQQQ signal: {'POSITIVE' if tqqq_signal else 'NEGATIVE/NEUTRAL'} (expected: {tqqq_expected_return:+.3%})")
     logger.info(f"TQQQ allocation: {tqqq_allocation:.1%}")
-    
-    # Execute TQQQ allocation if > 0
+
     if tqqq_allocation > 0:
         _execute_conditional_tqqq_entry(bot, tqqq_allocation)
-        # Set MR allocation override to maintain 60% individual MR when TQQQ allocated
-        bot.mr_total_allocation_override_pct = 0.60  # Keep individual MR at 60%
-        logger.info(f"TQQQ allocated {tqqq_allocation:.1%}, individual MR capped at 60%")
     else:
-        logger.info("TQQQ conditions not met - no TQQQ allocation")
-        # Ensure no TQQQ position exists and remove MR override
+        logger.info("TQQQ conditions not met — no overnight position")
         bot.overnight_etf_fired = False
         bot.overnight_etf_position = None
-        bot.mr_total_allocation_override_pct = None  # Remove override, use default 60%
-        logger.info("No TQQQ allocation, individual MR uses default 60%")
-    
-    # Mark decision as made (but don't block individual MR)
+
     bot.overnight_etf_decision_made = True
     bot._save_state()
-
-
-def _evaluate_individual_mr_signal(bot) -> bool:
-    """Evaluate if individual MR has positive expected return.
-    
-    Uses the scored candidates from the afternoon scoring process.
-    """
-    try:
-        # Get the scored MR candidates from the scoring process
-        candidates = getattr(bot, 'mr_candidates', [])
-        
-        if not candidates:
-            logger.info("No individual MR candidates available")
-            return False
-        
-        # Check if we have high-quality candidates
-        # Use average selection score as signal strength
-        valid_candidates = [c for c in candidates if hasattr(c, 'selection_score') and c.selection_score is not None]
-        
-        if not valid_candidates:
-            logger.info("No valid individual MR candidates with scores")
-            return False
-        
-        avg_score = sum(c.selection_score for c in valid_candidates) / len(valid_candidates)
-        score_threshold = float(getattr(config, "INDIVIDUAL_MR_SIGNAL_THRESHOLD", 0.5))
-        
-        # Also consider number of candidates (more candidates = stronger signal)
-        candidate_count = len(valid_candidates)
-        min_candidates = int(getattr(config, "INDIVIDUAL_MR_MIN_CANDIDATES", 1))
-        
-        signal_positive = (avg_score > score_threshold and candidate_count >= min_candidates)
-        
-        logger.info(f"Individual MR analysis: {candidate_count} candidates, avg score={avg_score:.3f}, threshold={score_threshold:.3f}")
-        
-        return signal_positive
-        
-    except Exception as e:
-        logger.error(f"Error evaluating individual MR signal: {e}")
-        return False
 
 
 def _evaluate_tqqq_signal(bot) -> Tuple[bool, float]:
@@ -202,23 +143,11 @@ def _evaluate_tqqq_signal(bot) -> Tuple[bool, float]:
         return False, 0.0
 
 
-def _calculate_tqqq_allocation(individual_positive: bool, tqqq_positive: bool, tqqq_expected: float) -> float:
-    """Calculate TQQQ allocation based on conditional logic.
-    
-    Returns allocation percentage (0.0 to config.TQQQ_CONDITIONAL_ALLOCATION_PCT).
-    """
-    allocation = float(getattr(config, "TQQQ_CONDITIONAL_ALLOCATION_PCT", 0.30))
-    strong_threshold = float(getattr(config, "TQQQ_STRONG_RETURN_THRESHOLD", 0.015))
-    
-    # Rule 1: Both positive -> add TQQQ
-    if individual_positive and tqqq_positive:
+def _calculate_tqqq_allocation(tqqq_positive: bool, tqqq_expected: float) -> float:
+    """Return TQQQ allocation (75%) when signal is positive, else 0."""
+    allocation = float(getattr(config, "TQQQ_CONDITIONAL_ALLOCATION_PCT", 0.75))
+    if tqqq_positive:
         return allocation
-    
-    # Rule 2: TQQQ very strong -> add TQQQ regardless of individual
-    if tqqq_expected > strong_threshold:
-        return allocation
-    
-    # Rule 3: Otherwise, no TQQQ
     return 0.0
 
 
@@ -321,24 +250,19 @@ def _execute_conditional_tqqq_entry(bot, allocation_pct: float) -> None:
 
 
 def get_overnight_allocation_summary(bot) -> Dict[str, float]:
-    """Get summary of current overnight allocations.
-    
+    """Get summary of current overnight allocations (TQQQ-only design).
+
     Returns:
-        Dict with allocation percentages for individual MR, TQQQ, and cash
+        Dict with allocation percentages for TQQQ and cash.
     """
-    individual_allocation = 0.60  # Base individual MR allocation
     tqqq_allocation = 0.0
-    
-    # Check if TQQQ position exists
-    if hasattr(bot, 'overnight_etf_position') and bot.overnight_etf_position:
-        if bot.overnight_etf_position.get('symbol') == 'TQQQ':
-            tqqq_allocation = bot.overnight_etf_position.get('allocation_pct', 0.0)
-    
-    cash_allocation = 1.0 - individual_allocation - tqqq_allocation
-    
+
+    if hasattr(bot, "overnight_etf_position") and bot.overnight_etf_position:
+        if bot.overnight_etf_position.get("symbol") == "TQQQ":
+            tqqq_allocation = bot.overnight_etf_position.get("allocation_pct", 0.0)
+
     return {
-        'individual_mr': individual_allocation,
-        'tqqq': tqqq_allocation,
-        'cash': max(0.0, cash_allocation),
-        'total': individual_allocation + tqqq_allocation
+        "tqqq": tqqq_allocation,
+        "cash": max(0.0, 1.0 - tqqq_allocation),
+        "total": tqqq_allocation,
     }
