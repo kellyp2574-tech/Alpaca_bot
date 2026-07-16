@@ -270,8 +270,9 @@ INTRADAY_MR_MAX_CANDIDATES = 8
 # ADV filter — previous day dollar volume minimum
 INTRADAY_MR_MIN_ADV_DOLLARS = 1_000_000
 
-# Capital allocation: 50% of equity split equally across all candidates
+# Capital allocation: 50% of equity split equally across up to INTRADAY_MR_MAX_POSITIONS candidates
 INTRADAY_MR_BUDGET_PCT = 0.50
+INTRADAY_MR_MAX_POSITIONS = 3  # Only enter top 3 ranked; walk down if any fail execution
 
 # Universe pre-filter for pre-market snapshot fetch
 # Price range intentionally wider than Theme bins to allow all themes

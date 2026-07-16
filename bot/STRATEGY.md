@@ -7,7 +7,7 @@
 |---|---|---|
 | Intraday ETF Router | one trade/day at 10:00 or 10:10 | same day, flat by 15:30 |
 | Intraday MR (morning momentum) | entries 09:32–10:00 | same day, flat by 15:40 |
-| Overnight (single-stock MR + conditional TQQQ) | entry 15:45 | overnight, sold 09:30 next day |
+| Overnight TQQQ | entry 15:45 | overnight, sold 09:30 next day |
 
 ---
 
@@ -47,10 +47,14 @@ Per-strategy SL/TP and exit times are the table `ETF_SL_TP` in `config_strategy.
 
 Gap-reversal longs entered in the morning, flat the same day.
 
-- **Active day** when `VIX ≥ 15` OR (`|SPY gap| > 1%` AND `|QQQ gap| > 1%`).
+- **Active day** when `VIX ≥ 15` AND `|SPY gap| > 1%` AND `|QQQ gap| > 1%`.
 - **Universe:** price $2–$100, prev-day dollar volume ≥ $1M.
 - **Candidates:** 1–8 per day, classified into themes by `intraday_mr_classifier.py`.
-- **Budget:** 50% of equity (`INTRADAY_MR_BUDGET_PCT`) split across candidates.
+- **Positions:** up to 3 live positions (`INTRADAY_MR_MAX_POSITIONS`). The bot submits
+  the highest-ranked due candidates first; if one fails execution, the next-ranked
+  due candidate takes its slot (walk-down).
+- **Budget:** 50% of equity (`INTRADAY_MR_BUDGET_PCT`) split equally across the target
+  3 positions.
 - **Timing:** Stage 1 universe + bar cache at 09:00; Stage 2 (opens, VIX, finalize) at
   09:30; entries 09:32 until the 10:00 cutoff; hard flatten at **15:40**.
 - **10:00 router-exit rule:** if the ETF router is SHORT (`sqqq_goldilocks`, i.e.

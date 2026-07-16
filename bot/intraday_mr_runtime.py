@@ -15,7 +15,10 @@ Two-stage pre-market build:
                      Run classifier -> bot.intraday_mr_candidates.
 
 Entry execution (09:32–09:47):
-  All candidates scheduled for the same minute are submitted CONCURRENTLY.
+  Live positions are capped at INTRADAY_MR_MAX_POSITIONS (default 3). Only the
+  highest-ranked due candidates fill the remaining slots; if one fails execution
+  the next-ranked due candidate takes its slot on a later tick.
+  All selected candidates for a tick are submitted CONCURRENTLY.
   Each order tracked via pending_order dict until fill confirmed.
   Only mark a symbol as entered after fill is confirmed.
 
@@ -411,8 +414,27 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
 
     budget_pct = float(getattr(config, "INTRADAY_MR_BUDGET_PCT", 0.50))
     total_budget = equity * budget_pct
-    n_cands = len(candidates)
-    per_pos = total_budget / n_cands if n_cands > 0 else 0
+
+    # Cap live positions at INTRADAY_MR_MAX_POSITIONS (default 3). Rejected or
+    # un-filled orders free up slots so lower-ranked due candidates can replace
+    # them — i.e., walk down the ranked list instead of giving up if the top 3 fail.
+    max_positions = int(getattr(config, "INTRADAY_MR_MAX_POSITIONS",
+                                   getattr(config, "MR_MAX_PRIMARY_POSITIONS", 3)))
+    open_positions = [p for p in bot.intraday_mr_positions.values()
+                      if p.get("exit_state") == _STATE_OPEN]
+    remaining_slots = max(0, max_positions - len(open_positions) - len(bot.intraday_mr_pending_orders))
+    if remaining_slots <= 0:
+        if not getattr(bot, "_intraday_mr_full_logged", False):
+            logger.info(
+                f"Intraday MR: full — {len(open_positions)} open, "
+                f"{len(bot.intraday_mr_pending_orders)} pending, max={max_positions}; "
+                f"no new entries until a slot frees up"
+            )
+            bot._intraday_mr_full_logged = True
+        return
+    bot._intraday_mr_full_logged = False
+
+    per_pos = total_budget / max_positions if max_positions > 0 else 0
 
     # Determine which candidates are due this tick, respecting max entry delay
     _MAX_ENTRY_DELAY_SECONDS = int(getattr(config, "INTRADAY_MR_MAX_ENTRY_DELAY_S", 60))
@@ -455,6 +477,11 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
             continue
 
         due.append(cand)
+
+    # Only the highest-ranked due candidates may fill the remaining slots.
+    # Lower-ranked candidates get a chance later if higher-ranked ones fail.
+    due.sort(key=lambda c: (c.sleeve_rank, -abs(c.pm_ret)))
+    due = due[:remaining_slots]
 
     if not due:
         if not getattr(bot, "_intraday_mr_no_due_logged", False):

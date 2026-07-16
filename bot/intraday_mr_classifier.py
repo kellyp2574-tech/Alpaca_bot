@@ -14,7 +14,9 @@ UL is a dead-zone-only fallback — it is never used on ACTIVE days.
 This matches the router-exit portfolio version producing the 26.37x / Sharpe 2.39 baseline.
 
 Sorting: (sleeve_rank ASC, |pm_ret| DESC) — severity ranking for tie-breaking.
-Caps: min=1, max=8 per day.
+Candidate cap: min=1, max=8 per day (INTRADAY_MR_MAX_CANDIDATES).
+Live positions are capped separately at INTRADAY_MR_MAX_POSITIONS (default 3); if a
+higher-ranked candidate fails execution, the next-ranked due candidate takes its slot.
 
 Router exit rule (10:00 AM):
   If router SHORT (sqqq_goldilocks): exit non-Theme-A positions.
@@ -207,8 +209,9 @@ def build_intraday_mr_candidates(
 
     sleeve_pool = ACTIVE_SLEEVES if regime == REGIME_ACTIVE else DEAD_ZONE_SLEEVES
     adv_min   = float(getattr(config, "INTRADAY_MR_MIN_ADV_DOLLARS", 1_000_000))
-    # Apply IEX volume multiplier to compensate for IEX undercounting (same fix as overnight MR)
-    adv_multiplier = float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0))
+    # Massive previous-day daily bars report consolidated/composite volume, so no
+    # IEX multiplier is needed here (unlike live IEX snapshot volume used elsewhere).
+    adv_multiplier = 1.0
     min_cands = int(getattr(config,   "INTRADAY_MR_MIN_CANDIDATES",  1))
     max_cands = int(getattr(config,   "INTRADAY_MR_MAX_CANDIDATES",  8))
 
