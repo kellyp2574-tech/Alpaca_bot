@@ -492,7 +492,10 @@ def build_live_mr_candidates_from_free_pipeline(
         adv_dollars = prev.prev_dollar_volume
 
         min_adv = float(getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 1_000_000))
+        min_raw_adv = float(getattr(config, "MR_MIN_RAW_DOLLAR_VOLUME", 0) or 0)
         if adv_dollars < min_adv:
+            continue
+        if min_raw_adv > 0 and adv_dollars < min_raw_adv:
             continue
 
         # Lower close_position is better; more negative day_return is usually better,

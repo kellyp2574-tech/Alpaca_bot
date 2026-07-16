@@ -209,9 +209,10 @@ def step_score_and_rank(bot) -> None:
         # Live Alpaca IEX volume is much lower than composite volume, so apply the
         # same multiplier used for ADV sizing/caps before comparing to the liquidity floor.
         min_adv = float(getattr(config, "MR_MIN_AVG_DOLLAR_VOLUME", 0) or 0)
+        min_raw_adv = float(getattr(config, "MR_MIN_RAW_DOLLAR_VOLUME", 0) or 0)
         adv_multiplier = float(getattr(config, "ADV_DOLLAR_MULTIPLIER", 1.0) or 1.0)
 
-        if min_adv > 0:
+        if min_adv > 0 or min_raw_adv > 0:
             before_adv = len(filtered_mr)
             adv_passed = []
             adv_rejected_sample = []
@@ -220,24 +221,41 @@ def step_score_and_rank(bot) -> None:
                 raw_adv = float(getattr(c, "adv_dollars", 0.0) or 0.0)
                 adjusted_adv = raw_adv * adv_multiplier
 
-                if adjusted_adv >= min_adv:
-                    adv_passed.append(c)
-                elif len(adv_rejected_sample) < 10:
-                    adv_rejected_sample.append({
-                        "symbol": c.symbol,
-                        "raw_adv_dollars": round(raw_adv, 0),
-                        "adjusted_adv_dollars": round(adjusted_adv, 0),
-                        "min_required": round(min_adv, 0),
-                    })
+                if min_raw_adv > 0 and raw_adv < min_raw_adv:
+                    if len(adv_rejected_sample) < 10:
+                        adv_rejected_sample.append({
+                            "symbol": c.symbol,
+                            "raw_adv_dollars": round(raw_adv, 0),
+                            "adjusted_adv_dollars": round(adjusted_adv, 0),
+                            "min_raw_required": round(min_raw_adv, 0),
+                            "min_adj_required": round(min_adv, 0),
+                            "reason": "raw_adv_too_low",
+                        })
+                    continue
+
+                if min_adv > 0 and adjusted_adv < min_adv:
+                    if len(adv_rejected_sample) < 10:
+                        adv_rejected_sample.append({
+                            "symbol": c.symbol,
+                            "raw_adv_dollars": round(raw_adv, 0),
+                            "adjusted_adv_dollars": round(adjusted_adv, 0),
+                            "min_raw_required": round(min_raw_adv, 0),
+                            "min_adj_required": round(min_adv, 0),
+                            "reason": "adjusted_adv_too_low",
+                        })
+                    continue
+
+                adv_passed.append(c)
 
             filtered_mr = adv_passed
 
             logger.info(
-                "MR ADV filter: %d -> %d using raw_adv * %.1f >= $%.0f",
+                "MR ADV filter: %d -> %d (raw >= $%.0f, adjusted >= $%.0f, multiplier=%.1f)",
                 before_adv,
                 len(filtered_mr),
-                adv_multiplier,
+                min_raw_adv,
                 min_adv,
+                adv_multiplier,
             )
 
             if adv_rejected_sample:

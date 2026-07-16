@@ -207,7 +207,8 @@ MR_VOLUME_RATIO_MIN = 0.0
 MR_CLOSE_POSITION_MAX = 0.25
 MR_LATE_DROP_MAX = None
 MR_LATE_DROP_MIN = -0.20  # Reject stocks with late drop worse than -20% (falling knives)
-MR_MIN_AVG_DOLLAR_VOLUME = 1_000_000
+MR_MIN_AVG_DOLLAR_VOLUME = 1_000_000  # Composite-equivalent minimum (raw * ADV_DOLLAR_MULTIPLIER)
+MR_MIN_RAW_DOLLAR_VOLUME = 150_000    # Actual IEX/Massive daily $ volume floor before any multiplier
 
 # Finalist rank is close_location ascending, top 3.
 MR_RANK_BY_CLOSE_LOCATION_ONLY = True
