@@ -171,6 +171,7 @@ def _sleeve_match(s: IntradayMRSleeve, prior_ret: float, pm_ret: float, price: f
 
 def build_intraday_mr_candidates(
     snapshots: Dict[str, dict],
+    diagnostics: Optional[Dict] = None,
 ) -> List[IntradayMRCandidate]:
     """
     Build and rank intraday MR candidates from snapshot data.
@@ -180,6 +181,10 @@ def build_intraday_mr_candidates(
       - '_vix_open' key injected by build_intraday_mr_watchlist (float)
       - Each stock snapshot needs: open, prev_close, prev_volume, prev2_close
         (prev2_close added by enrich_snapshots_with_prev2 before this call)
+
+    If ``diagnostics`` is provided, it is populated with per-stage counts:
+      input_symbols, missing_data, adv_filtered, extreme_ret, no_sleeve_match,
+      matched_by_theme, min_cands_fail, final_count.
 
     Returns candidates sorted by (sleeve_rank ASC, |pm_ret| DESC), capped at max.
     Returns [] if fewer than min_cands.
@@ -215,6 +220,24 @@ def build_intraday_mr_candidates(
     min_cands = int(getattr(config,   "INTRADAY_MR_MIN_CANDIDATES",  1))
     max_cands = int(getattr(config,   "INTRADAY_MR_MAX_CANDIDATES",  8))
 
+    if diagnostics is not None:
+        diagnostics.update({
+            "regime": regime,
+            "vix_open": float(vix_open),
+            "spy_gap": float(spy_gap),
+            "qqq_gap": float(qqq_gap),
+            "adv_min": adv_min,
+            "adv_multiplier": adv_multiplier,
+            "input_symbols": 0,
+            "missing_data": 0,
+            "adv_filtered": 0,
+            "extreme_ret": 0,
+            "no_sleeve_match": 0,
+            "matched_by_theme": {},
+            "min_cands_fail": 0,
+            "final_count": 0,
+        })
+
     abc_cands: List[IntradayMRCandidate] = []
     d_cands:   List[IntradayMRCandidate] = []
     ul_cands:  List[IntradayMRCandidate] = []
@@ -224,6 +247,8 @@ def build_intraday_mr_candidates(
             continue
         if symbol.upper() in LEVERAGED_ETFS:
             continue
+        if diagnostics is not None:
+            diagnostics["input_symbols"] += 1
 
         open_px         = snap.get("open")
         prev_close      = snap.get("prev_close")
@@ -231,6 +256,8 @@ def build_intraday_mr_candidates(
         prev_volume     = snap.get("prev_volume") or 0
 
         if not open_px or not prev_close or not prev2_close_raw:
+            if diagnostics is not None:
+                diagnostics["missing_data"] += 1
             continue
 
         open_px     = float(open_px)
@@ -239,17 +266,23 @@ def build_intraday_mr_candidates(
         prev_volume = float(prev_volume)
 
         if prev2_close <= 0 or prev_close <= 0 or open_px <= 0:
+            if diagnostics is not None:
+                diagnostics["missing_data"] += 1
             continue
 
         # ADV check with IEX multiplier
         effective_adv = prev_close * prev_volume * adv_multiplier
         if effective_adv < adv_min:
+            if diagnostics is not None:
+                diagnostics["adv_filtered"] += 1
             continue
 
         prior_ret = prev_close / prev2_close - 1.0
         pm_ret    = open_px   / prev_close   - 1.0
 
         if abs(prior_ret) > 0.60 or abs(pm_ret) > 0.60:
+            if diagnostics is not None:
+                diagnostics["extreme_ret"] += 1
             continue
 
         # Pass 1: regime sleeve match (first match = highest priority rank)
@@ -260,6 +293,8 @@ def build_intraday_mr_candidates(
                 break
 
         if matched is not None:
+            if diagnostics is not None:
+                diagnostics["matched_by_theme"][matched.theme] = diagnostics["matched_by_theme"].get(matched.theme, 0) + 1
             cand = IntradayMRCandidate(
                 symbol=symbol, theme=matched.theme, sleeve_name=matched.name,
                 sleeve_rank=matched.sleeve_rank, prior_ret=prior_ret, pm_ret=pm_ret,
@@ -276,8 +311,11 @@ def build_intraday_mr_candidates(
         # Pass 2: UL — evaluated on ALL days but only used as dead-zone fallback
         # (mirrors backtest: UL only fills when D empty on dead-zone days)
         if regime == REGIME_DEAD_ZONE:
+            ul_matched = False
             for s in UL_SLEEVES:
                 if _sleeve_match(s, prior_ret, pm_ret, open_px):
+                    if diagnostics is not None:
+                        diagnostics["matched_by_theme"][s.theme] = diagnostics["matched_by_theme"].get(s.theme, 0) + 1
                     ul_cands.append(IntradayMRCandidate(
                         symbol=symbol, theme=s.theme, sleeve_name=s.name,
                         sleeve_rank=s.sleeve_rank, prior_ret=prior_ret, pm_ret=pm_ret,
@@ -285,7 +323,13 @@ def build_intraday_mr_candidates(
                         entry_time=s.entry_time, exit_time=s.exit_time,
                         tp_pct=s.tp_pct, sl_pct=s.sl_pct, regime=regime,
                     ))
+                    ul_matched = True
                     break
+            if ul_matched:
+                continue
+
+        if diagnostics is not None:
+            diagnostics["no_sleeve_match"] += 1
 
     # Combine exactly as backtest:
     #   Active:    ABC only
@@ -299,7 +343,12 @@ def build_intraday_mr_candidates(
     combined.sort(key=lambda c: (c.sleeve_rank, -abs(c.pm_ret)))
     combined = combined[:max_cands]
 
+    if diagnostics is not None:
+        diagnostics["final_count"] = len(combined)
+
     if len(combined) < min_cands:
+        if diagnostics is not None:
+            diagnostics["min_cands_fail"] = len(combined)
         logger.info(f"Intraday MR: {len(combined)} candidates < min={min_cands} — skipping day")
         return []
 

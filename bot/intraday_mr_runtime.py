@@ -317,7 +317,8 @@ def build_intraday_mr_finalize(bot) -> None:
 
         enriched["_vix_open"] = float(vix_open)
 
-        candidates = build_intraday_mr_candidates(enriched)
+        classifier_diagnostics: Dict[str, Any] = {}
+        candidates = build_intraday_mr_candidates(enriched, classifier_diagnostics)
 
         bot.intraday_mr_candidates = candidates
         bot.intraday_mr_watchlist_built = True
@@ -341,6 +342,7 @@ def build_intraday_mr_finalize(bot) -> None:
                 "qqq_open": qqq_open,
                 "stage2_time": now.strftime("%H:%M:%S"),
                 "decision": decision,
+                "classifier_diagnostics": classifier_diagnostics,
             }
         )
         logger.info(
@@ -481,7 +483,16 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
     # Only the highest-ranked due candidates may fill the remaining slots.
     # Lower-ranked candidates get a chance later if higher-ranked ones fail.
     due.sort(key=lambda c: (c.sleeve_rank, -abs(c.pm_ret)))
+    skipped = due[remaining_slots:]
     due = due[:remaining_slots]
+
+    if skipped:
+        logger.info(
+            f"Intraday MR entry: {len(skipped)} lower-ranked due candidate(s) skipped "
+            f"because {len(open_positions)} position(s) open + {len(bot.intraday_mr_pending_orders)} pending "
+            f"= {max_positions - remaining_slots}/{max_positions} slots filled: "
+            f"{[c.symbol for c in skipped]}"
+        )
 
     if not due:
         if not getattr(bot, "_intraday_mr_no_due_logged", False):
@@ -492,10 +503,18 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
             bot._intraday_mr_no_due_logged = True
         return
 
+    logger.info(
+        f"Intraday MR entry: {len(due)} candidate(s) selected from {len(candidates)} total "
+        f"({remaining_slots} slot(s) open, budget=${total_budget:,.2f}, per_pos=${per_pos:,.2f}): "
+        f"{[c.symbol for c in due]}"
+    )
+
     # Submit all due candidates CONCURRENTLY via a thread pool.
     # Each thread fires one market-buy REST call; results are collected below.
     # This mirrors the backtest assumption that all same-minute entries happen
     # at the open of that minute rather than sequentially over several seconds.
+    pending_before = len(bot.intraday_mr_pending_orders)
+
     def _submit_one(cand: IntradayMRCandidate):
         """Returns (cand, order, error_type, qty) or raises."""
         if per_pos <= 0 or cand.signal_price <= 0:
@@ -532,6 +551,12 @@ def execute_intraday_mr_entries(bot, current_time) -> None:
                 f"Intraday MR order submitted: {cand.symbol} [{cand.sleeve_name}] "
                 f"x{qty} @ mkt  (order_id={order_id})"
             )
+
+    n_submitted = len(bot.intraday_mr_pending_orders) - len(pending_before)
+    logger.info(
+        f"Intraday MR entry round complete: {n_submitted}/{len(due)} submitted, "
+        f"{len(due) - n_submitted} rejected, {len(open_positions)} already open"
+    )
 
     bot._save_state()
 
