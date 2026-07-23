@@ -234,6 +234,11 @@ def build_intraday_mr_candidates(
             "extreme_ret": 0,
             "no_sleeve_match": 0,
             "matched_by_theme": {},
+            "rejected_sample": [],
+            "rejected_prior_ret_min": None,
+            "rejected_prior_ret_max": None,
+            "rejected_pm_ret_min": None,
+            "rejected_pm_ret_max": None,
             "min_cands_fail": 0,
             "final_count": 0,
         })
@@ -330,6 +335,26 @@ def build_intraday_mr_candidates(
 
         if diagnostics is not None:
             diagnostics["no_sleeve_match"] += 1
+            for key, val in (
+                ("rejected_prior_ret_min", prior_ret),
+                ("rejected_prior_ret_max", prior_ret),
+                ("rejected_pm_ret_min", pm_ret),
+                ("rejected_pm_ret_max", pm_ret),
+            ):
+                if diagnostics[key] is None:
+                    diagnostics[key] = val
+                elif "_min" in key:
+                    diagnostics[key] = min(diagnostics[key], val)
+                else:
+                    diagnostics[key] = max(diagnostics[key], val)
+            if len(diagnostics["rejected_sample"]) < 20:
+                diagnostics["rejected_sample"].append({
+                    "symbol": symbol,
+                    "prior_ret": round(prior_ret, 6),
+                    "pm_ret": round(pm_ret, 6),
+                    "open": round(open_px, 4),
+                    "effective_adv": round(effective_adv, 2),
+                })
 
     # Combine exactly as backtest:
     #   Active:    ABC only
