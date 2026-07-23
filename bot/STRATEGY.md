@@ -47,7 +47,7 @@ Per-strategy SL/TP and exit times are the table `ETF_SL_TP` in `config_strategy.
 
 Gap-reversal longs entered in the morning, flat the same day.
 
-- **Active day** when `VIX ≥ 15` AND `|SPY gap| > 0.5%` AND `|QQQ gap| > 0.5%`.
+- **Active day** when `VIX ≥ 15` AND `|SPY gap| > 1%` AND `|QQQ gap| > 1%`.
 - **Universe:** price $2–$100, prev-day dollar volume ≥ $1M.
 - **Candidates:** 1–8 per day, classified into themes by `intraday_mr_classifier.py`.
 - **Positions:** up to 3 live positions (`INTRADAY_MR_MAX_POSITIONS`). The bot submits
