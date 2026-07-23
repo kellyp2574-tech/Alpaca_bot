@@ -262,7 +262,7 @@ INTRADAY_MR_ENABLED = True             # Paper testing enabled.
 
 # Regime classification (VIX >= 15 validated vs VIX >= 20 original)
 INTRADAY_MR_VIX_THRESHOLD = 15.0      # Active day if VIX >= this
-INTRADAY_MR_GAP_THRESHOLD = 0.01      # Active day if |SPY gap| > 1% AND |QQQ gap| > 1%
+INTRADAY_MR_GAP_THRESHOLD = 0.005     # Active day if |SPY gap| > 0.5% AND |QQQ gap| > 0.5%
 
 # Candidate caps (validated min=1, max=8)
 INTRADAY_MR_MIN_CANDIDATES = 1
