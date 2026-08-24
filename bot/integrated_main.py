@@ -48,6 +48,7 @@ from bot import etf_router_runtime
 from bot import intraday_mr_runtime
 from bot import morning_exits
 from bot import overnight_etf_runner_conditional
+from bot import swing_sleeve
 from bot import scoring
 from bot import state_io
 from bot.massive_client import MassiveClient
@@ -192,6 +193,10 @@ class CombinedOvernightReboundBot:
         self.overnight_etf_position: Optional[Dict[str, Any]] = None
         self.overnight_etf_decision_made = False
         self.overnight_etf_blocked_today = False  # True if any blocking intraday ETF fired
+
+        # Swing ETF sleeve (Portfolio 7: TQQQ/UPRO/NUGT multi-day hold)
+        self.swing_positions: Dict[str, Any] = {}  # keyed by "SYMBOL_DATE"
+        self.swing_decision_made = False
 
         # Stage flags
         self.startup_done = False
@@ -425,9 +430,17 @@ class CombinedOvernightReboundBot:
                     if (not self.open_market_rescue_done
                             and current_time >= t_rescue):
                         bc = self.position_mgr.broker_position_count()
+                        swing_syms = swing_sleeve.get_swing_symbols(self)
                         if bc > 0:
-                            logger.warning(f"09:31 rescue: broker still has {bc} positions, running broker-native rescue")
-                            self._run_broker_native_rescue()
+                            # Check if remaining positions are only swing
+                            broker_positions = self.position_mgr.get_broker_positions()
+                            non_swing = [p for p in (broker_positions or []) if str(p.get("symbol", "")).upper() not in swing_syms]
+                            if non_swing:
+                                logger.warning(f"09:31 rescue: broker has {len(non_swing)} non-swing positions, running broker-native rescue")
+                                self._run_broker_native_rescue()
+                            else:
+                                logger.info("09:31 rescue: only swing positions remain — confirming flat")
+                                self._confirm_morning_flat("09:31 rescue: only swing positions remain")
                         elif bc == 0:
                             self._confirm_morning_flat("09:31 rescue: broker confirmed flat")
                         self.open_market_rescue_done = True
@@ -439,11 +452,17 @@ class CombinedOvernightReboundBot:
                     if (not self.post_exit_failsafe_done
                             and current_time >= t_failsafe):
                         bc = self.position_mgr.broker_position_count()
+                        swing_syms = swing_sleeve.get_swing_symbols(self)
                         if bc > 0:
-                            logger.warning(f"Post-exit failsafe: broker still has {bc} positions")
-                            self._run_failsafe_flatten(f"{t_failsafe.strftime('%H:%M')} post-exit failsafe")
-                            # Do NOT confirm flat yet — sell orders may still be pending.
-                            # Early-completion block below will confirm once broker is flat.
+                            # Check if remaining positions are only swing
+                            broker_positions = self.position_mgr.get_broker_positions()
+                            non_swing = [p for p in (broker_positions or []) if str(p.get("symbol", "")).upper() not in swing_syms]
+                            if non_swing:
+                                logger.warning(f"Post-exit failsafe: broker still has {len(non_swing)} non-swing positions")
+                                self._run_failsafe_flatten(f"{t_failsafe.strftime('%H:%M')} post-exit failsafe")
+                            else:
+                                logger.info("Post-exit failsafe: only swing positions remain — confirming flat")
+                                self._confirm_morning_flat("post-exit failsafe: only swing positions remain")
                         elif bc == 0:
                             self.position_mgr.reconcile_local_positions_from_broker()
                             self._confirm_morning_flat("post-exit failsafe: broker confirmed flat")
@@ -453,9 +472,17 @@ class CombinedOvernightReboundBot:
                     # Early completion: after 09:30 submit, when broker confirmed flat.
                     if current_time >= t_exit_all and not self.morning_exits_done:
                         bc = self.position_mgr.broker_position_count()
+                        swing_syms = swing_sleeve.get_swing_symbols(self)
                         if bc == 0:
                             self.position_mgr.positions.clear()
                             self._confirm_morning_flat("early completion: broker confirmed flat after sell batch")
+                        elif bc > 0:
+                            # Check if remaining are only swing positions
+                            broker_positions = self.position_mgr.get_broker_positions()
+                            non_swing = [p for p in (broker_positions or []) if str(p.get("symbol", "")).upper() not in swing_syms]
+                            if not non_swing:
+                                self.position_mgr.positions.clear()
+                                self._confirm_morning_flat("early completion: only swing positions remain")
 
             # ════════════════════════════════════════════
             # INTRADAY ETF Sleeve (5 strategies, one per day)
@@ -698,6 +725,18 @@ class CombinedOvernightReboundBot:
                 self.overnight_etf_decision_made = True
                 self._save_state()
 
+            # 15:45 — Swing ETF sleeve (Portfolio 7: TQQQ/UPRO/NUGT, 2-day hold)
+            # Runs independently of overnight TQQQ and intraday sleeves.
+            # Exits maturing positions first, then evaluates new signals.
+            if (self.scoring_done
+                    and not self.swing_decision_made
+                    and not intraday_positions_open
+                    and current_time >= t_entry
+                    and getattr(config, "SWING_SLEEVE_ENABLED", True)):
+                self._evaluate_swing_sleeve()
+                self.swing_decision_made = True
+                self._save_state()
+
             # 15:45 — Single-stock MR (disabled; entry_executor gates on MR_OVERNIGHT_ENABLED)
             if (self.scoring_done
                     and not self.entries_done
@@ -860,6 +899,9 @@ class CombinedOvernightReboundBot:
     # ═══════════════════════════════════════════════════
     def _evaluate_overnight_etf_strategies(self):
         return overnight_etf_runner_conditional.evaluate_overnight_etf_strategies(self)
+
+    def _evaluate_swing_sleeve(self):
+        return swing_sleeve.evaluate_swing_sleeve(self)
 
     def _confirm_morning_flat(self, reason: str) -> None:
         """One-way latch: set both morning_exits_done and morning_liquidation_confirmed.

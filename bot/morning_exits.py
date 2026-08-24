@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 _ET = ZoneInfo("America/New_York")
 
 
+def _swing_symbols(bot) -> set:
+    """Return the set of symbols currently held as swing positions."""
+    try:
+        from bot import swing_sleeve
+        return swing_sleeve.get_swing_symbols(bot)
+    except Exception:
+        return set()
+
+
 # ────────────────────────────────────────────────────────────────────
 # Sleeve / single-position exits  (REMOVED)
 # ────────────────────────────────────────────────────────────────────
@@ -52,10 +61,15 @@ def build_open_exit_plan_from_broker(bot, reason: str = "broker snapshot") -> Li
         bot.open_exit_plan = []
         return bot.open_exit_plan
 
+    swing_syms = _swing_symbols(bot)
+
     plan: List[Dict[str, Any]] = []
     for broker_pos in broker_positions:
         symbol = str(broker_pos.get("symbol", "")).upper().strip()
         if not symbol:
+            continue
+        if symbol in swing_syms:
+            logger.info("OPEN_EXIT_PLAN: skipping swing position %s", symbol)
             continue
         try:
             qty = int(abs(float(broker_pos.get("qty", 0))))
@@ -175,13 +189,23 @@ def submit_open_exit_market_sells(bot) -> None:
         logger.info("OPEN_EXIT: post-submit reconciliation adjustments: %s", actions)
 
     remaining = bot.position_mgr.broker_position_count()
+    swing_syms = _swing_symbols(bot)
     if remaining == 0:
         logger.warning("OPEN_EXIT: broker confirmed flat after batch submit")
         bot.position_mgr.positions.clear()
         bot.open_exit_plan = []
         bot.overnight_etf_position = None
     elif remaining > 0:
-        logger.warning("OPEN_EXIT: broker still shows %d positions after batch submit; failsafe will retry", remaining)
+        # Check if remaining are only swing positions
+        broker_positions = bot.position_mgr.get_broker_positions()
+        non_swing = [p for p in (broker_positions or []) if str(p.get("symbol", "")).upper() not in swing_syms]
+        if not non_swing:
+            logger.info("OPEN_EXIT: only swing positions remain after batch submit — non-swing confirmed flat")
+            bot.position_mgr.positions.clear()
+            bot.open_exit_plan = []
+            bot.overnight_etf_position = None
+        else:
+            logger.warning("OPEN_EXIT: broker still shows %d non-swing positions after batch submit; failsafe will retry", len(non_swing))
     else:
         logger.error("OPEN_EXIT: broker position count unavailable after batch submit")
 
@@ -202,11 +226,18 @@ def run_broker_native_rescue(bot) -> None:
         logger.info("09:31 rescue: broker confirmed flat")
         return
 
-    logger.warning(f"09:31 rescue: broker has {len(broker_positions)} positions, selling all")
+    swing_syms = _swing_symbols(bot)
+    non_swing_positions = [p for p in broker_positions if str(p.get("symbol", "")).upper() not in swing_syms]
+
+    if not non_swing_positions:
+        logger.info("09:31 rescue: only swing positions remain — nothing to sell")
+        return
+
+    logger.warning(f"09:31 rescue: broker has {len(non_swing_positions)} non-swing positions, selling all")
 
     submitted: List[Tuple[str, int, str]] = []
 
-    for broker_pos in broker_positions:
+    for broker_pos in non_swing_positions:
         symbol = str(broker_pos.get("symbol", "")).upper()
         try:
             qty = abs(int(float(broker_pos.get("qty", 0))))
@@ -248,36 +279,77 @@ def run_broker_native_rescue(bot) -> None:
     remaining = bot.position_mgr.broker_position_count()
     if remaining == 0:
         logger.info("09:31 rescue: broker confirmed flat after rescue")
-    else:
-        logger.warning(f"09:31 rescue: broker still has {remaining} positions after rescue")
+    elif remaining > 0:
+        broker_positions = bot.position_mgr.get_broker_positions()
+        non_swing = [p for p in (broker_positions or []) if str(p.get("symbol", "")).upper() not in swing_syms]
+        if not non_swing:
+            logger.info("09:31 rescue: only swing positions remain after rescue")
+        else:
+            logger.warning(f"09:31 rescue: broker still has {len(non_swing)} non-swing positions after rescue")
 
 def run_failsafe_flatten(bot, label: str) -> None:
-    """Broker-based catch-all flatten with multi-layer retry."""
-    logger.warning(f"{label}: starting broker-based failsafe flatten")
+    """Broker-based catch-all flatten with multi-layer retry.
 
-    summary = bot.position_mgr.force_flatten_broker_positions(label)
+    Swing positions are deliberately excluded — they have a 2-day hold period
+    and are managed by swing_sleeve.py, not the morning liquidation pipeline.
+    """
+    swing_syms = _swing_symbols(bot)
 
-    logger.warning(
-        f"{label}: failsafe flatten complete | "
-        f"positions_seen={summary['positions_seen']} | "
-        f"closes_submitted={summary['closes_submitted']} | "
-        f"fills_confirmed={summary['fills_confirmed']} | "
-        f"errors={len(summary['errors'])}"
-    )
+    # Get broker positions and filter out swing positions
+    broker_positions = bot.position_mgr.get_broker_positions()
+    if broker_positions is None:
+        logger.error(f"{label}: broker API unreachable — cannot determine if flattening needed")
+        bot._save_state()
+        return
 
-    manual = summary.get("manual_required", [])
-    if manual:
-        for item in manual:
-            logger.critical(f"{label}: {item}")
+    non_swing = [p for p in broker_positions if str(p.get("symbol", "")).upper() not in swing_syms]
 
-    remaining = bot.position_mgr.broker_position_count()
-    if remaining == 0:
+    if not non_swing:
+        logger.info(f"{label}: only swing positions remain — confirming flat for non-swing")
         bot.position_mgr.positions.clear()
         bot.overnight_etf_position = None
-        logger.warning(f"{label}: broker confirmed flat — local state cleared")
-    elif remaining < 0:
-        logger.error(f"{label}: broker API unreachable after failsafe — cannot confirm flat")
+        bot._confirm_morning_flat(f"{label}: only swing positions remain")
+        bot._save_state()
+        return
+
+    logger.warning(f"{label}: starting broker-based failsafe flatten ({len(non_swing)} non-swing positions)")
+
+    # Flatten only non-swing positions using individual sell orders
+    for pos in non_swing:
+        try:
+            symbol = str(pos.get("symbol", "")).upper()
+            qty = abs(int(float(pos.get("qty", 0))))
+            if not symbol or qty <= 0:
+                continue
+            logger.warning(f"{label}: force-selling {symbol} x{qty}")
+            bot.position_mgr._submit_sell_order(
+                symbol=symbol,
+                qty=qty,
+                order_type="market",
+                time_in_force="day",
+                extended_hours=False,
+                verify_broker_qty=False,
+            )
+        except Exception:
+            logger.exception(f"{label}: failed to force-sell {pos.get('symbol')}")
+
+    # Brief wait for orders to process
+    time.sleep(3)
+
+    # Re-check: are there any non-swing positions left?
+    remaining_positions = bot.position_mgr.get_broker_positions()
+    if remaining_positions is None:
+        logger.error(f"{label}: broker API unreachable after flatten — cannot confirm")
     else:
-        logger.error(f"{label}: broker still shows {remaining} open positions after failsafe")
+        remaining_non_swing = [p for p in remaining_positions if str(p.get("symbol", "")).upper() not in swing_syms]
+        if not remaining_non_swing:
+            bot.position_mgr.positions.clear()
+            bot.overnight_etf_position = None
+            logger.warning(f"{label}: non-swing positions confirmed flat — swing positions preserved")
+            bot._confirm_morning_flat(f"{label}: non-swing flat, swing preserved")
+        else:
+            logger.error(f"{label}: {len(remaining_non_swing)} non-swing positions still open after failsafe")
+            for p in remaining_non_swing:
+                logger.critical(f"{label}: MANUAL INTERVENTION REQUIRED for {p.get('symbol')}")
 
     bot._save_state()

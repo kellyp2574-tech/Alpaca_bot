@@ -228,6 +228,9 @@ def save_state(bot) -> None:
             "overnight_etf_position": _serialise_overnight_etf_position(getattr(bot, "overnight_etf_position", None)),
             "overnight_etf_decision_made": getattr(bot, "overnight_etf_decision_made", False),
             "overnight_etf_blocked_today": getattr(bot, "overnight_etf_blocked_today", False),
+            # Swing ETF sleeve state
+            "swing_positions": getattr(bot, "swing_positions", {}),
+            "swing_decision_made": getattr(bot, "swing_decision_made", False),
             # Intraday MR sleeve state
             "intraday_mr_universe_built": getattr(bot, "intraday_mr_universe_built", False),
             "intraday_mr_watchlist_built": getattr(bot, "intraday_mr_watchlist_built", False),
@@ -278,6 +281,14 @@ def load_state(bot) -> None:
         bot.overnight_etf_position = None
         bot.overnight_etf_decision_made = False
         bot.overnight_etf_blocked_today = False
+        # Swing ETF sleeve state — PRESERVE swing_positions across days (2-day hold).
+        # Only reset the daily decision flag; positions persist until sold by swing_sleeve.
+        if bot_state:
+            bot.swing_positions = bot_state.get("swing_positions", {}) or {}
+            logger.info(f"Swing sleeve: restored {len(bot.swing_positions)} swing positions from previous day state")
+        else:
+            bot.swing_positions = {}
+        bot.swing_decision_made = False
         # Intraday MR sleeve state
         bot.morning_liquidation_confirmed   = False
         bot.intraday_mr_universe_built      = False
@@ -356,6 +367,9 @@ def load_state(bot) -> None:
     bot.overnight_etf_position = bot_state.get("overnight_etf_position", None)
     bot.overnight_etf_decision_made = bot_state.get("overnight_etf_decision_made", False)
     bot.overnight_etf_blocked_today = bot_state.get("overnight_etf_blocked_today", False)
+    # Swing ETF sleeve state
+    bot.swing_positions = bot_state.get("swing_positions", {}) or {}
+    bot.swing_decision_made = bot_state.get("swing_decision_made", False)
     bot.morning_liquidation_confirmed     = bot_state.get("morning_liquidation_confirmed", False)
     # Intraday MR sleeve state
     bot.intraday_mr_universe_built        = bot_state.get("intraday_mr_universe_built", False)

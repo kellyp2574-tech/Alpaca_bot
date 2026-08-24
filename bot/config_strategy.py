@@ -48,6 +48,7 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 ETF_ROUTER_ENABLED = True
 OVERNIGHT_ETF_ENABLED = True   # Overnight TQQQ strategy
 MR_OVERNIGHT_ENABLED = False   # Single-stock MR overnight disabled
+SWING_SLEEVE_ENABLED = True    # Portfolio 7: TQQQ/UPRO/NUGT multi-day swing
 
 # ═══════════════════════════════════════════════════
 # Capital allocation — LIVE CONSTANTS
@@ -375,3 +376,18 @@ ROUTER_1010_TIME = "10:10"           # Strategies 4-5 evaluated here
 # Intraday ETF exit checkpoints
 INTRADAY_EXIT_1500 = "15:00"         # Momentum, Router Long, SVIX Long
 INTRADAY_ETF_HARD_FLATTEN_TIME = "15:30"  # VXX Spike, VXX Collapse + hard flatten
+
+# ═══════════════════════════════════════════════════
+# Sleeve: Swing ETF (Portfolio 7) — multi-day hold
+# ═══════════════════════════════════════════════════
+# TQQQ -3% + UPRO -3% + NUGT 3+ down streak
+# SPY 200-day MA regime filter, 2-day hold, equal allocation per symbol.
+# Entered at 15:45; exits at 15:45 two trading days later.
+# Swing positions are NOT sold at the 09:30 morning liquidation.
+SWING_SYMBOLS = ["TQQQ", "UPRO", "NUGT"]
+SWING_THRESHOLD_PCT = -3.0          # TQQQ/UPRO: buy when daily return <= -3%
+SWING_NUGT_STREAK_MIN = 3           # NUGT: buy when 3+ consecutive down days
+SWING_HOLD_DAYS = 2                 # Trading days to hold
+SWING_ALLOCATION_PCT = 0.25         # Per symbol (25% each, max 75% for 3 symbols)
+SWING_REGIME_SYMBOL = "SPY"
+SWING_REGIME_MA_PERIOD = 200        # SPY 200-day moving average
